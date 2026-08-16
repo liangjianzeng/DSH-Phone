@@ -161,9 +161,18 @@ class _WebViewScreenState extends State<WebViewScreen> {
   }
 
   Future<void> _openSettings() async {
+    final connected = _tunnelStatus == TunnelStatus.connected;
     final changed = await Navigator.of(context).push<bool>(
       MaterialPageRoute(
-        builder: (_) => SetupScreen(initial: _config),
+        builder: (_) => SetupScreen(
+          initial: _config,
+          showUiControls: connected,
+          zoomScale: _zoomScale,
+          onZoomIn: () => _adjustZoom(_zoomStep),
+          onZoomOut: () => _adjustZoom(-_zoomStep),
+          onResetZoom: _resetZoom,
+          onRefreshCache: _refreshCache,
+        ),
       ),
     );
     if (changed == true) {
@@ -255,31 +264,6 @@ class _WebViewScreenState extends State<WebViewScreen> {
         title: const Text('DSH-Phone'),
         actions: [
           _StatusChip(status: _tunnelStatus),
-          // 缩放控制（仅隧道连通时可用）
-          if (_tunnelStatus == TunnelStatus.connected) ...[
-            IconButton(
-              tooltip: '缩小',
-              icon: const Icon(Icons.zoom_out),
-              onPressed: () => _adjustZoom(-_zoomStep),
-            ),
-            IconButton(
-              tooltip: '放大',
-              icon: const Icon(Icons.zoom_in),
-              onPressed: () => _adjustZoom(_zoomStep),
-            ),
-            IconButton(
-              tooltip: '重置缩放',
-              icon: const Icon(Icons.aspect_ratio),
-              onPressed: _resetZoom,
-            ),
-          ],
-          IconButton(
-            tooltip: '刷新缓存',
-            icon: const Icon(Icons.refresh),
-            onPressed: _tunnelStatus == TunnelStatus.connected
-                ? _refreshCache
-                : null,
-          ),
           IconButton(
             tooltip: '设置',
             icon: const Icon(Icons.settings),

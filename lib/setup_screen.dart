@@ -3,12 +3,33 @@ import 'package:flutter/material.dart';
 import 'config.dart';
 import 'tunnel_service.dart';
 
-/// 首次启动 / 设置页：配置 SSH 地址、用户名、认证方式（密钥或密码）、本地端口。
+/// 首次启动 / 设置页：配置 SSH 地址、用户名、认证方式（密钥或密码）、本地端口，
+/// 以及（已连接时）界面缩放与缓存刷新控制。
 class SetupScreen extends StatefulWidget {
-  const SetupScreen({super.key, this.initial});
+  const SetupScreen({
+    super.key,
+    this.initial,
+    this.showUiControls = false,
+    this.zoomScale = 1.0,
+    this.onZoomIn,
+    this.onZoomOut,
+    this.onResetZoom,
+    this.onRefreshCache,
+  });
 
   /// 已有配置时传入，用于回填（从设置页进入时）。
   final SSHConfig? initial;
+
+  /// 是否显示界面控制（缩放/刷新缓存）——仅在已连接时由主界面传入。
+  final bool showUiControls;
+
+  /// 当前缩放比例。
+  final double zoomScale;
+
+  final VoidCallback? onZoomIn;
+  final VoidCallback? onZoomOut;
+  final VoidCallback? onResetZoom;
+  final VoidCallback? onRefreshCache;
 
   @override
   State<SetupScreen> createState() => _SetupScreenState();
@@ -244,6 +265,50 @@ class _SetupScreenState extends State<SetupScreen> {
                   labelText: '私钥口令（可选）',
                   border: OutlineInputBorder(),
                 ),
+              ),
+            ],
+            if (widget.showUiControls) ...[
+              const SizedBox(height: 16),
+              const Divider(),
+              const Text('界面设置', style: TextStyle(fontSize: 16)),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: widget.onZoomOut,
+                      icon: const Icon(Icons.zoom_out),
+                      label: const Text('缩小'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: widget.onZoomIn,
+                      icon: const Icon(Icons.zoom_in),
+                      label: const Text('放大'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: widget.onResetZoom,
+                      icon: const Icon(Icons.aspect_ratio),
+                      label: const Text('重置'),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '当前缩放：${(widget.zoomScale * 100).round()}%',
+                style: const TextStyle(color: Colors.grey, fontSize: 13),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: widget.onRefreshCache,
+                icon: const Icon(Icons.refresh),
+                label: const Text('刷新缓存'),
               ),
             ],
             const SizedBox(height: 24),
