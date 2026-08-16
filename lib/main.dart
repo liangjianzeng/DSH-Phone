@@ -11,14 +11,6 @@ void main() async {
 
   // 边缘到边缘全屏：应用内容延伸到系统状态栏/导航栏区域
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-  // 状态栏/导航栏透明，图标深色以适配浅色主题顶栏
-  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-    statusBarColor: Colors.transparent,
-    statusBarIconBrightness: Brightness.dark,
-    systemNavigationBarColor: Colors.transparent,
-    systemNavigationBarIconBrightness: Brightness.dark,
-    systemNavigationBarDividerColor: Colors.transparent,
-  ));
 
   runApp(const DshPhoneApp());
 }
@@ -31,10 +23,36 @@ class DshPhoneApp extends StatelessWidget {
     return MaterialApp(
       title: 'DSH-Phone',
       debugShowCheckedModeBanner: false,
+      // 浅色 / 深色主题都提供，并跟随系统切换
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
         useMaterial3: true,
       ),
+      darkTheme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.indigo,
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
+      ),
+      themeMode: ThemeMode.system,
+      // 状态栏/导航栏图标随主题亮度自适应
+      builder: (context, child) {
+        final isDark =
+            Theme.of(context).brightness == Brightness.dark;
+        return AnnotatedRegion<SystemUiOverlayStyle>(
+          value: SystemUiOverlayStyle(
+            statusBarColor: Colors.transparent,
+            statusBarIconBrightness:
+                isDark ? Brightness.light : Brightness.dark,
+            systemNavigationBarColor: Colors.transparent,
+            systemNavigationBarIconBrightness:
+                isDark ? Brightness.light : Brightness.dark,
+            systemNavigationBarDividerColor: Colors.transparent,
+          ),
+          child: child ?? const SizedBox.shrink(),
+        );
+      },
       home: const _Home(),
     );
   }
