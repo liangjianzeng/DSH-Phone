@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'config.dart';
 import 'setup_screen.dart';
@@ -7,6 +8,18 @@ import 'webview_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 边缘到边缘全屏：应用内容延伸到系统状态栏/导航栏区域
+  SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+  // 状态栏/导航栏透明，图标深色以适配浅色主题顶栏
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Colors.transparent,
+    statusBarIconBrightness: Brightness.dark,
+    systemNavigationBarColor: Colors.transparent,
+    systemNavigationBarIconBrightness: Brightness.dark,
+    systemNavigationBarDividerColor: Colors.transparent,
+  ));
+
   runApp(const DshPhoneApp());
 }
 

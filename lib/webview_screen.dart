@@ -260,18 +260,38 @@ class _WebViewScreenState extends State<WebViewScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('DSH-Phone'),
-        actions: [
-          _StatusChip(status: _tunnelStatus),
-          IconButton(
-            tooltip: '设置',
-            icon: const Icon(Icons.settings),
-            onPressed: _openSettings,
-          ),
+      // 边缘到边缘：顶栏延伸到系统状态栏区域（无 SafeArea 顶部留白）
+      body: Column(
+        children: [
+          _buildTopBar(context),
+          Expanded(child: _buildBody()),
         ],
       ),
-      body: _buildBody(),
+    );
+  }
+
+  /// 自定义全屏顶栏：背景延伸到状态栏区域（边缘到边缘），内容用 SafeArea 避让状态图标。
+  Widget _buildTopBar(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      color: theme.colorScheme.surface,
+      child: SafeArea(
+        bottom: false,
+        child: Row(
+          children: [
+            const SizedBox(width: 16),
+            Text('DSH-Phone', style: theme.textTheme.titleMedium),
+            const Spacer(),
+            _StatusChip(status: _tunnelStatus),
+            IconButton(
+              tooltip: '设置',
+              icon: const Icon(Icons.settings),
+              onPressed: _openSettings,
+            ),
+            const SizedBox(width: 4),
+          ],
+        ),
+      ),
     );
   }
 

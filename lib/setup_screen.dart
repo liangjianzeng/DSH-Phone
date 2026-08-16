@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'config.dart';
 import 'tunnel_service.dart';
@@ -346,8 +347,95 @@ class _SetupScreenState extends State<SetupScreen> {
                 ),
               ],
             ),
+            const SizedBox(height: 16),
+            const Divider(),
+            const Text('关于', style: TextStyle(fontSize: 16)),
+            const SizedBox(height: 8),
+            Card(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ListTile(
+                    leading: const Icon(Icons.info_outline),
+                    title: const Text('版本'),
+                    subtitle: const Text('DSH-Phone v0.1.0'),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: _showAbout,
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.stars_outlined),
+                    title: const Text('项目原理'),
+                    subtitle: const Text('通过 SSH 隧道把手机端口转发到远程 DSH Web UI，用 WebView 加载'),
+                    onTap: _showAbout,
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.code),
+                    title: const Text('开源地址'),
+                    subtitle: const Text('github.com/liangjianzeng/DSH-Phone'),
+                    trailing: const Icon(Icons.open_in_new),
+                    onTap: () => _openUrl('https://github.com/liangjianzeng/DSH-Phone'),
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.menu_book_outlined),
+                    title: const Text('README'),
+                    subtitle: const Text('查看项目说明文档'),
+                    trailing: const Icon(Icons.open_in_new),
+                    onTap: () => _openUrl(
+                        'https://github.com/liangjianzeng/DSH-Phone#readme'),
+                  ),
+                ],
+              ),
+            ),
           ],
         ),
+      ),
+    );
+  }
+
+  /// 打开外部链接（GitHub / README）。
+  Future<void> _openUrl(String url) async {
+    final uri = Uri.parse(url);
+    if (await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+      return;
+    }
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('无法打开链接，请检查系统浏览器')),
+      );
+    }
+  }
+
+  /// 显示"关于"对话框：版本、原理、开源地址。
+  void _showAbout() {
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('关于 DSH-Phone'),
+        content: const SingleChildScrollView(
+          child: Text(
+            'DSH-Phone v0.1.0\n\n'
+            '一个在 Android 上通过 SSH 隧道访问 DeepSeek Harness Web UI 的客户端。\n\n'
+            '工作原理：\n'
+            '• 应用内置 dartssh2 建立 SSH 隧道\n'
+            '• 将手机 127.0.0.1:<端口> 转发到远程 127.0.0.1:3080\n'
+            '• 用 WebView 以 loopback 身份加载远程 DSH 界面\n'
+            '• 配置/模型等特权接口因 loopback 而可用\n\n'
+            '开源：github.com/liangjianzeng/DSH-Phone',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('关闭'),
+          ),
+          TextButton(
+            onPressed: () async {
+              Navigator.of(context).pop();
+              await _openUrl('https://github.com/liangjianzeng/DSH-Phone');
+            },
+            child: const Text('访问 GitHub'),
+          ),
+        ],
       ),
     );
   }
