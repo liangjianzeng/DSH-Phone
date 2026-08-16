@@ -11,7 +11,7 @@ class SetupScreen extends StatefulWidget {
     super.key,
     this.initial,
     this.showUiControls = false,
-    this.zoomScale = 1.0,
+    this.zoomNotifier,
     this.onZoomIn,
     this.onZoomOut,
     this.onResetZoom,
@@ -24,8 +24,8 @@ class SetupScreen extends StatefulWidget {
   /// 是否显示界面控制（缩放/刷新缓存）——仅在已连接时由主界面传入。
   final bool showUiControls;
 
-  /// 当前缩放比例。
-  final double zoomScale;
+  /// 缩放比例共享通知器（实时联动显示）。
+  final ValueNotifier<double>? zoomNotifier;
 
   final VoidCallback? onZoomIn;
   final VoidCallback? onZoomOut;
@@ -301,9 +301,13 @@ class _SetupScreenState extends State<SetupScreen> {
                 ],
               ),
               const SizedBox(height: 8),
-              Text(
-                '当前缩放：${(widget.zoomScale * 100).round()}%',
-                style: const TextStyle(color: Colors.grey, fontSize: 13),
+              ValueListenableBuilder<double>(
+                valueListenable:
+                    widget.zoomNotifier ?? ValueNotifier<double>(1.0),
+                builder: (context, value, _) => Text(
+                  '当前缩放：${(value * 100).round()}%',
+                  style: const TextStyle(color: Colors.grey, fontSize: 13),
+                ),
               ),
               const SizedBox(height: 8),
               OutlinedButton.icon(

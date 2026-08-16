@@ -33,7 +33,9 @@ class _WebViewScreenState extends State<WebViewScreen> {
   static const double _zoomMin = 0.6;
   static const double _zoomMax = 2.5;
   static const double _zoomStep = 0.1;
-  double _zoomScale = 1.0;
+
+  /// 缩放比例共享通知器：设置页可实时监听并展示。
+  final ValueNotifier<double> _zoomScaleNotifier = ValueNotifier<double>(1.0);
 
   // ---- WebView 页面加载状态 ----
   bool _pageLoading = false; // 远程页面加载中（隧道已通，页面未就绪）
@@ -59,15 +61,15 @@ class _WebViewScreenState extends State<WebViewScreen> {
   Future<void> _loadZoomScale() async {
     final prefs = await SharedPreferences.getInstance();
     final saved = prefs.getDouble(_zoomPrefKey);
-    if (saved != null && mounted) {
-      setState(() => _zoomScale = saved);
+    if (saved != null) {
+      _zoomScaleNotifier.value = saved;
     }
   }
 
   /// 保存缩放比例（下次启动沿用）。
   Future<void> _saveZoomScale() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble(_zoomPrefKey, _zoomScale);
+    await prefs.setDouble(_zoomPrefKey, _zoomScaleNotifier.value);
   }
 
   /// 通过 CSS zoom 应用缩放比例（页面就绪后调用）。
@@ -75,20 +77,21 @@ class _WebViewScreenState extends State<WebViewScreen> {
     final c = _controller;
     if (c == null) return;
     await c.evaluateJavascript(source:
-      "document.documentElement.style.zoom = '${_zoomScale.toStringAsFixed(2)}'",
+      "document.documentElement.style.zoom = '${_zoomScaleNotifier.value.toStringAsFixed(2)}'",
     );
   }
 
   void _adjustZoom(double delta) {
-    final next = (_zoomScale + delta).clamp(_zoomMin, _zoomMax);
-    if (next == _zoomScale) return;
-    setState(() => _zoomScale = next);
+    final next =
+        (_zoomScaleNotifier.value + delta).clamp(_zoomMin, _zoomMax);
+    if (next == _zoomScaleNotifier.value) return;
+    _zoomScaleNotifier.value = next;
     _saveZoomScale();
     _applyZoom();
   }
 
   void _resetZoom() {
-    setState(() => _zoomScale = 1.0);
+    _zoomScaleNotifier.value = 1.0;
     _saveZoomScale();
     _applyZoom();
   }
@@ -147,6 +150,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
   void dispose() {
     _loadTimeoutTimer?.cancel();
     _tunnelSub?.cancel();
+    _zoomScaleNotifier.dispose();
     _disconnect();
     super.dispose();
   }
@@ -167,7 +171,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
         builder: (_) => SetupScreen(
           initial: _config,
           showUiControls: connected,
-          zoomScale: _zoomScale,
+          zoomNotifier: _zoomScaleNotifier,
           onZoomIn: () => _adjustZoom(_zoomStep),
           onZoomOut: () => _adjustZoom(-_zoomStep),
           onResetZoom: _resetZoom,
