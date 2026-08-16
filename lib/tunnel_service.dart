@@ -20,6 +20,7 @@ class TunnelService {
   SSHClient? _client;
   ServerSocket? _server;
   bool _disposed = false;
+  bool _connecting = false;
 
   TunnelStatus _status = TunnelStatus.idle;
   TunnelStatus get status => _status;
@@ -31,62 +32,76 @@ class TunnelService {
     if (!_disposed) _statusController.add(s);
   }
 
-  /// 建立隧道。成功返回 true，失败抛异常（携带可读错误信息）。
+  /// 建立隧道。已连接或正在连接时幂等返回，避免重复/并发连接造成死循环。
   Future<void> connect(SSHConfig config) async {
-    await disconnect();
+    // 已在连接中：忽略并发调用
+    if (_connecting) return;
+    // 已连接且配置未变：无需重连
+    if (_status == TunnelStatus.connected) return;
 
-    _setStatus(TunnelStatus.connecting);
+    _connecting = true;
+    try {
+      await _disconnectInternal();
 
-    // 1) 建立底层 TCP 到 SSH 服务器
-    final socket = await SSHSocket.connect(config.host, config.sshPort,
-        timeout: const Duration(seconds: 15));
+      _setStatus(TunnelStatus.connecting);
 
-    // 2) 认证：密钥优先，密码兜底
-    final List<SSHKeyPair>? identities = config.useKey
-        ? SSHKeyPair.fromPem(config.privateKeyPem,
-            config.keyPassphrase.isEmpty ? null : config.keyPassphrase)
-        : null;
+      // 1) 建立底层 TCP 到 SSH 服务器
+      final socket = await SSHSocket.connect(config.host, config.sshPort,
+          timeout: const Duration(seconds: 15));
 
-    final client = SSHClient(
-      socket,
-      username: config.username,
-      identities: identities,
-      onPasswordRequest:
-          config.useKey ? null : () async => config.password,
-      // SSH 保活：每 20s 发一次 keep-alive，避免空闲断连
-      keepAliveInterval: const Duration(seconds: 20),
-      // 信任用户自建的主机（手机端无 known_hosts）
-      onVerifyHostKey: (hostkeyType, fingerprint) => true,
-    );
+      // 2) 认证：密钥优先，密码兜底
+      final List<SSHKeyPair>? identities = config.useKey
+          ? SSHKeyPair.fromPem(config.privateKeyPem,
+              config.keyPassphrase.isEmpty ? null : config.keyPassphrase)
+          : null;
 
-    _client = client;
+      final client = SSHClient(
+        socket,
+        username: config.username,
+        identities: identities,
+        onPasswordRequest:
+            config.useKey ? null : () async => config.password,
+        // SSH 保活：每 20s 发一次 keep-alive，避免空闲断连
+        keepAliveInterval: const Duration(seconds: 20),
+        // 信任用户自建的主机（手机端无 known_hosts）
+        onVerifyHostKey: (hostkeyType, fingerprint) => true,
+      );
 
-    // 传输异常/断开时通知
-    client.done.then(
-      (_) {
-        if (_client == client) {
-          _setStatus(TunnelStatus.disconnected);
-        }
-      },
-      onError: (_) {
-        if (_client == client) {
-          _setStatus(TunnelStatus.failed);
-        }
-      },
-    );
+      _client = client;
 
-    // 3) 等待认证完成
-    await client.authenticated
-        .timeout(const Duration(seconds: 20), onTimeout: () {
-      throw const SocketException('SSH 认证超时');
-    });
+      // 传输异常/断开时通知，并清理资源
+      client.done.then(
+        (_) => _onTransportClosed(client),
+        onError: (_) => _onTransportClosed(client, failed: true),
+      );
 
-    // 4) 本地监听端口
-    _server = await ServerSocket.bind(InternetAddress.loopbackIPv4,
-        config.localPort);
-    _server!.listen(_handleLocalConnection);
+      // 3) 等待认证完成
+      await client.authenticated
+          .timeout(const Duration(seconds: 20), onTimeout: () {
+        throw const SocketException('SSH 认证超时');
+      });
 
-    _setStatus(TunnelStatus.connected);
+      // 4) 本地监听端口
+      _server = await ServerSocket.bind(
+          InternetAddress.loopbackIPv4, config.localPort);
+      _server!.listen(_handleLocalConnection);
+
+      _setStatus(TunnelStatus.connected);
+    } finally {
+      _connecting = false;
+    }
+  }
+
+  /// 传输关闭时的统一清理：仅当仍是当前 client 才处理，避免旧连接误改状态。
+  void _onTransportClosed(SSHClient client, {bool failed = false}) {
+    if (_client != client) return;
+    _client = null;
+
+    final server = _server;
+    _server = null;
+    server?.close();
+
+    _setStatus(failed ? TunnelStatus.failed : TunnelStatus.disconnected);
   }
 
   /// 处理一条本地 TCP 连接：打开远程直连隧道并双向透传。
@@ -147,8 +162,12 @@ class TunnelService {
     });
   }
 
-  /// 断开隧道并清理。
+  /// 主动断开隧道并清理。
   Future<void> disconnect() async {
+    await _disconnectInternal();
+  }
+
+  Future<void> _disconnectInternal() async {
     final server = _server;
     _server = null;
     if (server != null) {
