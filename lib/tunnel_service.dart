@@ -61,8 +61,8 @@ class TunnelService {
         identities: identities,
         onPasswordRequest:
             config.useKey ? null : () async => config.password,
-        // SSH 保活：每 20s 发一次 keep-alive，避免空闲断连
-        keepAliveInterval: const Duration(seconds: 20),
+        // SSH 保活：每 10s 发一次 keep-alive，降低移动网络空闲断连概率
+        keepAliveInterval: const Duration(seconds: 10),
         // 信任用户自建的主机（手机端无 known_hosts）
         onVerifyHostKey: (hostkeyType, fingerprint) => true,
       );

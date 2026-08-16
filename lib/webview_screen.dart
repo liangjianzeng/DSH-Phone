@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'config.dart';
 import 'setup_screen.dart';
@@ -27,6 +28,13 @@ class _WebViewScreenState extends State<WebViewScreen> {
   StreamSubscription<TunnelStatus>? _tunnelSub;
   bool _reconnecting = false;
 
+  // ---- 页面缩放（CSS zoom，持久化保存比例）----
+  static const String _zoomPrefKey = 'webview_zoom_scale';
+  static const double _zoomMin = 0.6;
+  static const double _zoomMax = 2.5;
+  static const double _zoomStep = 0.1;
+  double _zoomScale = 1.0;
+
   // ---- WebView 页面加载状态 ----
   bool _pageLoading = false; // 远程页面加载中（隧道已通，页面未就绪）
   int _loadProgress = 0; // 0-100
@@ -44,6 +52,45 @@ class _WebViewScreenState extends State<WebViewScreen> {
     // 监听隧道真实状态，状态变化时同步界面；仅在真正断开时自动重连。
     _tunnelSub = TunnelService.instance.statusStream.listen(_onTunnelStatus);
     _load();
+    _loadZoomScale();
+  }
+
+  /// 读取持久化的缩放比例。
+  Future<void> _loadZoomScale() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getDouble(_zoomPrefKey);
+    if (saved != null && mounted) {
+      setState(() => _zoomScale = saved);
+    }
+  }
+
+  /// 保存缩放比例（下次启动沿用）。
+  Future<void> _saveZoomScale() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_zoomPrefKey, _zoomScale);
+  }
+
+  /// 通过 CSS zoom 应用缩放比例（页面就绪后调用）。
+  Future<void> _applyZoom() async {
+    final c = _controller;
+    if (c == null) return;
+    await c.evaluateJavascript(source:
+      "document.documentElement.style.zoom = '${_zoomScale.toStringAsFixed(2)}'",
+    );
+  }
+
+  void _adjustZoom(double delta) {
+    final next = (_zoomScale + delta).clamp(_zoomMin, _zoomMax);
+    if (next == _zoomScale) return;
+    setState(() => _zoomScale = next);
+    _saveZoomScale();
+    _applyZoom();
+  }
+
+  void _resetZoom() {
+    setState(() => _zoomScale = 1.0);
+    _saveZoomScale();
+    _applyZoom();
   }
 
   /// 隧道状态流回调：同步界面状态；断开/失败时带守卫自动重连。
@@ -156,6 +203,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
   void _onPageLoadStop() {
     _loadTimeoutTimer?.cancel();
+    _pageRetryCount = 0;
     if (!mounted) return;
     setState(() {
       _pageLoading = false;
@@ -163,12 +211,25 @@ class _WebViewScreenState extends State<WebViewScreen> {
     });
   }
 
+  int _pageRetryCount = 0;
+
   void _onPageError(String message) {
     _loadTimeoutTimer?.cancel();
     if (!mounted) return;
     setState(() {
       _pageLoading = false;
       _pageError = message;
+    });
+    // 有限次自动重试：隧道若刚断连会自动重连，页面重载后自愈
+    _schedulePageRetry();
+  }
+
+  /// 页面加载失败后的有限自动重试（最多 3 次）。
+  void _schedulePageRetry() {
+    if (_pageRetryCount >= 3) return;
+    _pageRetryCount++;
+    Future<void>.delayed(const Duration(seconds: 3), () {
+      if (mounted && _pageError != null) _retryLoad();
     });
   }
 
@@ -194,6 +255,24 @@ class _WebViewScreenState extends State<WebViewScreen> {
         title: const Text('DSH-Phone'),
         actions: [
           _StatusChip(status: _tunnelStatus),
+          // 缩放控制（仅隧道连通时可用）
+          if (_tunnelStatus == TunnelStatus.connected) ...[
+            IconButton(
+              tooltip: '缩小',
+              icon: const Icon(Icons.zoom_out),
+              onPressed: () => _adjustZoom(-_zoomStep),
+            ),
+            IconButton(
+              tooltip: '放大',
+              icon: const Icon(Icons.zoom_in),
+              onPressed: () => _adjustZoom(_zoomStep),
+            ),
+            IconButton(
+              tooltip: '重置缩放',
+              icon: const Icon(Icons.aspect_ratio),
+              onPressed: _resetZoom,
+            ),
+          ],
           IconButton(
             tooltip: '刷新缓存',
             icon: const Icon(Icons.refresh),
@@ -264,12 +343,19 @@ class _WebViewScreenState extends State<WebViewScreen> {
                 // DSH 是含 WebSocket 的 SPA
                 javaScriptEnabled: true,
                 transparentBackground: false,
+                // 原生双指缩放 + 缩放控件
+                supportZoom: true,
+                displayZoomControls: true,
               ),
               onWebViewCreated: (controller) => _controller = controller,
               onLoadStart: (controller, url) => _onPageLoadStart(),
               onProgressChanged: (controller, progress) =>
                   _onPageProgress(progress),
-              onLoadStop: (controller, url) => _onPageLoadStop(),
+              onLoadStop: (controller, url) {
+                _onPageLoadStop();
+                // 页面就绪后应用持久化的缩放比例
+                _applyZoom();
+              },
               onReceivedError: (controller, request, error) => _onPageError(
                 '加载失败：${error.description}\n'
                 '（${error.type}）',
