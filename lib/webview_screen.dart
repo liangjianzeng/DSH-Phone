@@ -13,6 +13,8 @@ import 'tunnel_service.dart';
 /// 加载链路分两个阶段，均有可见反馈：
 /// 1. SSH 隧道建立（连接中 → 已连接）；
 /// 2. WebView 加载远程界面（进度条 + 阶段提示，超时/失败给出明确错误与重试）。
+///
+/// 支持最多 3 路 SSH 实例配置，顶部状态栏可自由切换激活实例。
 class WebViewScreen extends StatefulWidget {
   const WebViewScreen({super.key});
 
@@ -22,11 +24,24 @@ class WebViewScreen extends StatefulWidget {
 
 class _WebViewScreenState extends State<WebViewScreen> {
   InAppWebViewController? _controller;
+
+  // ---- 多实例配置 ----
+  List<SSHConfig> _profiles = List.filled(SSHConfig.maxProfiles, const SSHConfig());
+  int _activeIndex = 0;
   SSHConfig _config = const SSHConfig();
+
+  // ---- 页面加载超时（秒），可配置，默认 60，最大 180 ----
+  int _timeoutSeconds = SSHConfig.defaultTimeoutSeconds;
+
   TunnelStatus _tunnelStatus = TunnelStatus.idle;
   String? _error;
   StreamSubscription<TunnelStatus>? _tunnelSub;
   bool _reconnecting = false;
+  bool _switching = false; // 手动切换实例时抑制自动重连
+
+  /// 连续自动重连次数上限：防止"死循环连接"刷屏/耗尽资源。
+  static const int _maxReconnect = 5;
+  int _reconnectCount = 0;
 
   // ---- 页面缩放（CSS zoom，持久化保存比例）----
   static const String _zoomPrefKey = 'webview_zoom_scale';
@@ -43,10 +58,31 @@ class _WebViewScreenState extends State<WebViewScreen> {
   String? _pageError; // 页面加载错误（区别于隧道错误 _error）
   Timer? _loadTimeoutTimer;
 
-  /// 首次通过 SSH 隧道加载 DSH 是体积较大的 SPA，给足时间。
-  static const Duration _loadTimeout = Duration(seconds: 120);
-  static const String _loadingHint =
-      '首次加载需要从服务器传输界面资源，\n可能需要 1~2 分钟，请耐心等待。';
+  /// VPN 组网 UDP QoS 友好提示：跨运营商 UDP 可能被限速/丢包导致请求缓慢超时，
+  /// 建议端侧与云端联网在同一网络运营商下使用。
+  static const String _qosHint =
+      '\n\n提示：VPN 组网（WireGuard/Tailscale 走 UDP）跨运营商时可能被 QoS 限速/丢包，'
+      '导致请求缓慢或超时。建议端侧与云端联网处于同一网络运营商下使用；'
+      '必要时可在设置中调大页面加载超时。';
+
+  /// 若是网络超时/缓慢类错误，追加 VPN UDP QoS 友好提示。
+  static String _appendQosHintIfTimeout(String message) {
+    final lowered = message.toLowerCase();
+    if (lowered.contains('timeout') ||
+        lowered.contains('timed out') ||
+        lowered.contains('超时') ||
+        lowered.contains('socketexception') ||
+        lowered.contains('slow') ||
+        lowered.contains('network')) {
+      return message + _qosHint;
+    }
+    return message;
+  }
+
+  Duration get _loadTimeout => Duration(seconds: _timeoutSeconds);
+
+  String get _loadingHint =>
+      '首次加载需要从服务器传输界面资源，\n超时设置为 $_timeoutSeconds 秒，请耐心等待。';
 
   @override
   void initState() {
@@ -100,23 +136,44 @@ class _WebViewScreenState extends State<WebViewScreen> {
   void _onTunnelStatus(TunnelStatus s) {
     if (!mounted) return;
     setState(() => _tunnelStatus = s);
-    if (s == TunnelStatus.disconnected || s == TunnelStatus.failed) {
+    if (!_switching &&
+        (s == TunnelStatus.disconnected || s == TunnelStatus.failed)) {
       _scheduleReconnect();
     }
   }
 
-  /// 带守卫的自动重连：避免重复/并发重连造成死循环。
+  /// 带守卫的自动重连：避免重复/并发重连造成死循环；连续失败达到
+  /// [_maxReconnect] 次后停止自动重连，交由用户手动重试（防止无限循环）。
   void _scheduleReconnect() {
     if (_reconnecting) return;
+    if (_reconnectCount >= _maxReconnect) return;
     _reconnecting = true;
-    Future<void>.delayed(const Duration(seconds: 2), () {
+    _reconnectCount++;
+    // 递增退避：2s、4s、6s、8s、10s
+    final delay = Duration(seconds: 2 * _reconnectCount);
+    Future<void>.delayed(delay, () {
       _reconnecting = false;
-      if (mounted) _connect();
+      if (mounted && _reconnectCount < _maxReconnect) _connect();
     });
   }
 
   Future<void> _load() async {
-    _config = await SSHConfig.load();
+    final profiles = await SSHConfig.loadAllProfiles();
+    final activeIndex = await SSHConfig.loadActiveIndex();
+    final timeoutSeconds = await SSHConfig.loadTimeoutSeconds();
+    if (!mounted) return;
+    setState(() {
+      _profiles = profiles;
+      _activeIndex = activeIndex;
+      _config = profiles[activeIndex];
+      _timeoutSeconds = timeoutSeconds;
+    });
+    _manualConnect();
+  }
+
+  /// 用户主动连接：重置自动重连计数后连接（重试按钮 / 切换实例 / 初始加载）。
+  void _manualConnect() {
+    _reconnectCount = 0;
     _connect();
   }
 
@@ -130,20 +187,48 @@ class _WebViewScreenState extends State<WebViewScreen> {
       _pageLoading = false;
     });
     try {
-      await TunnelService.instance.connect(_config);
+      await TunnelService.instance
+          .connect(_config, profileIndex: _activeIndex);
       if (!mounted) return;
+      _reconnectCount = 0; // 连接成功：重置重连计数
       setState(() => _tunnelStatus = TunnelStatus.connected);
+      // 注意：这里不手动 loadUrl。WebView 每次在 body 重建时都会用
+      // initialUrlRequest（即当前 _targetUrl）加载，切换实例/重连后
+      // 会自动加载新地址；手动调用会用到尚未就绪/过期的 controller，
+      // 触发 MissingPluginException。
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _tunnelStatus = TunnelStatus.failed;
-        _error = '$e';
+        _error = _appendQosHintIfTimeout('$e');
       });
     }
   }
 
   Future<void> _disconnect() async {
     await TunnelService.instance.disconnect();
+  }
+
+  /// 切换激活实例：持久化 → 断开旧隧道 → 连接新实例并加载新界面。
+  Future<void> _switchInstance(int index) async {
+    if (index == _activeIndex) return;
+    // 目标实例未配置 → 跳转设置页配置它
+    if (!_profiles[index].isConfigured) {
+      await _openSettings(profileIndex: index);
+      return;
+    }
+    setState(() {
+      _activeIndex = index;
+      _config = _profiles[index];
+      _switching = true;
+      _pageError = null;
+      _pageLoading = false;
+    });
+    await SSHConfig.setActiveIndex(index);
+    await TunnelService.instance.disconnect();
+    if (!mounted) return;
+    setState(() => _switching = false);
+    _manualConnect();
   }
 
   @override
@@ -164,12 +249,15 @@ class _WebViewScreenState extends State<WebViewScreen> {
     }
   }
 
-  Future<void> _openSettings() async {
+  Future<void> _openSettings({int? profileIndex}) async {
     final connected = _tunnelStatus == TunnelStatus.connected;
+    final target = profileIndex ?? _activeIndex;
     final changed = await Navigator.of(context).push<bool>(
       MaterialPageRoute(
         builder: (_) => SetupScreen(
-          initial: _config,
+          profileIndex: target,
+          timeoutSeconds: _timeoutSeconds,
+          profiles: _profiles,
           showUiControls: connected,
           zoomNotifier: _zoomScaleNotifier,
           onZoomIn: () => _adjustZoom(_zoomStep),
@@ -180,13 +268,22 @@ class _WebViewScreenState extends State<WebViewScreen> {
       ),
     );
     if (changed == true) {
-      _config = await SSHConfig.load();
-      await _disconnect();
-      _connect();
+      await _load();
     }
   }
 
   String get _targetUrl => 'http://127.0.0.1:${_config.localPort}';
+
+  Future<void> _loadTargetUrl() async {
+    final c = _controller;
+    // 隧道未连接或 controller 已失效时跳过，避免 MissingPluginException
+    if (c == null || _tunnelStatus != TunnelStatus.connected) return;
+    try {
+      await c.loadUrl(urlRequest: URLRequest(url: WebUri(_targetUrl)));
+    } catch (_) {
+      // controller 可能已失效，忽略
+    }
+  }
 
   // ================= WebView 加载回调 =================
 
@@ -203,8 +300,9 @@ class _WebViewScreenState extends State<WebViewScreen> {
       if (!mounted || !_pageLoading) return;
       setState(() {
         _pageLoading = false;
-        _pageError = '加载超时（${_loadTimeout.inSeconds} 秒未完成）。\n'
-            '请检查服务器状态、网络连接，或点重试。';
+        _pageError = _appendQosHintIfTimeout(
+            '加载超时（${_loadTimeout.inSeconds} 秒未完成）。\n'
+            '请检查服务器状态、网络连接，或在设置中调大超时后重试。');
       });
     });
   }
@@ -231,7 +329,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
     if (!mounted) return;
     setState(() {
       _pageLoading = false;
-      _pageError = message;
+      _pageError = _appendQosHintIfTimeout(message);
     });
     // 有限次自动重试：隧道若刚断连会自动重连，页面重载后自愈
     _schedulePageRetry();
@@ -252,10 +350,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
       _pageLoading = true;
       _loadProgress = 0;
     });
-    final c = _controller;
-    if (c != null) {
-      await c.loadUrl(urlRequest: URLRequest(url: WebUri(_targetUrl)));
-    }
+    await _loadTargetUrl();
     _onPageLoadStart();
   }
 
@@ -283,10 +378,11 @@ class _WebViewScreenState extends State<WebViewScreen> {
         bottom: false,
         child: Row(
           children: [
-            const SizedBox(width: 16),
+            const SizedBox(width: 12),
             Text('DSH-Phone', style: theme.textTheme.titleMedium),
             const Spacer(),
-            _StatusChip(status: _tunnelStatus),
+            // 实例切换器：点击弹出菜单，自由切换连接实例
+            _buildInstanceSwitcher(context),
             IconButton(
               tooltip: '设置',
               icon: const Icon(Icons.settings),
@@ -296,6 +392,38 @@ class _WebViewScreenState extends State<WebViewScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  /// 顶部实例切换器：当前实例标签 + 状态点，点击弹出菜单切换。
+  Widget _buildInstanceSwitcher(BuildContext context) {
+    return PopupMenuButton<int>(
+      tooltip: '切换连接实例',
+      onSelected: _switchInstance,
+      child: _InstanceChip(
+        label: '${_activeIndex + 1} · ${_config.label}',
+        status: _tunnelStatus,
+      ),
+      itemBuilder: (context) => [
+        for (var i = 0; i < SSHConfig.maxProfiles; i++)
+          PopupMenuItem<int>(
+            value: i,
+            child: Row(
+              children: [
+                Icon(
+                  i == _activeIndex
+                      ? Icons.check_circle
+                      : Icons.radio_button_unchecked,
+                  size: 18,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text('实例${i + 1} · ${_profiles[i].label}'),
+                ),
+              ],
+            ),
+          ),
+      ],
     );
   }
 
@@ -326,7 +454,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
                 Text('连接失败：\n$_error', textAlign: TextAlign.center),
                 const SizedBox(height: 16),
                 FilledButton.icon(
-                  onPressed: _connect,
+                  onPressed: _manualConnect,
                   icon: const Icon(Icons.refresh),
                   label: const Text('重试'),
                 ),
@@ -351,9 +479,11 @@ class _WebViewScreenState extends State<WebViewScreen> {
                 // DSH 是含 WebSocket 的 SPA
                 javaScriptEnabled: true,
                 transparentBackground: false,
-                // 原生双指缩放 + 缩放控件
+                // 原生双指缩放（保留手势），但禁用原生右下角缩放控件
+                // （原生控件位置固定、常覆盖发送按钮），改用自定义
+                // 左侧中央竖排浮动控件（_buildZoomControls）。
                 supportZoom: true,
-                displayZoomControls: true,
+                displayZoomControls: false,
               ),
               onWebViewCreated: (controller) => _controller = controller,
               onLoadStart: (controller, url) => _onPageLoadStart(),
@@ -378,6 +508,9 @@ class _WebViewScreenState extends State<WebViewScreen> {
               _buildPageLoading(context),
             // 页面加载失败/超时：错误界面
             if (_pageError != null) _buildPageError(context),
+            // 自定义缩放控件：左侧屏幕中央、竖排，避开右下角发送按钮
+            if (!_pageLoading && _pageError == null)
+              _buildZoomControls(context),
           ],
         );
       case TunnelStatus.disconnected:
@@ -390,7 +523,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
               const Text('隧道已断开'),
               const SizedBox(height: 16),
               FilledButton.icon(
-                onPressed: _connect,
+                onPressed: _manualConnect,
                 icon: const Icon(Icons.refresh),
                 label: const Text('重新连接'),
               ),
@@ -415,10 +548,10 @@ class _WebViewScreenState extends State<WebViewScreen> {
             Text('隧道已连接，正在加载远程界面…',
                 style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 12),
-            const Text(
+            Text(
               _loadingHint,
               textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.grey),
+              style: const TextStyle(color: Colors.grey),
             ),
             const SizedBox(height: 24),
             LinearProgressIndicator(value: _loadProgress / 100),
@@ -471,27 +604,81 @@ class _WebViewScreenState extends State<WebViewScreen> {
       ),
     );
   }
+
+  /// 自定义浮动缩放控件：定位在**左侧屏幕中央、竖排**，替代原生右下角
+  /// 缩放控件（后者固定右下、常覆盖发送按钮）。半透明小尺寸，尽量少遮挡。
+  Widget _buildZoomControls(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Positioned(
+      left: 6,
+      top: 0,
+      bottom: 0,
+      child: Center(
+        child: Material(
+          color: scheme.surface.withValues(alpha: 0.55),
+          borderRadius: BorderRadius.circular(24),
+          elevation: 2,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                tooltip: '放大',
+                icon: const Icon(Icons.add),
+                iconSize: 20,
+                visualDensity: VisualDensity.compact,
+                onPressed: () => _adjustZoom(_zoomStep),
+              ),
+              const Divider(height: 1, thickness: 1),
+              IconButton(
+                tooltip: '缩小',
+                icon: const Icon(Icons.remove),
+                iconSize: 20,
+                visualDensity: VisualDensity.compact,
+                onPressed: () => _adjustZoom(-_zoomStep),
+              ),
+              const Divider(height: 1, thickness: 1),
+              IconButton(
+                tooltip: '重置缩放',
+                icon: const Icon(Icons.refresh),
+                iconSize: 18,
+                visualDensity: VisualDensity.compact,
+                onPressed: _resetZoom,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
-class _StatusChip extends StatelessWidget {
-  const _StatusChip({required this.status});
+/// 顶部实例切换器的展示 Chip：实例标签 + 连接状态点。
+class _InstanceChip extends StatelessWidget {
+  const _InstanceChip({required this.label, required this.status});
 
+  final String label;
   final TunnelStatus status;
 
   @override
   Widget build(BuildContext context) {
-    final (label, color) = switch (status) {
-      TunnelStatus.idle => ('空闲', Colors.grey),
-      TunnelStatus.connecting => ('连接中', Colors.orange),
-      TunnelStatus.connected => ('已连接', Colors.green),
-      TunnelStatus.failed => ('失败', Colors.red),
-      TunnelStatus.disconnected => ('已断开', Colors.grey),
+    final (color) = switch (status) {
+      TunnelStatus.idle => Colors.grey,
+      TunnelStatus.connecting => Colors.orange,
+      TunnelStatus.connected => Colors.green,
+      TunnelStatus.failed => Colors.red,
+      TunnelStatus.disconnected => Colors.grey,
     };
     return Padding(
-      padding: const EdgeInsets.only(right: 8),
+      padding: const EdgeInsets.only(right: 4),
       child: Chip(
-        label: Text(label, style: const TextStyle(fontSize: 12)),
-        backgroundColor: color.withValues(alpha: 0.2),
+        avatar: Icon(Icons.swap_horiz, size: 16, color: color),
+        label: Text(
+          label,
+          style: const TextStyle(fontSize: 12),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        backgroundColor: color.withValues(alpha: 0.15),
         visualDensity: VisualDensity.compact,
       ),
     );

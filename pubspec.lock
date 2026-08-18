@@ -100,10 +100,9 @@ packages:
   dartssh2:
     dependency: "direct main"
     description:
-      name: dartssh2
-      sha256: e7c58c98bd11fb1c7bf7df0e1758c10e3a90f1ba83f0306510dab04ea58696d2
-      url: "https://pub.dev"
-    source: hosted
+      path: "third_party/dartssh2"
+      relative: true
+    source: path
     version: "2.11.0"
   fake_async:
     dependency: transitive

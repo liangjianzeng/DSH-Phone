@@ -1,6 +1,7 @@
 # Miscellaneous
 *.class
 *.log
+*.err
 *.pyc
 *.swp
 .DS_Store
@@ -39,7 +40,8 @@ app.*.symbols
 # Obfuscation related
 app.*.map.json
 
-# Android Studio will place build artifacts here
+# Android Studio / CMake build artifacts
 /android/app/debug
 /android/app/profile
+/android/app/.cxx/
 /android/app/release
