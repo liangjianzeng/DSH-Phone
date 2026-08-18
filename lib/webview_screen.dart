@@ -133,8 +133,19 @@ class _WebViewScreenState extends State<WebViewScreen> {
   }
 
   /// 隧道状态流回调：同步界面状态；断开/失败时带守卫自动重连。
+  ///
+  /// 首次异常（[_reconnectCount] == 0）不提示：保持当前状态直接默认重试，
+  /// 避免隐藏后台 / 黑屏一段时间后频繁闪现异常界面；再次异常才显示提示。
   void _onTunnelStatus(TunnelStatus s) {
     if (!mounted) return;
+    if (!_switching &&
+        (s == TunnelStatus.disconnected || s == TunnelStatus.failed)) {
+      if (_reconnectCount == 0) {
+        // 首次异常：不更新状态（界面不闪现提示），直接默认重试
+        _scheduleReconnect();
+        return;
+      }
+    }
     setState(() => _tunnelStatus = s);
     if (!_switching &&
         (s == TunnelStatus.disconnected || s == TunnelStatus.failed)) {
@@ -198,11 +209,24 @@ class _WebViewScreenState extends State<WebViewScreen> {
       // 触发 MissingPluginException。
     } catch (e) {
       if (!mounted) return;
-      setState(() {
-        _tunnelStatus = TunnelStatus.failed;
-        _error = _appendQosHintIfTimeout('$e');
-      });
+      _handleConnectFailure('$e');
     }
+  }
+
+  /// 连接失败处理：首次失败不提示、直接默认重试；再次失败才显示错误
+  /// 提示界面，随后按退避策略自动重试。
+  void _handleConnectFailure(String message) {
+    if (_reconnectCount == 0) {
+      // 首次失败：不更新状态（界面不闪现错误提示），直接默认重试
+      _scheduleReconnect();
+      return;
+    }
+    // 再次失败：显示错误提示界面，随后自动重试
+    setState(() {
+      _tunnelStatus = TunnelStatus.failed;
+      _error = _appendQosHintIfTimeout(message);
+    });
+    _scheduleReconnect();
   }
 
   Future<void> _disconnect() async {

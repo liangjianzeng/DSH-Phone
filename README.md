@@ -5,8 +5,8 @@
 DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 用户名 / 认证方式（SSH 密钥或密码），应用自动建立 SSH 隧道（`127.0.0.1:<localPort>` → 远程 `127.0.0.1:3080`），并通过 WebView 加载 DSH Web UI。内置本地缓存加速、SSH 保活、界面缩放与全屏显示、主题自适应，以及手动修改连接配置 / 刷新缓存 / 查看关于的入口。
 
 - **开源地址**：https://github.com/liangjianzeng/DSH-Phone
-- **当前版本**：v0.1.1
-- **安装包**：[`apk/DSH-Phone-v0.1.1.apk`](apk/DSH-Phone-v0.1.1.apk)（旧版 [`apk/DSH-Phone-v0.1.0.apk`](apk/DSH-Phone-v0.1.0.apk) 见仓库）
+- **当前版本**：v0.1.2
+- **安装包**：[`apk/DSH-Phone-v0.1.2.apk`](apk/DSH-Phone-v0.1.2.apk)（旧版 [`apk/DSH-Phone-v0.1.1.apk`](apk/DSH-Phone-v0.1.1.apk) 见仓库）
 
 ## 工作原理
 
@@ -44,10 +44,10 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 ## 功能特性
 
 - 🔐 **首次启动引导**：设置 SSH 地址、端口、用户名，认证方式支持 **SSH 密钥（默认）** 与 **密码**。
-- 📦 **多连接实例（最多 3 路）**：配置指向不同服务端的多路 SSH 实例，顶栏状态栏一键自由切换；敏感信息仍加密存储。
+- 📦 **多连接实例（最多 3 路）**：配置指向不同服务端的多路 SSH 实例，顶栏状态栏一键自由切换；可为每路实例设置**别名**（最多 7 个中文或 15 个英文字母），顶栏优先显示别名而非地址，避免多路 IP 混淆；敏感信息仍加密存储。
 - ⏱️ **可配置页面加载超时**：默认 60s、范围 30–180s，设置页滑块调整；大上下文会话历史加载较慢时可调大。
 - 🔄 **自动 SSH 隧道**：基于 `dartssh2` 建立本地端口转发，无需 Root。
-- ⚡ **SSH 保活**：每 10s 发送 keep-alive，降低移动网络空闲断连；断线自动重连（递增退避 + 连续失败上限）。
+- ⚡ **SSH 保活与静默重连**：每 10s 发送 keep-alive，降低移动网络空闲断连；首次异常（如隐藏后台 / 黑屏一段时间后断线）**不闪现错误提示、直接默认重连**，连续异常才提示并自动退避重试（递增退避 + 连续失败上限）。
 - 🚀 **隧道吞吐优化**：本地 fork 的 `dartssh2`（认证后 zlib 压缩 + 整包批量解密），双向透传不做应用层节流，显著提升大体积加载速度。
 - 🧭 **WebView 加载 DSH Web UI**：`flutter_inappwebview`，loopback 访问，模型/设置等特权接口可用。
 - 💾 **本地缓存加速**：优先使用本地缓存，缺才走网络；支持手动清缓存刷新。
@@ -57,6 +57,15 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - ⚙️ **设置管理**：修改地址 / 用户名 / 认证、清空缓存、缩放控制、刷新缓存。
 - ℹ️ **关于**：显示版本、项目原理、开源地址，可直接跳转 GitHub / README。
 - 🔒 **敏感信息加密**：密码 / 私钥存于 Android Keystore（`flutter_secure_storage`）。
+
+## 主机端（服务端）SSH 支持
+
+DSH-Phone 通过 SSH 隧道接入主机端，因此主机端需要能接受 SSH 连接：
+
+- **Linux 主机**：原生支持 SSH（OpenSSH 服务端通常已内置或 `apt install openssh-server` 即可），开箱即用，无需额外安装。
+- **Windows 主机**：建议下载安装 **OpenSSH 作为服务端**（Windows 设置 → 可选功能 → 添加"OpenSSH 服务器"，或 `winget install Microsoft.OpenSSH.Beta`），并确认 SSH 服务已启动、防火墙放行 22 端口，即可配合端侧 DSH-Phone 的 SSH 隧道建立与使用。
+
+> 主机端 DSH 默认监听 `127.0.0.1:3080`，仅 loopback 访问；DSH-Phone 通过 SSH 隧道把手机本机端口转发到主机端，使 WebView 以 loopback 身份访问，从而获得完整功能。
 
 ## 快速开始
 
@@ -104,6 +113,7 @@ third_party/dartssh2/   # 本地 fork 的 dartssh2（吞吐优化）
 
 ## 版本记录
 
+- **v0.1.2**：实例别名（最多 7 个中文 / 15 个英文字母，顶栏优先显示别名而非地址）；首次连接异常静默直接重连、连续异常才提示；修复 Windows 构建（AGP 8.2.1 / minSdk 23 / 禁用 jetifier）。
 - **v0.1.1**：多连接实例（最多 3 路）与顶栏切换、可配置页面加载超时、本地 `dartssh2` fork 吞吐优化（zlib 压缩 + 批量解密）、去掉隧道节流、断线重连递增退避 + 上限、release 签名。
 - **v0.1.0**：首个发布版。SSH 隧道访问 DSH Web UI，含缩放、全屏、主题自适应、关于页。
 

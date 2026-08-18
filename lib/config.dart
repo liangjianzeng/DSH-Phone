@@ -29,6 +29,7 @@ class SSHConfig {
   static const String keyUsername = 'username';
   static const String keyLocalPort = 'local_port';
   static const String keyAuthType = 'auth_type';
+  static const String keyAlias = 'alias';
 
   // 激活实例 / 超时
   static const String keyActiveProfile = 'active_profile';
@@ -52,6 +53,7 @@ class SSHConfig {
   final String password; // 密码认证时使用
   final String privateKeyPem; // 密钥认证时使用
   final String keyPassphrase; // 私钥口令（可空）
+  final String alias; // 实例别名（可空，为空时展示名回退为地址）
 
   const SSHConfig({
     this.host = '',
@@ -62,6 +64,7 @@ class SSHConfig {
     this.password = '',
     this.privateKeyPem = '',
     this.keyPassphrase = '',
+    this.alias = '',
   });
 
   bool get isConfigured =>
@@ -69,8 +72,11 @@ class SSHConfig {
 
   bool get useKey => authType == authTypeKey;
 
-  /// 展示名：地址为主，未配置时显示"未配置"。
-  String get label => host.isNotEmpty ? host : '未配置';
+  /// 展示名：优先别名；无别名时回退为地址（IP），未配置时显示"未配置"。
+  String get label {
+    if (alias.isNotEmpty) return alias;
+    return host.isNotEmpty ? host : '未配置';
+  }
 
   // ============ 单实例键名（按索引）============
 
@@ -102,6 +108,7 @@ class SSHConfig {
         password: password,
         privateKeyPem: privateKeyPem,
         keyPassphrase: keyPassphrase,
+        alias: prefs.getString(_pKey(i, keyAlias)) ?? '',
       ));
     }
     return list;
@@ -138,6 +145,7 @@ class SSHConfig {
     await prefs.setString(_pKey(i, keyUsername), config.username);
     await prefs.setInt(_pKey(i, keyLocalPort), config.localPort);
     await prefs.setString(_pKey(i, keyAuthType), config.authType);
+    await prefs.setString(_pKey(i, keyAlias), config.alias);
 
     const storage = FlutterSecureStorage();
     if (config.password.isNotEmpty) {

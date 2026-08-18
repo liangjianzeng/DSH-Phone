@@ -59,6 +59,7 @@ class _SetupScreenState extends State<SetupScreen> {
   late int _timeoutSeconds;
 
   late TextEditingController _host;
+  late TextEditingController _alias;
   late TextEditingController _sshPort;
   late TextEditingController _username;
   late TextEditingController _password;
@@ -84,6 +85,7 @@ class _SetupScreenState extends State<SetupScreen> {
   void _loadFromProfile(int index) {
     final c = widget.profiles[index];
     _host = TextEditingController(text: c.host);
+    _alias = TextEditingController(text: c.alias);
     _sshPort = TextEditingController(text: '${c.sshPort}');
     _username = TextEditingController(text: c.username);
     _password = TextEditingController(text: c.password);
@@ -96,6 +98,7 @@ class _SetupScreenState extends State<SetupScreen> {
   @override
   void dispose() {
     _host.dispose();
+    _alias.dispose();
     _sshPort.dispose();
     _username.dispose();
     _password.dispose();
@@ -116,9 +119,28 @@ class _SetupScreenState extends State<SetupScreen> {
     });
   }
 
+  /// 校验实例别名：可空；非空时加权长度不超过 15。
+  /// 中文（CJK）按 2 计、其他字符按 1 计，从而等价于"最多 7 个中文或 15 个英文字母"。
+  String? _validateAlias(String? v) {
+    final t = v?.trim() ?? '';
+    if (t.isEmpty) return null; // 空别名合法，展示名回退为地址
+    var weight = 0;
+    for (final code in t.runes) {
+      final isCjk = (code >= 0x4E00 && code <= 0x9FFF) || // 常用汉字
+          (code >= 0x3400 && code <= 0x4DBF) || // 扩展 A
+          (code >= 0x20000 && code <= 0x2A6DF) || // 扩展 B
+          (code >= 0xFF00 && code <= 0xFFEF) || // 全角标点/字母
+          code >= 0x2E80 && code <= 0x2EFF; // CJK 部首等
+      weight += isCjk ? 2 : 1;
+    }
+    if (weight > 15) return '别名过长：最多 7 个中文或 15 个英文字母';
+    return null;
+  }
+
   SSHConfig _buildConfig() {
     return SSHConfig(
       host: _host.text.trim(),
+      alias: _alias.text.trim(),
       sshPort: int.tryParse(_sshPort.text.trim()) ?? 22,
       username: _username.text.trim(),
       localPort: int.tryParse(_localPort.text.trim()) ?? 3081,
@@ -227,6 +249,18 @@ class _SetupScreenState extends State<SetupScreen> {
               validator: (v) => (v == null || v.trim().isEmpty)
                   ? '请输入 SSH 地址'
                   : null,
+            ),
+            const SizedBox(height: 12),
+            // 实例别名：可为空（为空时展示名回退为地址 IP）
+            TextFormField(
+              controller: _alias,
+              decoration: const InputDecoration(
+                labelText: '实例别名（可选）',
+                hintText: '如：家里的服务器 / Home Server',
+                helperText: '最多 7 个中文或 15 个英文字母；留空则显示地址（IP）',
+                border: OutlineInputBorder(),
+              ),
+              validator: _validateAlias,
             ),
             const SizedBox(height: 12),
             Row(
@@ -458,7 +492,7 @@ class _SetupScreenState extends State<SetupScreen> {
                   ListTile(
                     leading: const Icon(Icons.info_outline),
                     title: const Text('版本'),
-                    subtitle: const Text('DSH-Phone v0.1.1'),
+                    subtitle: const Text('DSH-Phone v0.1.2'),
                     trailing: const Icon(Icons.chevron_right),
                     onTap: _showAbout,
                   ),
@@ -513,7 +547,7 @@ class _SetupScreenState extends State<SetupScreen> {
         title: const Text('关于 DSH-Phone'),
         content: const SingleChildScrollView(
           child: Text(
-            'DSH-Phone v0.1.1\n\n'
+            'DSH-Phone v0.1.2\n\n'
             '一个在 Android 上通过 SSH 隧道访问 DeepSeek Harness Web UI 的客户端。\n\n'
             '工作原理：\n'
             '• 应用内置 dartssh2 建立 SSH 隧道\n'
