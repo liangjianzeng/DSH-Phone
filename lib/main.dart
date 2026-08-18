@@ -77,10 +77,10 @@ class _HomeState extends State<_Home> {
   }
 
   Future<void> _init() async {
-    final config = await SSHConfig.load();
+    final configured = await SSHConfig.anyConfigured();
     if (!mounted) return;
     setState(() {
-      _configured = config.isConfigured;
+      _configured = configured;
       _loading = false;
     });
   }
@@ -96,6 +96,18 @@ class _HomeState extends State<_Home> {
     if (_loading) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
-    return _configured ? const WebViewScreen() : const SetupScreen();
+    return _configured
+        ? const WebViewScreen()
+        : SetupScreen(
+            profileIndex: 0,
+            timeoutSeconds: SSHConfig.defaultTimeoutSeconds,
+            profiles: List.filled(SSHConfig.maxProfiles, const SSHConfig()),
+            // 首次启动：SetupScreen 是根页面，保存后通过回调通知更新状态，
+            // 避免直接 pop 根路由导致黑屏。
+            onSaved: () {
+              if (!mounted) return;
+              setState(() => _configured = true);
+            },
+          );
   }
 }

@@ -5,12 +5,17 @@ import 'config.dart';
 import 'tunnel_service.dart';
 
 /// 首次启动 / 设置页：配置 SSH 地址、用户名、认证方式（密钥或密码）、本地端口，
-/// 以及（已连接时）界面缩放与缓存刷新控制。
+/// 页面加载超时，以及（已连接时）界面缩放与缓存刷新控制。
+///
+/// 支持最多 3 路 SSH 实例配置：通过顶部标签切换要编辑的实例。
 class SetupScreen extends StatefulWidget {
   const SetupScreen({
     super.key,
-    this.initial,
+    required this.profileIndex,
+    required this.timeoutSeconds,
+    required this.profiles,
     this.showUiControls = false,
+    this.onSaved,
     this.zoomNotifier,
     this.onZoomIn,
     this.onZoomOut,
@@ -18,8 +23,19 @@ class SetupScreen extends StatefulWidget {
     this.onRefreshCache,
   });
 
-  /// 已有配置时传入，用于回填（从设置页进入时）。
-  final SSHConfig? initial;
+  /// 当前编辑的实例索引。
+  final int profileIndex;
+
+  /// 当前页面加载超时（秒）。
+  final int timeoutSeconds;
+
+  /// 全部实例配置（用于标签切换编辑）。
+  final List<SSHConfig> profiles;
+
+  /// 首次启动时 SetupScreen 作为根页面展示，保存成功后通过此回调通知父级
+  /// 更新"已配置"状态（而不是 pop 根路由导致黑屏）。为 null 时走
+  /// [Navigator.pop(true)]（编辑页场景）。
+  final VoidCallback? onSaved;
 
   /// 是否显示界面控制（缩放/刷新缓存）——仅在已连接时由主界面传入。
   final bool showUiControls;
@@ -39,6 +55,9 @@ class SetupScreen extends StatefulWidget {
 class _SetupScreenState extends State<SetupScreen> {
   final _formKey = GlobalKey<FormState>();
 
+  late int _profileIndex;
+  late int _timeoutSeconds;
+
   late TextEditingController _host;
   late TextEditingController _sshPort;
   late TextEditingController _username;
@@ -56,7 +75,14 @@ class _SetupScreenState extends State<SetupScreen> {
   @override
   void initState() {
     super.initState();
-    final c = widget.initial ?? const SSHConfig();
+    _profileIndex = widget.profileIndex.clamp(0, SSHConfig.maxProfiles - 1);
+    _timeoutSeconds = widget.timeoutSeconds;
+    _loadFromProfile(_profileIndex);
+  }
+
+  /// 把指定实例配置回填到表单控件。
+  void _loadFromProfile(int index) {
+    final c = widget.profiles[index];
     _host = TextEditingController(text: c.host);
     _sshPort = TextEditingController(text: '${c.sshPort}');
     _username = TextEditingController(text: c.username);
@@ -77,6 +103,17 @@ class _SetupScreenState extends State<SetupScreen> {
     _keyPassphrase.dispose();
     _localPort.dispose();
     super.dispose();
+  }
+
+  /// 切换要编辑的实例标签（放弃未保存的编辑）。
+  void _switchProfile(int index) {
+    if (index == _profileIndex) return;
+    setState(() {
+      _profileIndex = index;
+      _loadFromProfile(index);
+      _testResult = null;
+      _testPassed = false;
+    });
   }
 
   SSHConfig _buildConfig() {
@@ -124,11 +161,22 @@ class _SetupScreenState extends State<SetupScreen> {
     if (!_formKey.currentState!.validate()) return;
     FocusScope.of(context).unfocus();
     setState(() => _saving = true);
-    final config = _buildConfig();
-    await config.save();
+    // 保存当前实例配置 + 页面加载超时
+    await SSHConfig.saveProfile(_profileIndex, _buildConfig());
+    await SSHConfig.saveTimeoutSeconds(_timeoutSeconds);
+    // 首次配置时，若尚无激活实例则把当前编辑实例设为激活
+    if (widget.profileIndex == _profileIndex ||
+        !(await SSHConfig.loadActive()).isConfigured) {
+      await SSHConfig.setActiveIndex(_profileIndex);
+    }
     if (mounted) setState(() => _saving = false);
     if (mounted) {
-      Navigator.of(context).pop(true);
+      if (widget.onSaved != null) {
+        // 首次启动根页面：通知父级更新状态，不 pop 根路由
+        widget.onSaved!();
+      } else {
+        Navigator.of(context).pop(true);
+      }
     }
   }
 
@@ -149,6 +197,24 @@ class _SetupScreenState extends State<SetupScreen> {
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
+            // 实例标签：最多 3 路 SSH 实例配置
+            const Text('连接实例（最多 3 路）', style: TextStyle(fontSize: 18)),
+            const SizedBox(height: 8),
+            SegmentedButton<int>(
+              segments: [
+                for (var i = 0; i < SSHConfig.maxProfiles; i++)
+                  ButtonSegment<int>(
+                    value: i,
+                    label: Text('实例${i + 1}'),
+                    tooltip: widget.profiles[i].label,
+                  ),
+              ],
+              selected: {_profileIndex},
+              showSelectedIcon: true,
+              onSelectionChanged: (selection) =>
+                  _switchProfile(selection.first),
+            ),
+            const SizedBox(height: 16),
             const Text('SSH 连接配置', style: TextStyle(fontSize: 18)),
             const SizedBox(height: 8),
             TextFormField(
@@ -268,6 +334,36 @@ class _SetupScreenState extends State<SetupScreen> {
                 ),
               ),
             ],
+            const SizedBox(height: 16),
+            const Divider(),
+            // 页面加载超时设置
+            const Text('加载超时', style: TextStyle(fontSize: 16)),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '页面加载超时（秒）：$_timeoutSeconds',
+                    style: const TextStyle(fontSize: 14),
+                  ),
+                ),
+                const Text('默认 60 · 最大 180',
+                    style: TextStyle(fontSize: 12, color: Colors.grey)),
+              ],
+            ),
+            Slider(
+              value: _timeoutSeconds.toDouble(),
+              min: SSHConfig.minTimeoutSeconds.toDouble(),
+              max: SSHConfig.maxTimeoutSeconds.toDouble(),
+              divisions: 15,
+              label: '$_timeoutSeconds 秒',
+              onChanged: (v) =>
+                  setState(() => _timeoutSeconds = v.round()),
+            ),
+            Text(
+              '大上下文会话历史加载较慢时，可适当调大超时，避免提示超时。',
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
+            ),
             if (widget.showUiControls) ...[
               const SizedBox(height: 16),
               const Divider(),
@@ -362,7 +458,7 @@ class _SetupScreenState extends State<SetupScreen> {
                   ListTile(
                     leading: const Icon(Icons.info_outline),
                     title: const Text('版本'),
-                    subtitle: const Text('DSH-Phone v0.1.0'),
+                    subtitle: const Text('DSH-Phone v0.1.1'),
                     trailing: const Icon(Icons.chevron_right),
                     onTap: _showAbout,
                   ),
@@ -417,13 +513,14 @@ class _SetupScreenState extends State<SetupScreen> {
         title: const Text('关于 DSH-Phone'),
         content: const SingleChildScrollView(
           child: Text(
-            'DSH-Phone v0.1.0\n\n'
+            'DSH-Phone v0.1.1\n\n'
             '一个在 Android 上通过 SSH 隧道访问 DeepSeek Harness Web UI 的客户端。\n\n'
             '工作原理：\n'
             '• 应用内置 dartssh2 建立 SSH 隧道\n'
             '• 将手机 127.0.0.1:<端口> 转发到远程 127.0.0.1:3080\n'
             '• 用 WebView 以 loopback 身份加载远程 DSH 界面\n'
-            '• 配置/模型等特权接口因 loopback 而可用\n\n'
+            '• 配置/模型等特权接口因 loopback 而可用\n'
+            '• 最多配置 3 路 SSH 实例，顶部状态栏自由切换\n\n'
             '开源：github.com/liangjianzeng/DSH-Phone',
           ),
         ),
