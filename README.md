@@ -5,8 +5,8 @@
 DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 用户名 / 认证方式（SSH 密钥或密码），应用自动建立 SSH 隧道（`127.0.0.1:<localPort>` → 远程 `127.0.0.1:3080`），并通过 WebView 加载 DSH Web UI。内置本地缓存加速、SSH 保活、界面缩放与全屏显示、主题自适应，以及手动修改连接配置 / 刷新缓存 / 查看关于的入口。
 
 - **开源地址**：https://github.com/liangjianzeng/DSH-Phone
-- **当前版本**：v0.1.2
-- **安装包**：[`apk/DSH-Phone-v0.1.2.apk`](apk/DSH-Phone-v0.1.2.apk)（旧版 [`apk/DSH-Phone-v0.1.1.apk`](apk/DSH-Phone-v0.1.1.apk) 见仓库）
+- **当前版本**：v0.1.3
+- **安装包**：[`apk/DSH-Phone-v0.1.3.apk`](apk/DSH-Phone-v0.1.3.apk)（旧版 [`apk/DSH-Phone-v0.1.2.apk`](apk/DSH-Phone-v0.1.2.apk)、[`apk/DSH-Phone-v0.1.1.apk`](apk/DSH-Phone-v0.1.1.apk) 见仓库）
 
 ## 工作原理
 
@@ -52,9 +52,14 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - 🧭 **WebView 加载 DSH Web UI**：`flutter_inappwebview`，loopback 访问，模型/设置等特权接口可用。
 - 💾 **本地缓存加速**：优先使用本地缓存，缺才走网络；支持手动清缓存刷新。
 - 🔍 **界面缩放**：双指缩放 + 顶栏/设置页 放大、缩小、重置；缩放比例**自动保存**，下次沿用。
+- 🎛️ **对话区缩放控件开关**：对话区左侧的放大/缩小/重置浮动按钮默认隐藏，可在设置 → 界面设置中一键开启，避免遮挡内容。
+- 📄 **成果原生查看器**：点击对话中的成果（Markdown / HTML / 代码 / 文本文件）直接以原生渲染打开——Markdown 渲染、HTML 原生渲染、代码语法高亮，背景跟随深浅色主题；查看页状态栏提供**另存为**按钮，可随时保存到本机。
+- 💾 **编码自动检测**：通过 SFTP 读取云端文件，自动识别 UTF-8 / GBK（GB2312）/ ASCII，中文路径与内容不再乱码。
+- 📦 **资源下载（断点续传 + 另存为）**：点击 apk / 压缩包等二进制成果进入下载页，显示进度与大小；支持**暂停 / 继续（断点续传）**、取消、失败重试；下载完成弹窗提示，通过系统文件选择器（SAF）**选择保存位置**。
+- 🧩 **隐藏产物路径解析**：DSH 产物 chips 被隐藏时，自动用可见产物的目录 + 文件名拼接并经 SSH 验证定位云端路径，确保点击仍能正确分流查看/下载。
 - 🖥️ **全屏边缘到边缘**：顶栏延伸到系统状态栏区域，最大化显示面积。
 - 🌗 **主题自适应**：跟随系统深色 / 浅色模式，背景与状态栏图标自动切换。
-- ⚙️ **设置管理**：修改地址 / 用户名 / 认证、清空缓存、缩放控制、刷新缓存。
+- ⚙️ **设置管理**：修改地址 / 用户名 / 认证、清空缓存、缩放控制、对话区缩放控件开关、刷新缓存。
 - ℹ️ **关于**：显示版本、项目原理、开源地址，可直接跳转 GitHub / README。
 - 🔒 **敏感信息加密**：密码 / 私钥存于 Android Keystore（`flutter_secure_storage`）。
 
@@ -94,25 +99,36 @@ flutter build apk --release
 | 包 | 用途 |
 |----|------|
 | `dartssh2`（本地 fork，`third_party/`） | 纯 Dart SSH 客户端：认证 + 本地端口转发 + 保活 + zlib 压缩 / 批量解密优化 |
-| `flutter_inappwebview` | WebView、本地缓存控制、缩放 |
+| `flutter_inappwebview` | WebView、本地缓存控制、缩放、JS 成果识别桥 |
 | `flutter_secure_storage` | 密码 / 私钥加密存储 |
-| `shared_preferences` | 非敏感配置持久化（含缩放比例 / 多实例） |
+| `shared_preferences` | 非敏感配置持久化（含缩放比例 / 多实例 / 缩放控件开关） |
 | `url_launcher` | 打开 GitHub / README 链接 |
+| `flutter_markdown` | 成果查看器：Markdown 原生渲染（跟随主题） |
+| `flutter_highlight` + `highlight` | 成果查看器：代码语法高亮（深浅色主题） |
+| `flutter_widget_from_html_core` | 成果查看器：HTML 原生渲染 |
+| `charset` | 文件编码自动检测（UTF-8 / GBK / ASCII） |
+| `file_picker` | 下载 / 另存为：系统文件选择器（SAF）保存位置 |
+| `path_provider` | 下载临时目录 |
 
 ## 目录结构
 
 ```
 lib/
-├── main.dart           # 应用入口：主题/全屏、首次启动判断
-├── config.dart         # SSH 配置模型 + 持久化（最多 3 路实例 / 加载超时 / 旧配置迁移）
-├── tunnel_service.dart # SSH 隧道服务（认证 / 转发 / 保活 / 断线重连 / 双向透传）
-├── setup_screen.dart   # 设置 / 首次引导页（实例编辑 / 超时 / 界面控制 / 关于）
-└── webview_screen.dart # WebView 主界面（实例切换 / 缓存 / 缩放 / 加载状态）
-third_party/dartssh2/   # 本地 fork 的 dartssh2（吞吐优化）
+├── main.dart                 # 应用入口：主题/全屏、首次启动判断
+├── config.dart               # SSH 配置模型 + 持久化（最多 3 路实例 / 加载超时 / 旧配置迁移）
+├── tunnel_service.dart       # SSH 隧道服务（认证 / 转发 / 保活 / 断线重连 / SFTP 读取 / 路径解析）
+├── setup_screen.dart         # 设置 / 首次引导页（实例编辑 / 超时 / 界面控制 / 关于）
+├── webview_screen.dart       # WebView 主界面（实例切换 / 缓存 / 缩放 / 成果识别桥 / 路由）
+├── artifact_recognizer.dart  # 成果类型识别（markdown/html/代码/文件/资源）
+├── artifact_viewer_screen.dart # 成果原生查看器（md/html/代码渲染 + 另存为）
+├── download_manager.dart     # 会话级下载管理（断点续传 / 暂停 / 取消）
+└── download_screen.dart      # 资源下载页（进度 / 暂停继续 / 另存为）
+third_party/dartssh2/         # 本地 fork 的 dartssh2（吞吐优化）
 ```
 
 ## 版本记录
 
+- **v0.1.3**：成果原生查看器（Markdown / HTML / 代码高亮 / 文本，编码自动检测，另存为）；资源下载（进度、暂停/断点续传、取消、失败重试、SAF 另存为）；对话区缩放控件开关（默认隐藏）；隐藏产物路径自动解析；SFTP 读取解决中文路径/内容乱码。
 - **v0.1.2**：实例别名（最多 7 个中文 / 15 个英文字母，顶栏优先显示别名而非地址）；首次连接异常静默直接重连、连续异常才提示；修复 Windows 构建（AGP 8.2.1 / minSdk 23 / 禁用 jetifier）。
 - **v0.1.1**：多连接实例（最多 3 路）与顶栏切换、可配置页面加载超时、本地 `dartssh2` fork 吞吐优化（zlib 压缩 + 批量解密）、去掉隧道节流、断线重连递增退避 + 上限、release 签名。
 - **v0.1.0**：首个发布版。SSH 隧道访问 DSH Web UI，含缩放、全屏、主题自适应、关于页。
