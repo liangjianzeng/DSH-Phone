@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 0.1.2+4
+version: 0.1.3+5
 
 environment:
   sdk: ^3.6.0
@@ -39,6 +39,14 @@ dependencies:
   shared_preferences: ^2.5.3
   flutter_secure_storage: ^10.3.1
   url_launcher: ^6.3.2
+  # 方案 C：原生成果查看器渲染依赖
+  flutter_markdown: ^0.7.3      # Markdown 渲染
+  flutter_highlight: ^0.7.0     # 代码块高亮（依赖 highlight）
+  highlight: ^0.7.0             # 语法高亮核心（与 flutter_highlight 兼容）
+  flutter_widget_from_html_core: ^0.15.2 # HTML 原生渲染（核心版，无重型集成依赖）
+  charset: ^2.0.1                      # 文件编码自动检测（UTF-8/GBK 等）
+  file_picker: ^8.1.2                  # 下载完成后的系统"另存为"位置选择（SAF）
+  path_provider: ^2.1.5                # 下载临时目录
 
 dependency_overrides:
   # 本地 fork 的 dartssh2：优化解密（processAll 批处理）+ 启用 zlib 压缩，

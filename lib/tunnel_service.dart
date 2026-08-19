@@ -1,6 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:charset/charset.dart' show Charset, gbk;
 import 'package:dartssh2/dartssh2.dart';
 
 import 'config.dart';
@@ -193,6 +196,108 @@ class TunnelService {
       forwardSub.cancel().catchError((_) {});
       forward.destroy();
     });
+  }
+
+  /// 通过现有 SSH 会话读取云端主机上的文件内容（用于成果查看）。
+  ///
+  /// [remotePath] 为云端文件路径（如 `E:\Work\CaTv\xxx.md` 或 `/home/user/xxx.md`）。
+  /// 采用 **SFTP** 读取：绕开 shell 命令对中文路径的编码问题（Windows cmd 用
+  /// GBK 而 exec 命令按 UTF-8 发送，中文路径会被误解码）。
+  /// 隧道未连接时返回空字符串（由查看器提示）。
+  Future<String> readRemoteFile(String remotePath) async {
+    final client = _client;
+    if (client == null) return '';
+    // 尝试多种 SFTP 路径形态（Windows 盘符路径的表示差异）
+    for (final path in _sftpPathCandidates(remotePath)) {
+      SftpFile? file;
+      try {
+        final sftp = await client.sftp();
+        file = await sftp.open(path);
+        final bytes = await file.readBytes();
+        return _decodeBytes(bytes);
+      } catch (e) {
+        print('[DSH] readRemoteFile failed for "$path": $e');
+      } finally {
+        if (file != null) await file.close();
+      }
+    }
+    return '';
+  }
+
+  /// 解析远程路径并打开 SFTP 文件句柄（用于资源下载/断点续传）。
+  ///
+  /// 尝试多种路径形态（与 [readRemoteFile] 一致的候选规则），
+  /// 打开成功即返回，调用方负责 `close()`。隧道未连接或全部形态
+  /// 打开失败时返回 null。
+  Future<SftpFile?> openRemoteFile(String remotePath) async {
+    final client = _client;
+    if (client == null) return null;
+    for (final path in _sftpPathCandidates(remotePath)) {
+      try {
+        final sftp = await client.sftp();
+        return await sftp.open(path);
+      } catch (e) {
+        print('[DSH] openRemoteFile failed for "$path": $e');
+      }
+    }
+    return null;
+  }
+
+  /// 用候选目录 + 文件名拼接云端路径，逐个尝试 SFTP 打开，
+  /// 返回第一个可打开的完整路径；全部失败返回 null。
+  ///
+  /// 用于 DSH 产物 chips 被隐藏（只有文件名、无完整路径）的场景。
+  Future<String?> resolveRemotePath(String filename, List<String> dirs) async {
+    for (final dir in dirs) {
+      for (final sep in [r'\', '/']) {
+        final cand = (dir.endsWith(r'\') || dir.endsWith('/'))
+            ? '$dir$filename'
+            : '$dir$sep$filename';
+        final file = await openRemoteFile(cand);
+        if (file != null) {
+          await file.close();
+          print('[DSH] resolved "$filename" -> "$cand"');
+          return cand;
+        }
+      }
+    }
+    return null;
+  }
+
+  /// 生成待尝试的 SFTP 路径：原样 → 反斜杠转正斜杠 → 前缀 `/`。
+  List<String> _sftpPathCandidates(String p) {
+    final normalized = p.replaceAll(r'\', '/');
+    return <String>[
+      p,
+      normalized,
+      normalized.startsWith('/') ? normalized : '/$normalized',
+    ];
+  }
+
+  /// 读取云端文件原始字节（用于"另存为"时保留原始编码，如 GBK）。
+  ///
+  /// 打开失败返回 null。仅读内存（小文本文件），大文件请走下载流。
+  Future<Uint8List?> readRemoteFileBytes(String remotePath) async {
+    final file = await openRemoteFile(remotePath);
+    if (file == null) return null;
+    try {
+      return await file.readBytes();
+    } catch (e) {
+      print('[DSH] readRemoteFileBytes failed: $e');
+      return null;
+    } finally {
+      await file.close();
+    }
+  }
+
+  /// 健壮解码：先自动检测编码（UTF-8 → GBK/GB2312 → ASCII），
+  /// 检测/解码异常时兜底 UTF-8 宽松解码，避免返回空导致白屏。
+  String _decodeBytes(Uint8List bytes) {
+    try {
+      final detected = Charset.detect(bytes, orders: [utf8, gbk, ascii]);
+      if (detected != null) return detected.decode(bytes);
+    } catch (_) {}
+    return utf8.decode(bytes, allowMalformed: true);
   }
 
   /// 主动断开隧道并清理。

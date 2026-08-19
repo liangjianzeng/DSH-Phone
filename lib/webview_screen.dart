@@ -4,7 +4,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'artifact_recognizer.dart';
+import 'artifact_viewer_screen.dart';
 import 'config.dart';
+import 'download_manager.dart';
+import 'download_screen.dart';
 import 'setup_screen.dart';
 import 'tunnel_service.dart';
 
@@ -49,8 +53,14 @@ class _WebViewScreenState extends State<WebViewScreen> {
   static const double _zoomMax = 2.5;
   static const double _zoomStep = 0.1;
 
+  /// 对话区左侧浮动缩放控件的开关键（持久化，默认关闭）。
+  static const String _zoomControlsPrefKey = 'webview_zoom_controls_enabled';
+
   /// 缩放比例共享通知器：设置页可实时监听并展示。
   final ValueNotifier<double> _zoomScaleNotifier = ValueNotifier<double>(1.0);
+
+  /// 对话区左侧浮动缩放控件是否显示（默认关闭，由设置页开关控制）。
+  bool _zoomControlsEnabled = false;
 
   // ---- WebView 页面加载状态 ----
   bool _pageLoading = false; // 远程页面加载中（隧道已通，页面未就绪）
@@ -64,6 +74,182 @@ class _WebViewScreenState extends State<WebViewScreen> {
       '\n\n提示：VPN 组网（WireGuard/Tailscale 走 UDP）跨运营商时可能被 QoS 限速/丢包，'
       '导致请求缓慢或超时。建议端侧与云端联网处于同一网络运营商下使用；'
       '必要时可在设置中调大页面加载超时。';
+
+  /// 成果识别 JS 桥：页面内注入全局点击监听，把点击命中的成果
+  /// （代码块 / 文件型链接 / markdown 显式容器）通过
+  /// `flutter_inappwebview.callHandler('onArtifactClick', {...})` 回传 Flutter。
+  ///
+  /// 代码块/markdown 内容由 JS 侧直接提取文本；文件型成果在页面内 `fetch`
+  /// （天然带隧道/鉴权上下文）后连同文本一起回传。
+  static const String _artifactBridgeJs = r'''
+(function() {
+  if (window.__dshArtifactBridge) return;
+  window.__dshArtifactBridge = true;
+
+  function closestUp(el, selectors) {
+    var c = el;
+    while (c && c !== document.documentElement) {
+      for (var i = 0; i < selectors.length; i++) {
+        if (c.matches && c.matches(selectors[i])) return c;
+      }
+      c = c.parentElement;
+    }
+    return null;
+  }
+
+  function send(payload) {
+    try {
+      window.flutter_inappwebview.callHandler('onArtifactClick', payload);
+    } catch (e) {}
+  }
+
+  function collectDebug(container) {
+    var debug = { codeOuter: '', parentOuter: '', dataAttrs: {}, linksInParent: [] };
+    if (!container) return debug;
+    debug.codeOuter = (container.outerHTML || '').slice(0, 500);
+    if (container.parentElement) debug.parentOuter = container.parentElement.outerHTML.slice(0, 500);
+    for (var i = 0; i < container.attributes.length; i++) {
+      debug.dataAttrs[container.attributes[i].name] = container.attributes[i].value;
+    }
+    var p = container.parentElement;
+    if (p) {
+      var as = p.querySelectorAll('a');
+      for (var j = 0; j < as.length; j++) debug.linksInParent.push(as[j].getAttribute('href'));
+    }
+    return debug;
+  }
+
+  // 在整个文档中查找 file-mention 按钮（"产物"chips，title 存完整路径），
+  // 返回其 title（完整路径）。用于把对话里"文件名文本"（表格单元格/代码块）
+  // 解析成产物路径：文件名是 DSH 产物时，chips 里必有对应按钮。
+  function findMentionPath(filename) {
+    var buttons = document.querySelectorAll('button');
+    for (var i = 0; i < buttons.length; i++) {
+      var b = buttons[i];
+      var title = b.getAttribute('title') || '';
+      if (!title) continue;
+      var base = title.split(/[\\/]+/).pop() || '';
+      if (base === filename) return title;
+    }
+    return '';
+  }
+
+  // 收集页面上所有"产物"chips（title 含完整路径）的目录列表，去重。
+  // 反查不到路径时（chips 被隐藏），用目录 + 文件名拼接候选路径。
+  function collectProducedDirs() {
+    var dirs = [];
+    var buttons = document.querySelectorAll('button');
+    for (var i = 0; i < buttons.length; i++) {
+      var title = buttons[i].getAttribute('title') || '';
+      if (!title) continue;
+      var at = Math.max(title.lastIndexOf('/'), title.lastIndexOf('\\'));
+      if (at > 0) {
+        var dir = title.slice(0, at);
+        if (dirs.indexOf(dir) < 0) dirs.push(dir);
+      }
+    }
+    return dirs;
+  }
+
+  document.addEventListener('click', function(ev) {
+    var t = ev.target;
+
+    // 资源型后缀（apk/压缩包等二进制，走下载保存流程）
+    var isResourceSuffix = /\.(apk|zip|tar|gz|tgz|rar|7z|xz|bin|exe|msi|dmg|iso|img|mp4|mp3|pdf|png|jpg|jpeg|gif|webp|svg|doc|docx|xls|xlsx|ppt|pptx|so|a|dll)(\?|#|$)/i;
+
+    // 1) 文件型成果链接：优先判断，即使链接包裹在 pre/code 里。
+    var a = closestUp(t, ['a']);
+    if (a) {
+      var href = a.getAttribute('href') || '';
+      var isFile = /\/api\/files\/|\/files\/|\/api\/artifact\/|\/artifacts\/|\.(md|markdown|html|htm|txt|json|csv)(\?|#|$)/i.test(href);
+      var isResource = isResourceSuffix.test(href);
+      if (isFile || isResource) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (isResource) {
+          // 资源型链接：无远端路径，交由 Dart 侧提示（无法经 SFTP 下载）
+          send({type: 'resource', url: a.href, language: '', content: '', path: '', debug: collectDebug(a)});
+          return;
+        }
+        fetch(a.href).then(function(r){ return r.text(); }).then(function(text){
+          send({type: 'file', url: a.href, language: '', content: text, debug: collectDebug(a)});
+        }).catch(function(err){
+          send({type: 'file', url: a.href, language: '', content: '', debug: collectDebug(a)});
+        });
+        return;
+      }
+    }
+
+    // 2) 文件成果按钮：DSH 把文件成果渲染为
+    //    <button class="_fileMention_*" title="云端路径">文件名</button>，
+    //    云端路径在 title/aria-label 里，须先于代码块检测。
+    //    资源类按钮同样以路径形式存在，这里放宽：路径带资源/可查看后缀即拦截。
+    var mention = closestUp(t, ['button']);
+    if (mention) {
+      var cls = mention.className || '';
+      var title = mention.getAttribute('title') || '';
+      var label = mention.getAttribute('aria-label') || '';
+      var filePath = title || label || '';
+      var isMention = cls.indexOf('fileMention') >= 0 ||
+          /\.(md|markdown|html|htm|txt|json|csv|apk|zip|tar|gz|tgz|rar|7z|xz|bin|exe|msi|dmg|iso|img|mp4|mp3|pdf|png|jpg|jpeg|gif|webp|svg|doc|docx|xls|xlsx|ppt|pptx|so|a|dll)(\?|#|$)/i.test(filePath);
+      if (isMention && filePath) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        // 资源型（apk 等二进制）：走下载保存流程；否则经 SSH 读取查看。
+        var isResource = isResourceSuffix.test(filePath);
+        send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: filePath});
+        return;
+      }
+    }
+
+    // 3) 代码块：命中 pre/code（非链接），提取文本与语言。
+    //    若 code 内容只是单个文件名（如对话表格单元格/代码块里的文件名），
+    //    且页面里有对应的"产物"chips（title 含完整路径），按文件/资源处理。
+    var code = closestUp(t, ['pre', 'code']);
+    if (code) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      var text = code.innerText || code.textContent || '';
+      var trimmed = text.trim();
+      var singleLine = trimmed.indexOf('\n') < 0 && trimmed.length > 0;
+      var suffixRe = /\.(md|markdown|html|htm|txt|json|csv|apk|zip|tar|gz|tgz|rar|7z|xz|bin|exe|msi|dmg|iso|img|mp4|mp3|pdf|png|jpg|jpeg|gif|webp|svg|doc|docx|xls|xlsx|ppt|pptx|so|a|dll)$/i;
+      if (singleLine && suffixRe.test(trimmed)) {
+        // 先按文件名在整个文档的产物 chips 里反查完整路径；
+        // 若文本自身已含路径分隔符（/ 或 \），则直接用文本作为路径。
+        var mentionPath = findMentionPath(trimmed);
+        if (!mentionPath && /[\\/]/.test(trimmed)) mentionPath = trimmed;
+        if (mentionPath) {
+          var isResource = isResourceSuffix.test(mentionPath);
+          send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: mentionPath, debug: collectDebug(code)});
+          return;
+        }
+        // 反查失败（该文件 chips 被隐藏）：回传文件名 + 可见产物目录，
+        // 由 Dart 侧逐个拼接目录定位云端路径。
+        var dirs = collectProducedDirs();
+        if (dirs.length > 0) {
+          var isResource = isResourceSuffix.test(trimmed);
+          send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: trimmed, dirs: dirs, debug: collectDebug(code)});
+          return;
+        }
+      }
+      var lang = '';
+      var m = (code.className || '').match(/language-([\w-]+)/);
+      if (m) lang = m[1];
+      send({type: 'code', url: '', language: lang, content: text, debug: collectDebug(code)});
+      return;
+    }
+
+    // 3) Markdown 成果：仅显式标记容器，避免误报
+    var md = closestUp(t, ['[data-dsh-artifact]', '.dsh-markdown', '.artifact-markdown']);
+    if (md) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      send({type: 'markdown', url: '', language: '', content: md.innerText || md.textContent || '', debug: collectDebug(md)});
+      return;
+    }
+  }, true);
+})();
+''';
 
   /// 若是网络超时/缓慢类错误，追加 VPN UDP QoS 友好提示。
   static String _appendQosHintIfTimeout(String message) {
@@ -91,6 +277,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
     _tunnelSub = TunnelService.instance.statusStream.listen(_onTunnelStatus);
     _load();
     _loadZoomScale();
+    _loadZoomControls();
   }
 
   /// 读取持久化的缩放比例。
@@ -106,6 +293,23 @@ class _WebViewScreenState extends State<WebViewScreen> {
   Future<void> _saveZoomScale() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setDouble(_zoomPrefKey, _zoomScaleNotifier.value);
+  }
+
+  /// 读取持久化的对话区缩放控件开关。
+  Future<void> _loadZoomControls() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool(_zoomControlsPrefKey) ?? false;
+    if (!mounted) return;
+    setState(() => _zoomControlsEnabled = enabled);
+  }
+
+  /// 保存并应用对话区缩放控件开关（默认关闭）。
+  void _setZoomControlsEnabled(bool enabled) {
+    if (!mounted) return;
+    setState(() => _zoomControlsEnabled = enabled);
+    SharedPreferences.getInstance().then(
+      (prefs) => prefs.setBool(_zoomControlsPrefKey, enabled),
+    );
   }
 
   /// 通过 CSS zoom 应用缩放比例（页面就绪后调用）。
@@ -288,6 +492,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
           onZoomOut: () => _adjustZoom(-_zoomStep),
           onResetZoom: _resetZoom,
           onRefreshCache: _refreshCache,
+          zoomControlsEnabled: _zoomControlsEnabled,
+          onZoomControlsChanged: _setZoomControlsEnabled,
         ),
       ),
     );
@@ -307,6 +513,120 @@ class _WebViewScreenState extends State<WebViewScreen> {
     } catch (_) {
       // controller 可能已失效，忽略
     }
+  }
+
+  // ================= 成果识别桥（方案 C）=================
+
+  /// 注册成果点击 handler 并注入监听脚本。
+  ///
+  /// handler 随 controller 常驻；监听脚本按页面加载注入（onLoadStop），
+  /// 因为每次页面导航 DOM 都会重建。
+  void _setupArtifactBridge(InAppWebViewController controller) {
+    controller.addJavaScriptHandler(
+      handlerName: 'onArtifactClick',
+      callback: (List<Object?> args) async {
+        debugPrint('ARTIFACT_RAW_ARGS: $args');
+        if (args.isEmpty || !mounted) return null;
+        final raw = args.first;
+        if (raw is! Map) return null;
+        final hit = parseArtifactHit(raw);
+        debugPrint('ARTIFACT_HIT: type=${hit.type} url=${hit.url} '
+            'lang=${hit.language} contentLen=${hit.content.length}');
+        if (hit.isNone || !mounted) return null;
+        await _openArtifact(hit);
+        return null;
+      },
+    );
+    // 立即注入一次；页面导航后 onLoadStop 会再次注入。
+    controller.evaluateJavascript(source: _artifactBridgeJs);
+  }
+
+  /// 页面加载完成后注入成果监听脚本（每次导航 DOM 重建后重新绑定）。
+  void _injectArtifactBridge() {
+    final c = _controller;
+    if (c == null) return;
+    c.evaluateJavascript(source: _artifactBridgeJs);
+  }
+
+  /// 打开原生成果查看器：以全屏路由叠在对话之上，关闭即返回对话。
+  Future<void> _openArtifact(ArtifactHit hit) async {
+    // path 只有文件名时（chips 被隐藏场景），先用候选目录拼接定位云端路径。
+    final resolved = await _resolveHitPath(hit);
+    if (!mounted) return;
+    hit = resolved;
+    // 资源型成果（apk/压缩包等）：转下载页（含断点续传 + 另存为）。
+    if (hit.type == ArtifactType.resource) {
+      _openResourceDownload(hit);
+      return;
+    }
+    // 文件型成果：内容经 SSH 读取云端文件（复用隧道会话），打开后异步加载。
+    final loader = hit.type == ArtifactType.file && hit.path.isNotEmpty
+        ? () => TunnelService.instance.readRemoteFile(hit.path)
+        : null;
+    // 另存为时读取原始字节（保留原始编码，如 GBK）。
+    final rawBytesLoader = hit.type == ArtifactType.file && hit.path.isNotEmpty
+        ? () => TunnelService.instance.readRemoteFileBytes(hit.path)
+        : null;
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => ArtifactViewerScreen(
+          type: hit.type,
+          url: hit.url,
+          language: hit.language,
+          content: hit.content,
+          loader: loader,
+          fileName: hit.path.isNotEmpty ? _basename(hit.path) : null,
+          rawBytesLoader: rawBytesLoader,
+        ),
+      ),
+    );
+  }
+
+  /// 解析成果云端路径：path 已含路径分隔符视为完整路径；否则用候选目录
+  /// （[ArtifactHit.dirs]）逐个拼接并经 SFTP 验证，返回首个可打开的路径。
+  Future<ArtifactHit> _resolveHitPath(ArtifactHit hit) async {
+    if (hit.path.contains(r'\') || hit.path.contains('/')) return hit;
+    if (hit.dirs.isEmpty || hit.path.isEmpty) return hit;
+    final resolved =
+        await TunnelService.instance.resolveRemotePath(hit.path, hit.dirs);
+    if (resolved == null || resolved.isEmpty) return hit;
+    return ArtifactHit(
+      type: hit.type,
+      url: hit.url,
+      language: hit.language,
+      content: hit.content,
+      path: resolved,
+    );
+  }
+
+  /// 资源型成果：经 SSH 下载（复用隧道会话），打开下载页。
+  ///
+  /// 仅当云端路径可用（文件成果按钮的 title/aria-label）时经 SFTP 下载；
+  /// 仅含链接地址的资源无法取得远端路径，提示不支持直接下载。
+  /// 立即打开下载页（任务后台启动），避免等待 SFTP 打开导致"点开灰屏/无反应"。
+  void _openResourceDownload(ArtifactHit hit) {
+    if (!mounted) return;
+    if (hit.path.isEmpty) {
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..showSnackBar(const SnackBar(content: Text('该资源不支持直接下载')));
+      return;
+    }
+    final task = DownloadManager.instance.start(hit.path);
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => DownloadScreen(task: task),
+      ),
+    );
+  }
+
+  /// 取路径最后一段（兼容 `/` 与 `\` 分隔），用于查看器保存文件名。
+  static String _basename(String p) {
+    final norm = p.replaceAll(r'\', '/');
+    final i = norm.lastIndexOf('/');
+    return i >= 0 ? norm.substring(i + 1) : norm;
   }
 
   // ================= WebView 加载回调 =================
@@ -509,7 +829,10 @@ class _WebViewScreenState extends State<WebViewScreen> {
                 supportZoom: true,
                 displayZoomControls: false,
               ),
-              onWebViewCreated: (controller) => _controller = controller,
+              onWebViewCreated: (controller) {
+                _controller = controller;
+                _setupArtifactBridge(controller);
+              },
               onLoadStart: (controller, url) => _onPageLoadStart(),
               onProgressChanged: (controller, progress) =>
                   _onPageProgress(progress),
@@ -517,6 +840,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
                 _onPageLoadStop();
                 // 页面就绪后应用持久化的缩放比例
                 _applyZoom();
+                // 每次页面导航后重新注入成果监听脚本
+                _injectArtifactBridge();
               },
               onReceivedError: (controller, request, error) => _onPageError(
                 '加载失败：${error.description}\n'
@@ -532,8 +857,9 @@ class _WebViewScreenState extends State<WebViewScreen> {
               _buildPageLoading(context),
             // 页面加载失败/超时：错误界面
             if (_pageError != null) _buildPageError(context),
-            // 自定义缩放控件：左侧屏幕中央、竖排，避开右下角发送按钮
-            if (!_pageLoading && _pageError == null)
+            // 自定义缩放控件：左侧屏幕中央、竖排，避开右下角发送按钮。
+            // 默认关闭，仅在设置页开启后显示。
+            if (_zoomControlsEnabled && !_pageLoading && _pageError == null)
               _buildZoomControls(context),
           ],
         );

@@ -21,6 +21,8 @@ class SetupScreen extends StatefulWidget {
     this.onZoomOut,
     this.onResetZoom,
     this.onRefreshCache,
+    this.zoomControlsEnabled = false,
+    this.onZoomControlsChanged,
   });
 
   /// 当前编辑的实例索引。
@@ -48,6 +50,12 @@ class SetupScreen extends StatefulWidget {
   final VoidCallback? onResetZoom;
   final VoidCallback? onRefreshCache;
 
+  /// 对话区左侧浮动缩放控件是否显示（默认关闭）。
+  final bool zoomControlsEnabled;
+
+  /// 切换对话区缩放控件显示（默认关闭）。
+  final ValueChanged<bool>? onZoomControlsChanged;
+
   @override
   State<SetupScreen> createState() => _SetupScreenState();
 }
@@ -73,11 +81,16 @@ class _SetupScreenState extends State<SetupScreen> {
   String? _testResult;
   bool _testPassed = false;
 
+  /// 对话区缩放控件开关的本地状态（设置页是独立路由，父级 setState
+  /// 不会重建它，必须本地持有才能即时反映拨动效果）。
+  late bool _zoomControlsEnabled;
+
   @override
   void initState() {
     super.initState();
     _profileIndex = widget.profileIndex.clamp(0, SSHConfig.maxProfiles - 1);
     _timeoutSeconds = widget.timeoutSeconds;
+    _zoomControlsEnabled = widget.zoomControlsEnabled;
     _loadFromProfile(_profileIndex);
   }
 
@@ -440,6 +453,20 @@ class _SetupScreenState extends State<SetupScreen> {
                 ),
               ),
               const SizedBox(height: 8),
+              // 对话区左侧浮动缩放控件开关（默认关闭）
+              SwitchListTile(
+                title: const Text('对话区显示缩放控件'),
+                subtitle: const Text(
+                  '默认关闭；开启后在对话区左侧显示放大/缩小/重置浮动按钮',
+                ),
+                value: _zoomControlsEnabled,
+                onChanged: (v) {
+                  // 本地状态即时反映拨动，同时通知主界面持久化并生效
+                  setState(() => _zoomControlsEnabled = v);
+                  widget.onZoomControlsChanged?.call(v);
+                },
+              ),
+              const SizedBox(height: 8),
               OutlinedButton.icon(
                 onPressed: widget.onRefreshCache,
                 icon: const Icon(Icons.refresh),
@@ -492,7 +519,7 @@ class _SetupScreenState extends State<SetupScreen> {
                   ListTile(
                     leading: const Icon(Icons.info_outline),
                     title: const Text('版本'),
-                    subtitle: const Text('DSH-Phone v0.1.2'),
+                    subtitle: const Text('DSH-Phone v0.1.3'),
                     trailing: const Icon(Icons.chevron_right),
                     onTap: _showAbout,
                   ),
@@ -547,7 +574,7 @@ class _SetupScreenState extends State<SetupScreen> {
         title: const Text('关于 DSH-Phone'),
         content: const SingleChildScrollView(
           child: Text(
-            'DSH-Phone v0.1.2\n\n'
+            'DSH-Phone v0.1.3\n\n'
             '一个在 Android 上通过 SSH 隧道访问 DeepSeek Harness Web UI 的客户端。\n\n'
             '工作原理：\n'
             '• 应用内置 dartssh2 建立 SSH 隧道\n'
