@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 0.1.3+5
+version: 0.1.3+6
 
 environment:
   sdk: ^3.6.0
@@ -47,12 +47,19 @@ dependencies:
   charset: ^2.0.1                      # 文件编码自动检测（UTF-8/GBK 等）
   file_picker: ^8.1.2                  # 下载完成后的系统"另存为"位置选择（SAF）
   path_provider: ^2.1.5                # 下载临时目录
+  # 前台服务保活：隧道连接期间在后台保持进程与网络，避免后台/关屏后
+  # SSH 保活停止导致远端空闲断开、恢复前台必然重连。
+  flutter_foreground_task: ^4.0.0
 
 dependency_overrides:
   # 本地 fork 的 dartssh2：优化解密（processAll 批处理）+ 启用 zlib 压缩，
   # 显著提升隧道吞吐，避免长上下文历史加载超时。
   dartssh2:
     path: third_party/dartssh2
+  # 本地 fork 的 flutter_foreground_task：为 Android 库模块补 namespace，
+  # 兼容 AGP 8.x（原包缺失 namespace 导致 assembleRelease 失败）。
+  flutter_foreground_task:
+    path: third_party/flutter_foreground_task
 
 dev_dependencies:
   flutter_test:

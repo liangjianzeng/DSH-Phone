@@ -48,6 +48,7 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - ⏱️ **可配置页面加载超时**：默认 60s、范围 30–180s，设置页滑块调整；大上下文会话历史加载较慢时可调大。
 - 🔄 **自动 SSH 隧道**：基于 `dartssh2` 建立本地端口转发，无需 Root。
 - ⚡ **SSH 保活与静默重连**：每 10s 发送 keep-alive，降低移动网络空闲断连；首次异常（如隐藏后台 / 黑屏一段时间后断线）**不闪现错误提示、直接默认重连**，连续异常才提示并自动退避重试（递增退避 + 连续失败上限）。
+- 🔒 **前台服务后台保活**：隧道连接期间启动 Android 前台服务（低优先级静默通知 + 唤醒锁），App 进入后台或关屏时进程与网络保持运行、SSH 保活持续发送，恢复前台**不再重连**；滑动清除任务后隧道随任务停止。
 - 🚀 **隧道吞吐优化**：本地 fork 的 `dartssh2`（认证后 zlib 压缩 + 整包批量解密），双向透传不做应用层节流，显著提升大体积加载速度。
 - 🧭 **WebView 加载 DSH Web UI**：`flutter_inappwebview`，loopback 访问，模型/设置等特权接口可用。
 - 💾 **本地缓存加速**：优先使用本地缓存，缺才走网络；支持手动清缓存刷新。
@@ -109,6 +110,7 @@ flutter build apk --release
 | `charset` | 文件编码自动检测（UTF-8 / GBK / ASCII） |
 | `file_picker` | 下载 / 另存为：系统文件选择器（SAF）保存位置 |
 | `path_provider` | 下载临时目录 |
+| `flutter_foreground_task`（本地 fork，`third_party/`） | 前台服务后台保活（隧道连接期间保持进程/网络，避免后台断线重连；补 namespace 兼容 AGP 8.x） |
 
 ## 目录结构
 
@@ -122,13 +124,15 @@ lib/
 ├── artifact_recognizer.dart  # 成果类型识别（markdown/html/代码/文件/资源）
 ├── artifact_viewer_screen.dart # 成果原生查看器（md/html/代码渲染 + 另存为）
 ├── download_manager.dart     # 会话级下载管理（断点续传 / 暂停 / 取消）
-└── download_screen.dart      # 资源下载页（进度 / 暂停继续 / 另存为）
-third_party/dartssh2/         # 本地 fork 的 dartssh2（吞吐优化）
+├── download_screen.dart      # 资源下载页（进度 / 暂停继续 / 另存为）
+└── foreground_service.dart   # 前台服务保活封装（隧道连接期间后台保持进程/网络）
+third_party/dartssh2/                 # 本地 fork 的 dartssh2（吞吐优化 + SFTP 会话释放）
+third_party/flutter_foreground_task/  # 本地 fork 的 flutter_foreground_task（AGP 8.x namespace 兼容）
 ```
 
 ## 版本记录
 
-- **v0.1.3**：成果原生查看器（Markdown / HTML / 代码高亮 / 文本，编码自动检测，另存为）；资源下载（进度、暂停/断点续传、取消、失败重试、SAF 另存为）；对话区缩放控件开关（默认隐藏）；隐藏产物路径自动解析；SFTP 读取解决中文路径/内容乱码。
+- **v0.1.3**：成果原生查看器（Markdown / HTML / 代码高亮 / 文本，编码自动检测，另存为）；资源下载（进度、暂停/断点续传、取消、失败重试、SAF 另存为）；对话区缩放控件开关（默认隐藏）；隐藏产物路径自动解析；SFTP 读取解决中文路径/内容乱码。后续补丁（build 6）：**前台服务后台保活**（隧道连接期间启动低优先级静默通知前台服务 + 唤醒锁，App 后台/关屏时 SSH 保活持续发送，恢复前台不再重连；滑动清除任务随任务停止）；**SFTP 会话释放**（每次文件操作关闭底层 SSH 通道，避免 OpenSSH 会话泄漏）；前后台生命周期诊断日志。
 - **v0.1.2**：实例别名（最多 7 个中文 / 15 个英文字母，顶栏优先显示别名而非地址）；首次连接异常静默直接重连、连续异常才提示；修复 Windows 构建（AGP 8.2.1 / minSdk 23 / 禁用 jetifier）。
 - **v0.1.1**：多连接实例（最多 3 路）与顶栏切换、可配置页面加载超时、本地 `dartssh2` fork 吞吐优化（zlib 压缩 + 批量解密）、去掉隧道节流、断线重连递增退避 + 上限、release 签名。
 - **v0.1.0**：首个发布版。SSH 隧道访问 DSH Web UI，含缩放、全屏、主题自适应、关于页。

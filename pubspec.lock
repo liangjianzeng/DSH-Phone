@@ -165,6 +165,13 @@ packages:
     description: flutter
     source: sdk
     version: "0.0.0"
+  flutter_foreground_task:
+    dependency: "direct main"
+    description:
+      path: "third_party/flutter_foreground_task"
+      relative: true
+    source: path
+    version: "4.2.0"
   flutter_highlight:
     dependency: "direct main"
     description:

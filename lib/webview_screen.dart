@@ -26,7 +26,8 @@ class WebViewScreen extends StatefulWidget {
   State<WebViewScreen> createState() => _WebViewScreenState();
 }
 
-class _WebViewScreenState extends State<WebViewScreen> {
+class _WebViewScreenState extends State<WebViewScreen>
+    with WidgetsBindingObserver {
   InAppWebViewController? _controller;
 
   // ---- 多实例配置 ----
@@ -273,11 +274,40 @@ class _WebViewScreenState extends State<WebViewScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     // 监听隧道真实状态，状态变化时同步界面；仅在真正断开时自动重连。
     _tunnelSub = TunnelService.instance.statusStream.listen(_onTunnelStatus);
     _load();
     _loadZoomScale();
     _loadZoomControls();
+  }
+
+  /// 应用前后台切换记录：用于排查"后台→前台必然重连"问题。
+  /// 后台期间记录时间戳；前台恢复时打印隧道状态，确认断开发生在何时。
+  DateTime? _backgroundedAt;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    debugPrint('[DSH] lifecycle: $state '
+        '(tunnel=${TunnelService.instance.status})');
+    switch (state) {
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.hidden:
+        // 进入后台：记录时间（inactive/hidden 都可能触发）
+        _backgroundedAt ??= DateTime.now();
+      case AppLifecycleState.paused:
+        // 确认进入后台
+        _backgroundedAt ??= DateTime.now();
+      case AppLifecycleState.resumed:
+        // 回到前台：打印后台持续时长与当前隧道状态
+        final bg = _backgroundedAt;
+        debugPrint('[DSH] resumed from background, '
+            'backgroundedMs=${bg == null ? '?' : DateTime.now().difference(bg).inMilliseconds}, '
+            'tunnel=${TunnelService.instance.status}');
+        _backgroundedAt = null;
+      case AppLifecycleState.detached:
+        break;
+    }
   }
 
   /// 读取持久化的缩放比例。
@@ -461,6 +491,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _loadTimeoutTimer?.cancel();
     _tunnelSub?.cancel();
     _zoomScaleNotifier.dispose();

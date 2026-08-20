@@ -7,6 +7,7 @@ import 'package:charset/charset.dart' show Charset, gbk;
 import 'package:dartssh2/dartssh2.dart';
 
 import 'config.dart';
+import 'foreground_service.dart';
 
 /// 隧道连接状态。
 enum TunnelStatus { idle, connecting, connected, failed, disconnected }
@@ -40,6 +41,17 @@ class TunnelService {
   void _setStatus(TunnelStatus s) {
     _status = s;
     if (!_disposed) _statusController.add(s);
+    _syncForegroundService(s);
+  }
+
+  /// 前台服务与隧道状态联动：connected 启动保活服务，其余状态停止。
+  /// 后台/关屏时进程保持运行，SSH 保活持续发送，避免远端空闲断开。
+  void _syncForegroundService(TunnelStatus s) {
+    if (s == TunnelStatus.connected) {
+      ForegroundTunnelService.instance.start();
+    } else {
+      ForegroundTunnelService.instance.stop();
+    }
   }
 
   /// 建立隧道。已连接或正在连接时幂等返回，避免重复/并发连接造成死循环。
@@ -86,7 +98,10 @@ class TunnelService {
       // 传输异常/断开时通知，并清理资源
       client.done.then(
         (_) => _onTransportClosed(client),
-        onError: (_) => _onTransportClosed(client, failed: true),
+        onError: (Object e) {
+          print('[DSH] transport error: $e');
+          _onTransportClosed(client, failed: true);
+        },
       );
 
       // 3) 等待认证完成
@@ -118,7 +133,8 @@ class TunnelService {
   void _onTransportClosed(SSHClient client, {bool failed = false}) {
     if (_client != client) return;
     print('[DSH] transport closed'
-        '${failed ? ' (with error)' : ''}');
+        '${failed ? ' (with error)' : ''} '
+        '(activeProfile=$_activeProfileIndex)');
     _client = null;
     _activeProfileIndex = null;
 
@@ -210,15 +226,17 @@ class TunnelService {
     // 尝试多种 SFTP 路径形态（Windows 盘符路径的表示差异）
     for (final path in _sftpPathCandidates(remotePath)) {
       SftpFile? file;
+      SftpClient? sftp;
       try {
-        final sftp = await client.sftp();
+        sftp = await client.sftp();
         file = await sftp.open(path);
         final bytes = await file.readBytes();
         return _decodeBytes(bytes);
       } catch (e) {
         print('[DSH] readRemoteFile failed for "$path": $e');
       } finally {
-        if (file != null) await file.close();
+        if (file != null) await file.close(); // 顺带关闭所属 SFTP 会话/通道
+        sftp?.close(); // 打开失败等分支：释放会话通道，避免泄漏
       }
     }
     return '';
@@ -233,11 +251,13 @@ class TunnelService {
     final client = _client;
     if (client == null) return null;
     for (final path in _sftpPathCandidates(remotePath)) {
+      SftpClient? sftp;
       try {
-        final sftp = await client.sftp();
-        return await sftp.open(path);
+        sftp = await client.sftp();
+        return await sftp.open(path); // 返回后会话由 SftpFile.close() 一并关闭
       } catch (e) {
         print('[DSH] openRemoteFile failed for "$path": $e');
+        sftp?.close(); // 打开失败：释放会话通道，避免泄漏
       }
     }
     return null;
@@ -325,5 +345,7 @@ class TunnelService {
   void dispose() {
     _disposed = true;
     _statusController.close();
+    // 应用退出：停止前台服务并释放唤醒锁
+    ForegroundTunnelService.instance.stop();
   }
 }

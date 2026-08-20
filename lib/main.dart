@@ -2,12 +2,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'config.dart';
+import 'foreground_service.dart';
 import 'setup_screen.dart';
 import 'tunnel_service.dart';
 import 'webview_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 前台服务保活初始化：隧道连接期间后台保持进程/网络，避免后台断线
+  ForegroundTunnelService.init();
 
   // 边缘到边缘全屏：应用内容延伸到系统状态栏/导航栏区域
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);

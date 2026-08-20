@@ -169,12 +169,17 @@ class SftpClient {
   }
 
   /// Close the sftp session.
+  ///
+  /// 幂等；同时释放底层 SSH 通道，避免每次 [SSHClient.sftp] 都泄漏一条通道
+  /// （OpenSSH 单连接会话数有限，泄漏到一定程度后所有文件操作都会失败）。
   void close() {
+    if (_done.isCompleted) return;
     for (var waiter in _replyWaiters.values) {
       waiter.completeError(SftpAbortError("Connection closed"));
     }
     _replyWaiters.clear();
     _done.complete();
+    _channel.destroy();
   }
 
   void _closeError(Object error, [StackTrace? stackTrace]) {
@@ -519,6 +524,10 @@ class SftpFile {
     if (_isClosed) return;
     _isClosed = true;
     await _client._close(_handle);
+    // 关闭文件句柄后同时关闭所属 SFTP 会话（释放底层 SSH 通道）。
+    // 本应用的使用模式是每个会话只打开一个文件，因此这里直接关闭会话；
+    // 幂等由 SftpClient.close() 内的 _done 守卫保证。
+    _client.close();
   }
 
   Future<SftpFileAttrs> stat() async {
