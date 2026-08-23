@@ -35,21 +35,23 @@ android {
         release {
             def keyProps = new Properties()
             def keyPropsFile = rootProject.file('key.properties')
+            // 签名密钥文件不存在时留空（release 回退 debug 签名兜底，见 buildTypes）
             if (keyPropsFile.exists()) {
                 keyPropsFile.withInputStream { keyProps.load(it) }
+                storeFile = file(keyProps.getProperty('storeFile'))
+                storePassword = keyProps.getProperty('storePassword')
+                keyAlias = keyProps.getProperty('keyAlias')
+                keyPassword = keyProps.getProperty('keyPassword')
             }
-            storeFile = file(keyProps.getProperty('storeFile'))
-            storePassword = keyProps.getProperty('storePassword')
-            keyAlias = keyProps.getProperty('keyAlias')
-            keyPassword = keyProps.getProperty('keyPassword')
         }
     }
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the release keystore (key.jks) now.
-            signingConfig = signingConfigs.release
+            // 有 key.properties 用 release 签名；否则回退 debug 签名，
+            // 保证各打包机在未配置签名密钥时也能产出可安装 APK。
+            def hasKey = rootProject.file('key.properties').exists()
+            signingConfig = hasKey ? signingConfigs.release : signingConfigs.debug
         }
     }
 }

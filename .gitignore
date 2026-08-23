@@ -50,3 +50,7 @@ app.*.map.json
 crash_logcat.txt
 crash_startup.txt
 test_artifacts/
+
+# 签名密钥（含密码，绝不提交）
+/android/key.properties
+/android/key.jks

@@ -9,6 +9,7 @@ import 'artifact_viewer_screen.dart';
 import 'config.dart';
 import 'download_manager.dart';
 import 'download_screen.dart';
+import 'host_monitor.dart';
 import 'setup_screen.dart';
 import 'tunnel_service.dart';
 
@@ -57,6 +58,11 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 对话区左侧浮动缩放控件的开关键（持久化，默认关闭）。
   static const String _zoomControlsPrefKey = 'webview_zoom_controls_enabled';
 
+  // ---- 工具类功能开关（设置页"工具"分类控制）----
+  bool _hostMonitorEnabled = true; // 主机监控（默认开：采样并呈现曲线）
+  bool _resourceViewEnabled = true; // 资源查看（默认开）
+  bool _resourceDownloadEnabled = true; // 资源下载（默认开）
+
   /// 缩放比例共享通知器：设置页可实时监听并展示。
   final ValueNotifier<double> _zoomScaleNotifier = ValueNotifier<double>(1.0);
 
@@ -104,20 +110,31 @@ class _WebViewScreenState extends State<WebViewScreen>
     } catch (e) {}
   }
 
-  function collectDebug(container) {
-    var debug = { codeOuter: '', parentOuter: '', dataAttrs: {}, linksInParent: [] };
-    if (!container) return debug;
-    debug.codeOuter = (container.outerHTML || '').slice(0, 500);
-    if (container.parentElement) debug.parentOuter = container.parentElement.outerHTML.slice(0, 500);
-    for (var i = 0; i < container.attributes.length; i++) {
-      debug.dataAttrs[container.attributes[i].name] = container.attributes[i].value;
-    }
-    var p = container.parentElement;
-    if (p) {
-      var as = p.querySelectorAll('a');
-      for (var j = 0; j < as.length; j++) debug.linksInParent.push(as[j].getAttribute('href'));
-    }
-    return debug;
+  // 成果文本拉取：限制大小与超时，防止大文件打爆 WebView 内存 / 请求悬挂。
+  // 依据 content-length 头提前拒绝超大文件；无该头时由 Dart 侧 _looksBinary 兜底。
+  var MAX_ARTIFACT_FETCH = 8 * 1024 * 1024; // 8MB 上限
+  function fetchArtifact(url) {
+    return new Promise(function(resolve, reject) {
+      var settled = false;
+      var timer = setTimeout(function() {
+        if (!settled) { settled = true; reject(new Error('fetch timeout')); }
+      }, 30000);
+      fetch(url).then(function(r) {
+        var len = r.headers.get('content-length');
+        if (len && parseInt(len, 10) > MAX_ARTIFACT_FETCH) {
+          throw new Error('artifact too large');
+        }
+        return r.text();
+      }).then(function(text) {
+        if (settled) return;
+        settled = true; clearTimeout(timer);
+        resolve(text);
+      }).catch(function(err) {
+        if (settled) return;
+        settled = true; clearTimeout(timer);
+        reject(err);
+      });
+    });
   }
 
   // 在整个文档中查找 file-mention 按钮（"产物"chips，title 存完整路径），
@@ -168,14 +185,19 @@ class _WebViewScreenState extends State<WebViewScreen>
         ev.preventDefault();
         ev.stopPropagation();
         if (isResource) {
-          // 资源型链接：无远端路径，交由 Dart 侧提示（无法经 SFTP 下载）
-          send({type: 'resource', url: a.href, language: '', content: '', path: '', debug: collectDebug(a)});
+          // 资源型链接：先按文件名反查产物 chips 的完整路径（title），
+          // 反查不到时回传文件名 + 页面产物目录，由 Dart 侧拼接定位；
+          // 避免"链接型 APK 一律不支持下载"导致时好时坏。
+          var base = href.split(/[\\/?#]+/).pop() || '';
+          var mentionPath = findMentionPath(base);
+          var dirs = collectProducedDirs();
+          send({type: 'resource', url: a.href, language: '', content: '', path: mentionPath, dirs: dirs});
           return;
         }
-        fetch(a.href).then(function(r){ return r.text(); }).then(function(text){
-          send({type: 'file', url: a.href, language: '', content: text, debug: collectDebug(a)});
+        fetchArtifact(a.href).then(function(text){
+          send({type: 'file', url: a.href, language: '', content: text});
         }).catch(function(err){
-          send({type: 'file', url: a.href, language: '', content: '', debug: collectDebug(a)});
+          send({type: 'file', url: a.href, language: '', content: ''});
         });
         return;
       }
@@ -221,7 +243,7 @@ class _WebViewScreenState extends State<WebViewScreen>
         if (!mentionPath && /[\\/]/.test(trimmed)) mentionPath = trimmed;
         if (mentionPath) {
           var isResource = isResourceSuffix.test(mentionPath);
-          send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: mentionPath, debug: collectDebug(code)});
+          send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: mentionPath});
           return;
         }
         // 反查失败（该文件 chips 被隐藏）：回传文件名 + 可见产物目录，
@@ -229,14 +251,14 @@ class _WebViewScreenState extends State<WebViewScreen>
         var dirs = collectProducedDirs();
         if (dirs.length > 0) {
           var isResource = isResourceSuffix.test(trimmed);
-          send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: trimmed, dirs: dirs, debug: collectDebug(code)});
+          send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: trimmed, dirs: dirs});
           return;
         }
       }
       var lang = '';
       var m = (code.className || '').match(/language-([\w-]+)/);
       if (m) lang = m[1];
-      send({type: 'code', url: '', language: lang, content: text, debug: collectDebug(code)});
+      send({type: 'code', url: '', language: lang, content: text});
       return;
     }
 
@@ -245,7 +267,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     if (md) {
       ev.preventDefault();
       ev.stopPropagation();
-      send({type: 'markdown', url: '', language: '', content: md.innerText || md.textContent || '', debug: collectDebug(md)});
+      send({type: 'markdown', url: '', language: '', content: md.innerText || md.textContent || ''});
       return;
     }
   }, true);
@@ -280,6 +302,9 @@ class _WebViewScreenState extends State<WebViewScreen>
     _load();
     _loadZoomScale();
     _loadZoomControls();
+    _loadToolSwitches();
+    // 监控采样定时器常驻，内部仅在隧道 connected 时旁路采集。
+    HostMonitor.instance.start();
   }
 
   /// 应用前后台切换记录：用于排查"后台→前台必然重连"问题。
@@ -342,6 +367,43 @@ class _WebViewScreenState extends State<WebViewScreen>
     );
   }
 
+  /// 读取工具类功能开关（监控 / 资源查看 / 资源下载），并同步监控采样器。
+  Future<void> _loadToolSwitches() async {
+    final hostMonitor = await SSHConfig.loadHostMonitorEnabled();
+    final resourceView = await SSHConfig.loadResourceViewEnabled();
+    final resourceDownload = await SSHConfig.loadResourceDownloadEnabled();
+    if (!mounted) return;
+    setState(() {
+      _hostMonitorEnabled = hostMonitor;
+      _resourceViewEnabled = resourceView;
+      _resourceDownloadEnabled = resourceDownload;
+    });
+    // 同步监控采样器：关闭则不请求（曲线随之消失）。
+    HostMonitor.instance.enabled = hostMonitor;
+  }
+
+  /// 主机监控开关：持久化并同步采样器（关闭 → 停止请求并清空曲线）。
+  void _setHostMonitorEnabled(bool enabled) {
+    if (!mounted) return;
+    setState(() => _hostMonitorEnabled = enabled);
+    HostMonitor.instance.enabled = enabled;
+    SSHConfig.saveHostMonitorEnabled(enabled);
+  }
+
+  /// 资源查看开关：关闭后点击文件型成果不再打开查看器。
+  void _setResourceViewEnabled(bool enabled) {
+    if (!mounted) return;
+    setState(() => _resourceViewEnabled = enabled);
+    SSHConfig.saveResourceViewEnabled(enabled);
+  }
+
+  /// 资源下载开关：关闭后点击资源型成果不再触发下载。
+  void _setResourceDownloadEnabled(bool enabled) {
+    if (!mounted) return;
+    setState(() => _resourceDownloadEnabled = enabled);
+    SSHConfig.saveResourceDownloadEnabled(enabled);
+  }
+
   /// 通过 CSS zoom 应用缩放比例（页面就绪后调用）。
   Future<void> _applyZoom() async {
     final c = _controller;
@@ -395,10 +457,12 @@ class _WebViewScreenState extends State<WebViewScreen>
     _reconnecting = true;
     _reconnectCount++;
     // 递增退避：2s、4s、6s、8s、10s
+    // 注意：_reconnectCount 在调度时就已自增，第 5 次调度后值为
+    // _maxReconnect，此时仍应执行连接（否则实际只重试 4 次）。
     final delay = Duration(seconds: 2 * _reconnectCount);
     Future<void>.delayed(delay, () {
       _reconnecting = false;
-      if (mounted && _reconnectCount < _maxReconnect) _connect();
+      if (mounted && _reconnectCount <= _maxReconnect) _connect();
     });
   }
 
@@ -413,7 +477,24 @@ class _WebViewScreenState extends State<WebViewScreen>
       _config = profiles[activeIndex];
       _timeoutSeconds = timeoutSeconds;
     });
+    _setupMonitorProfile();
     _manualConnect();
+  }
+
+  /// 依据实例级"默认主机资源监控"开关，建立/更新独立的监控采集隧道。
+  /// 监控目标与当前连接实例无关：顶栏曲线始终显示监控实例的数据。
+  void _setupMonitorProfile() {
+    final index = _profiles.indexWhere((p) => p.hostMonitorEnabled);
+    if (index < 0) {
+      TunnelService.instance.setupMonitorProfile(null);
+      return;
+    }
+    final config = _profiles[index];
+    if (!config.isConfigured) {
+      TunnelService.instance.setupMonitorProfile(null);
+      return;
+    }
+    TunnelService.instance.setupMonitorProfile(config, profileIndex: index);
   }
 
   /// 用户主动连接：重置自动重连计数后连接（重试按钮 / 切换实例 / 初始加载）。
@@ -495,6 +576,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     _loadTimeoutTimer?.cancel();
     _tunnelSub?.cancel();
     _zoomScaleNotifier.dispose();
+    HostMonitor.instance.stop();
     _disconnect();
     super.dispose();
   }
@@ -511,7 +593,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   Future<void> _openSettings({int? profileIndex}) async {
     final connected = _tunnelStatus == TunnelStatus.connected;
     final target = profileIndex ?? _activeIndex;
-    final changed = await Navigator.of(context).push<bool>(
+    await Navigator.of(context).push<bool>(
       MaterialPageRoute(
         builder: (_) => SetupScreen(
           profileIndex: target,
@@ -525,12 +607,22 @@ class _WebViewScreenState extends State<WebViewScreen>
           onRefreshCache: _refreshCache,
           zoomControlsEnabled: _zoomControlsEnabled,
           onZoomControlsChanged: _setZoomControlsEnabled,
+          hostMonitorEnabled: _hostMonitorEnabled,
+          onHostMonitorChanged: _setHostMonitorEnabled,
+          resourceViewEnabled: _resourceViewEnabled,
+          onResourceViewChanged: _setResourceViewEnabled,
+          resourceDownloadEnabled: _resourceDownloadEnabled,
+          onResourceDownloadChanged: _setResourceDownloadEnabled,
+          // 实例级监控开关即时保存后：重新加载配置并刷新监控隧道
+          onInstanceMonitorChanged: (_) => _load(),
         ),
       ),
     );
-    if (changed == true) {
-      await _load();
-    }
+    // 设置已自动保存（表单编辑即落盘）：无论返回方式（点完成/返回键），
+    // 返回后都断开重连，以应用最新配置；否则隧道仍 connected 时 _connect()
+    // 会提前返回，修改的地址/端口/凭据不会生效。
+    await TunnelService.instance.disconnect();
+    await _load();
   }
 
   String get _targetUrl => 'http://127.0.0.1:${_config.localPort}';
@@ -556,7 +648,13 @@ class _WebViewScreenState extends State<WebViewScreen>
     controller.addJavaScriptHandler(
       handlerName: 'onArtifactClick',
       callback: (List<Object?> args) async {
-        debugPrint('ARTIFACT_RAW_ARGS: $args');
+        // 只打印关键字段与内容长度，不落完整内容（避免大文本/敏感对话进日志）
+        if (args.isNotEmpty && args.first is Map) {
+          final raw = args.first as Map;
+          debugPrint('ARTIFACT_RAW: type=${raw['type']} url=${raw['url']} '
+              'path=${raw['path']} '
+              'contentLen=${(raw['content'] as String?)?.length ?? 0}');
+        }
         if (args.isEmpty || !mounted) return null;
         final raw = args.first;
         if (raw is! Map) return null;
@@ -586,10 +684,15 @@ class _WebViewScreenState extends State<WebViewScreen>
     if (!mounted) return;
     hit = resolved;
     // 资源型成果（apk/压缩包等）：转下载页（含断点续传 + 另存为）。
+    // 工具开关：资源下载关闭时不触发下载能力。
     if (hit.type == ArtifactType.resource) {
-      _openResourceDownload(hit);
+      if (_resourceDownloadEnabled) {
+        _openResourceDownload(hit);
+      }
       return;
     }
+    // 工具开关：资源查看关闭时不打开查看器。
+    if (!_resourceViewEnabled) return;
     // 文件型成果：内容经 SSH 读取云端文件（复用隧道会话），打开后异步加载。
     final loader = hit.type == ArtifactType.file && hit.path.isNotEmpty
         ? () => TunnelService.instance.readRemoteFile(hit.path)
@@ -616,11 +719,18 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   /// 解析成果云端路径：path 已含路径分隔符视为完整路径；否则用候选目录
   /// （[ArtifactHit.dirs]）逐个拼接并经 SFTP 验证，返回首个可打开的路径。
+  ///
+  /// 链接型资源（path 为空、url 非空，如 `/api/files/xxx.apk`）时，
+  /// 用 URL 文件名 + 候选目录拼接定位，避免"不支持直接下载"。
   Future<ArtifactHit> _resolveHitPath(ArtifactHit hit) async {
     if (hit.path.contains(r'\') || hit.path.contains('/')) return hit;
-    if (hit.dirs.isEmpty || hit.path.isEmpty) return hit;
+    var base = hit.path;
+    if (base.isEmpty && hit.url.isNotEmpty) {
+      base = _basename(hit.url); // 链接型资源兜底：从 URL 提取文件名
+    }
+    if (base.isEmpty || hit.dirs.isEmpty) return hit;
     final resolved =
-        await TunnelService.instance.resolveRemotePath(hit.path, hit.dirs);
+        await TunnelService.instance.resolveRemotePath(base, hit.dirs);
     if (resolved == null || resolved.isEmpty) return hit;
     return ArtifactHit(
       type: hit.type,
@@ -745,8 +855,15 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   /// 自定义全屏顶栏：背景延伸到状态栏区域（边缘到边缘），内容用 SafeArea 避让状态图标。
+  ///
+  /// 启用主机监控且已连接时，趋势曲线叠加在左侧"DSH-Phone"标题区域内
+  /// （左侧最老、右侧最新，纵轴高度即百分比），顶栏整体保持简洁。
   Widget _buildTopBar(BuildContext context) {
     final theme = Theme.of(context);
+    // 曲线数据来自"默认主机资源监控"实例（独立采集隧道），
+    // 与当前连接实例/隧道状态无关：任一实例连接时都显示监控实例的值。
+    final showTrend = _hostMonitorEnabled &&
+        TunnelService.instance.monitorProfileIndex != null;
     return Container(
       color: theme.colorScheme.surface,
       child: SafeArea(
@@ -754,9 +871,32 @@ class _WebViewScreenState extends State<WebViewScreen>
         child: Row(
           children: [
             const SizedBox(width: 12),
-            Text('DSH-Phone', style: theme.textTheme.titleMedium),
+            // DSH-Phone 标题区域：背景叠加趋势曲线（仅此区域，不铺满整条顶栏）
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+              child: Stack(
+                children: [
+                  if (showTrend)
+                    Positioned.fill(
+                      child: ListenableBuilder(
+                        listenable: HostMonitor.instance,
+                        builder: (context, _) => CustomPaint(
+                          painter: HostTrendPainter(
+                            samples: HostMonitor.instance.samples,
+                          ),
+                        ),
+                      ),
+                    ),
+                  // 文字半透明底：曲线透出时仍清晰
+                  Container(
+                    color: theme.colorScheme.surface.withValues(alpha: 0.7),
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: Text('DSH-Phone', style: theme.textTheme.titleMedium),
+                  ),
+                ],
+              ),
+            ),
             const Spacer(),
-            // 实例切换器：点击弹出菜单，自由切换连接实例
             _buildInstanceSwitcher(context),
             IconButton(
               tooltip: '设置',

@@ -35,6 +35,14 @@ class SSHConfig {
   static const String keyActiveProfile = 'active_profile';
   static const String keyLoadTimeout = 'load_timeout_seconds';
 
+  // 工具类功能开关
+  static const String keyHostMonitor = 'host_monitor_enabled';
+  static const String keyResourceView = 'resource_view_enabled';
+  static const String keyResourceDownload = 'resource_download_enabled';
+
+  // 实例级"默认主机资源监控"开关（最多一个实例开启）
+  static const String keyInstanceHostMonitor = 'instance_host_monitor';
+
   // secure storage keys（旧单实例键名，用于迁移）
   static const String secPassword = 'password';
   static const String secPrivateKey = 'private_key';
@@ -55,6 +63,11 @@ class SSHConfig {
   final String keyPassphrase; // 私钥口令（可空）
   final String alias; // 实例别名（可空，为空时展示名回退为地址）
 
+  /// 实例级"默认主机资源监控"开关：开启后该实例成为全局监控目标，
+  /// 顶栏趋势曲线始终显示它的主机数据（与当前连接实例无关）。
+  /// 所有实例默认关闭，且全局最多一个实例开启。
+  final bool hostMonitorEnabled;
+
   const SSHConfig({
     this.host = '',
     this.sshPort = 22,
@@ -65,6 +78,7 @@ class SSHConfig {
     this.privateKeyPem = '',
     this.keyPassphrase = '',
     this.alias = '',
+    this.hostMonitorEnabled = false,
   });
 
   bool get isConfigured =>
@@ -86,6 +100,17 @@ class SSHConfig {
 
   // ============ 多实例读写 ============
 
+  /// 安全读取 secure storage：Android Keystore 在系统更新/备份恢复/应用数据
+  /// 还原等场景可能失效并抛异常，这里兜底返回空串，避免启动即崩溃。
+  static Future<String> _safeSecRead(
+      FlutterSecureStorage storage, String key) async {
+    try {
+      return await storage.read(key: key) ?? '';
+    } catch (_) {
+      return '';
+    }
+  }
+
   /// 读取全部实例（长度恒为 [maxProfiles]，未配置的为空白实例）。
   static Future<List<SSHConfig>> loadAllProfiles() async {
     await _migrateLegacy();
@@ -94,11 +119,11 @@ class SSHConfig {
 
     final list = <SSHConfig>[];
     for (var i = 0; i < maxProfiles; i++) {
-      final password = await storage.read(key: _sKey(i, secPassword)) ?? '';
+      final password = await _safeSecRead(storage, _sKey(i, secPassword));
       final privateKeyPem =
-          await storage.read(key: _sKey(i, secPrivateKey)) ?? '';
+          await _safeSecRead(storage, _sKey(i, secPrivateKey));
       final keyPassphrase =
-          await storage.read(key: _sKey(i, secKeyPassphrase)) ?? '';
+          await _safeSecRead(storage, _sKey(i, secKeyPassphrase));
       list.add(SSHConfig(
         host: prefs.getString(_pKey(i, keyHost)) ?? '',
         sshPort: prefs.getInt(_pKey(i, keySshPort)) ?? 22,
@@ -109,6 +134,8 @@ class SSHConfig {
         privateKeyPem: privateKeyPem,
         keyPassphrase: keyPassphrase,
         alias: prefs.getString(_pKey(i, keyAlias)) ?? '',
+        hostMonitorEnabled:
+            prefs.getBool(_pKey(i, keyInstanceHostMonitor)) ?? false,
       ));
     }
     return list;
@@ -146,18 +173,27 @@ class SSHConfig {
     await prefs.setInt(_pKey(i, keyLocalPort), config.localPort);
     await prefs.setString(_pKey(i, keyAuthType), config.authType);
     await prefs.setString(_pKey(i, keyAlias), config.alias);
+    await prefs.setBool(
+        _pKey(i, keyInstanceHostMonitor), config.hostMonitorEnabled);
 
     const storage = FlutterSecureStorage();
+    // 敏感项写入/删除双方向同步：用户清空某项时，旧值不能滞留在 keystore。
     if (config.password.isNotEmpty) {
       await storage.write(key: _sKey(i, secPassword), value: config.password);
+    } else {
+      await storage.delete(key: _sKey(i, secPassword));
     }
     if (config.privateKeyPem.isNotEmpty) {
       await storage.write(
           key: _sKey(i, secPrivateKey), value: config.privateKeyPem);
+    } else {
+      await storage.delete(key: _sKey(i, secPrivateKey));
     }
     if (config.keyPassphrase.isNotEmpty) {
       await storage.write(
           key: _sKey(i, secKeyPassphrase), value: config.keyPassphrase);
+    } else {
+      await storage.delete(key: _sKey(i, secKeyPassphrase));
     }
   }
 
@@ -176,6 +212,41 @@ class SSHConfig {
         seconds.clamp(minTimeoutSeconds, maxTimeoutSeconds));
   }
 
+  // ============ 工具类功能开关 ============
+
+  /// 读取主机监控开关（默认开启）。
+  static Future<bool> loadHostMonitorEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(keyHostMonitor) ?? true;
+  }
+
+  static Future<void> saveHostMonitorEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(keyHostMonitor, enabled);
+  }
+
+  /// 读取资源查看开关（默认开启）。
+  static Future<bool> loadResourceViewEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(keyResourceView) ?? true;
+  }
+
+  static Future<void> saveResourceViewEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(keyResourceView, enabled);
+  }
+
+  /// 读取资源下载开关（默认开启）。
+  static Future<bool> loadResourceDownloadEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(keyResourceDownload) ?? true;
+  }
+
+  static Future<void> saveResourceDownloadEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(keyResourceDownload, enabled);
+  }
+
   // ============ 旧单实例配置迁移 ============
 
   /// 若存在旧版单实例配置且尚未迁移，则迁移到实例 0。
@@ -188,9 +259,9 @@ class SSHConfig {
     if (legacyHost == null || legacyHost.isEmpty) return;
 
     const storage = FlutterSecureStorage();
-    final password = await storage.read(key: secPassword) ?? '';
-    final privateKeyPem = await storage.read(key: secPrivateKey) ?? '';
-    final keyPassphrase = await storage.read(key: secKeyPassphrase) ?? '';
+    final password = await _safeSecRead(storage, secPassword);
+    final privateKeyPem = await _safeSecRead(storage, secPrivateKey);
+    final keyPassphrase = await _safeSecRead(storage, secKeyPassphrase);
 
     await prefs.setString(_pKey(0, keyHost), legacyHost);
     await prefs.setInt(
@@ -232,5 +303,22 @@ class SSHConfig {
   static Future<bool> anyConfigured() async {
     final profiles = await loadAllProfiles();
     return profiles.any((p) => p.isConfigured);
+  }
+
+  // ============ 实例级主机资源监控 ============
+
+  /// 读取开启"默认主机资源监控"的实例索引（无则 -1）。
+  static Future<int> loadMonitorProfileIndex() async {
+    final profiles = await loadAllProfiles();
+    return profiles.indexWhere((p) => p.hostMonitorEnabled);
+  }
+
+  /// 仅保存指定实例的"默认主机资源监控"开关（不触碰表单其它字段，
+  /// 用于设置页即时保存）。
+  static Future<void> saveInstanceHostMonitor(int index, bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(
+        _pKey(index.clamp(0, maxProfiles - 1), keyInstanceHostMonitor),
+        enabled);
   }
 }

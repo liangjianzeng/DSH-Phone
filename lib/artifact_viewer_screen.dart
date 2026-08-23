@@ -65,7 +65,6 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
 
   /// 另存为状态。
   bool _saving = false;
-  String? _savedPath;
 
   @override
   void initState() {
@@ -230,7 +229,6 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
       );
       if (!mounted) return;
       if (path != null) {
-        setState(() => _savedPath = path);
         _toast('已保存到：$path');
       }
     } catch (e) {

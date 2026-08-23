@@ -59,6 +59,10 @@ class DownloadTask {
   StreamSubscription<Uint8List>? _sub;
   SftpFile? _file;
 
+  /// 是否正在下载：防止 resume/retry 并发重复打开 SFTP 流，
+  /// 导致同一段数据重复追加进缓冲区。
+  bool _running = false;
+
   final StreamController<DownloadStatus> _statusCtl =
       StreamController<DownloadStatus>.broadcast();
   final StreamController<DownloadProgress> _progressCtl =
@@ -99,7 +103,14 @@ class DownloadManager {
   /// 进度/状态通过 task 的流通知界面——避免等待 SFTP 打开导致"点开灰屏/无反应"。
   DownloadTask start(String remotePath, {int? resumeOffset}) {
     final existing = _tasks[remotePath];
-    if (existing != null) return existing;
+    if (existing != null) {
+      // 上次失败的任务会滞留任务表：再次点击同一资源时自动重试，
+      // 避免用户"点一下没反应、还是失败状态"。
+      if (existing.status == DownloadStatus.failed) {
+        retry(existing);
+      }
+      return existing;
+    }
     final task = DownloadTask(
       remotePath: remotePath,
       fileName: _basename(remotePath),
@@ -120,6 +131,7 @@ class DownloadManager {
 
   /// 暂停：取消当前流并关闭句柄，记录已下载量，可恢复。
   void pause(DownloadTask task) {
+    task._running = false;
     task._sub?.cancel();
     task._sub = null;
     task._file?.close();
@@ -127,21 +139,34 @@ class DownloadManager {
     task._emitStatus(DownloadStatus.paused);
   }
 
-  /// 取消：暂停并清空缓冲区，任务进入 cancelled。
+  /// 取消：暂停并清空缓冲区，任务进入 cancelled，并从任务表移除
+  /// （否则下次点击同一资源会拿到"死任务"，无法重新下载）。
   void cancel(DownloadTask task) {
     pause(task);
     task._buffer.clear();
     task.downloadedBytes = 0;
     task.totalBytes = null;
     task.resultBytes = null;
+    _release(task);
     task._emitStatus(DownloadStatus.cancelled);
+  }
+
+  /// 从任务表释放：completed / cancelled 的任务不再持有全量字节，
+  /// 防止 `_tasks` 随会话增长造成内存滞留。
+  void _release(DownloadTask task) {
+    _tasks.remove(task.remotePath);
   }
 
   /// 断点续传：以 [offset] 重新打开 SFTP，从该偏移继续读取。
   Future<void> _run(DownloadTask task, {required int offset}) async {
+    // 并发守卫：任务已在下载中时，忽略重复的 resume/retry/start，
+    // 避免并发打开多条 SFTP 流导致缓冲区重复数据。
+    if (task._running) return;
+    task._running = true;
     task._emitStatus(DownloadStatus.downloading);
     final file = await TunnelService.instance.openRemoteFile(task.remotePath);
     if (file == null) {
+      task._running = false;
       task.error = '无法打开云端文件（隧道可能未连接）';
       task._emitStatus(DownloadStatus.failed);
       return;
@@ -160,14 +185,18 @@ class DownloadManager {
       task._sub = stream.listen(
         (chunk) => task._buffer.add(chunk),
         onDone: () async {
+          task._running = false;
           await file.close();
           task._file = null;
           task._sub = null;
           task.resultBytes = task._buffer.takeBytes();
           task.downloadedBytes = task.resultBytes?.length ?? 0;
+          // 完成后释放任务表条目：不再持有全量字节，防内存滞留
+          _release(task);
           task._emitStatus(DownloadStatus.completed);
         },
         onError: (Object e) {
+          task._running = false;
           task.error = '$e';
           task._file = null;
           task._sub = null;
@@ -177,6 +206,7 @@ class DownloadManager {
         cancelOnError: true,
       );
     } catch (e) {
+      task._running = false;
       task.error = '$e';
       file.close();
       task._emitStatus(DownloadStatus.failed);

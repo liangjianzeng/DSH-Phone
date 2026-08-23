@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:charset/charset.dart' show Charset, gbk;
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:dartssh2/dartssh2.dart';
 
 import 'config.dart';
@@ -11,6 +12,31 @@ import 'foreground_service.dart';
 
 /// 隧道连接状态。
 enum TunnelStatus { idle, connecting, connected, failed, disconnected }
+
+/// 远程主机类型（用于选择采集命令）。
+enum HostType { linux, windows }
+
+/// 单次主机采样：GPU 使用率 / GPU 温度 / CPU / 内存使用率。
+class HostSample {
+  const HostSample({
+    required this.cpu,
+    required this.mem,
+    required this.gpu,
+    this.gpuTemp = -1,
+  });
+
+  /// CPU 使用率（0-100）。
+  final double cpu;
+
+  /// 内存使用率（0-100）。
+  final double mem;
+
+  /// GPU 使用率（0-100），-1 表示无 GPU / 无数据。
+  final double gpu;
+
+  /// GPU 温度（℃），-1 表示无 GPU / 无数据。
+  final double gpuTemp;
+}
 
 /// 负责建立 SSH 隧道：把手机 `127.0.0.1:<localPort>` 转发到远程
 /// `127.0.0.1:3080`（DSH Web UI），并做 SSH 保活。
@@ -68,7 +94,7 @@ class TunnelService {
 
       _activeProfileIndex = profileIndex;
       _setStatus(TunnelStatus.connecting);
-      print('[DSH] connecting to ${config.host}:${config.sshPort} '
+      debugPrint('[DSH] connecting to ${config.host}:${config.sshPort} '
           '(auth=${config.authType}) ...');
 
       // 1) 建立底层 TCP 到 SSH 服务器
@@ -99,7 +125,7 @@ class TunnelService {
       client.done.then(
         (_) => _onTransportClosed(client),
         onError: (Object e) {
-          print('[DSH] transport error: $e');
+          debugPrint('[DSH] transport error: $e');
           _onTransportClosed(client, failed: true);
         },
       );
@@ -107,22 +133,36 @@ class TunnelService {
       // 3) 等待认证完成
       await client.authenticated
           .timeout(const Duration(seconds: 20), onTimeout: () {
-        print('[DSH] SSH authentication timed out');
+        debugPrint('[DSH] SSH authentication timed out');
         throw const SocketException('SSH 认证超时');
       });
-      print('[DSH] authenticated, opening local tunnel on '
+      // 3.5) 认证完成后确认未被并发断开/替换（竞态守卫）：
+      // 若期间 disconnect() 已执行（_client 被置空/替换），放弃本次连接，
+      // 避免绑定一个已失效 client 的"假隧道"并误报 connected。
+      if (_client != client) {
+        client.close();
+        throw const SocketException('隧道已断开，放弃连接');
+      }
+      debugPrint('[DSH] authenticated, opening local tunnel on '
           '127.0.0.1:${config.localPort}');
 
       // 4) 本地监听端口
-      _server = await ServerSocket.bind(
+      final server = await ServerSocket.bind(
           InternetAddress.loopbackIPv4, config.localPort);
-      _server!.listen(_handleLocalConnection);
+      // 绑定后再确认一次：期间被断开则释放端口，防止残留占用
+      if (_client != client) {
+        await server.close();
+        client.close();
+        throw const SocketException('隧道已断开，放弃连接');
+      }
+      _server = server;
+      server.listen(_handleLocalConnection);
 
-      print('[DSH] tunnel up: 127.0.0.1:${config.localPort} -> '
+      debugPrint('[DSH] tunnel up: 127.0.0.1:${config.localPort} -> '
           '127.0.0.1:3080');
       _setStatus(TunnelStatus.connected);
     } catch (e) {
-      print('[DSH] connect failed: $e');
+      debugPrint('[DSH] connect failed: $e');
       rethrow;
     } finally {
       _connecting = false;
@@ -132,7 +172,7 @@ class TunnelService {
   /// 传输关闭时的统一清理：仅当仍是当前 client 才处理，避免旧连接误改状态。
   void _onTransportClosed(SSHClient client, {bool failed = false}) {
     if (_client != client) return;
-    print('[DSH] transport closed'
+    debugPrint('[DSH] transport closed'
         '${failed ? ' (with error)' : ''} '
         '(activeProfile=$_activeProfileIndex)');
     _client = null;
@@ -233,7 +273,7 @@ class TunnelService {
         final bytes = await file.readBytes();
         return _decodeBytes(bytes);
       } catch (e) {
-        print('[DSH] readRemoteFile failed for "$path": $e');
+        debugPrint('[DSH] readRemoteFile failed for "$path": $e');
       } finally {
         if (file != null) await file.close(); // 顺带关闭所属 SFTP 会话/通道
         sftp?.close(); // 打开失败等分支：释放会话通道，避免泄漏
@@ -256,7 +296,7 @@ class TunnelService {
         sftp = await client.sftp();
         return await sftp.open(path); // 返回后会话由 SftpFile.close() 一并关闭
       } catch (e) {
-        print('[DSH] openRemoteFile failed for "$path": $e');
+        debugPrint('[DSH] openRemoteFile failed for "$path": $e');
         sftp?.close(); // 打开失败：释放会话通道，避免泄漏
       }
     }
@@ -276,7 +316,7 @@ class TunnelService {
         final file = await openRemoteFile(cand);
         if (file != null) {
           await file.close();
-          print('[DSH] resolved "$filename" -> "$cand"');
+          debugPrint('[DSH] resolved "$filename" -> "$cand"');
           return cand;
         }
       }
@@ -303,7 +343,7 @@ class TunnelService {
     try {
       return await file.readBytes();
     } catch (e) {
-      print('[DSH] readRemoteFileBytes failed: $e');
+      debugPrint('[DSH] readRemoteFileBytes failed: $e');
       return null;
     } finally {
       await file.close();
@@ -318,6 +358,141 @@ class TunnelService {
       if (detected != null) return detected.decode(bytes);
     } catch (_) {}
     return utf8.decode(bytes, allowMalformed: true);
+  }
+
+  // ================= 主机监控：远程命令采集 =================
+
+  /// 按 SSH 会话缓存主机类型探测结果（活动隧道与监控隧道可能指向不同主机）。
+  final Map<SSHClient, HostType> _hostTypes = {};
+
+  /// 在指定 SSH 会话上执行命令，返回合并后的 stdout+stderr 文本。
+  ///
+  /// 执行失败 / 超时返回 null。输出用 [_decodeBytes] 健壮解码
+  /// （UTF-8 → GBK → ASCII），兼容 Windows cmd 的 GBK 错误信息。
+  Future<String?> _execOn(
+    SSHClient client,
+    String command, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    try {
+      final bytes = await client.run(command).timeout(timeout);
+      return _decodeBytes(bytes);
+    } catch (e) {
+      debugPrint('[DSH] executeRemote failed: $e');
+      return null;
+    }
+  }
+
+  /// 在当前活动隧道上执行命令（对外保留的便捷方法）。
+  Future<String?> executeRemote(
+    String command, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    final client = _client;
+    if (client == null) return null;
+    return _execOn(client, command, timeout: timeout);
+  }
+
+  /// 探测指定 SSH 会话的主机类型（按会话缓存）。
+  ///
+  /// Windows（默认 cmd）执行 `uname -s` 会返回"命令不存在"的 GBK 错误文本，
+  /// 因此不能仅凭"输出非空"判定 Unix：须识别命令不存在 / Windows bash 环境
+  /// 标识（MINGW / MSYS / CYGWIN / *_NT），否则视为 Unix 系。
+  Future<HostType> _detectHostType(SSHClient client) async {
+    final cached = _hostTypes[client];
+    if (cached != null) return cached;
+    final out = await _execOn(client, 'uname -s');
+    final t = (out ?? '').trim();
+    final isWindows = t.isEmpty ||
+        t.contains('MINGW') ||
+        t.contains('MSYS') ||
+        t.contains('CYGWIN') ||
+        t.contains('_NT') ||
+        // 命令不存在类错误 → Windows cmd
+        t.contains('不是内部或外部命令') ||
+        t.contains('不是内部命令') ||
+        t.contains('not recognized') ||
+        t.contains('command not found') ||
+        t.contains('not found') ||
+        t.contains('找不到');
+    final type = isWindows ? HostType.windows : HostType.linux;
+    _hostTypes[client] = type;
+    debugPrint('[DSH] detected host type: $type (uname="$t")');
+    return type;
+  }
+
+  /// 在指定 SSH 会话上采集一次主机使用率（CPU / 内存 / GPU）。
+  /// 会话断开或采集失败返回 null。
+  Future<HostSample?> _sampleFrom(SSHClient client) async {
+    final type = await _detectHostType(client);
+    final command = _buildSampleCommand(type);
+    final out = await _execOn(client, command);
+    if (out == null || out.trim().isEmpty) return null;
+    return _parseSample(out);
+  }
+
+  /// 采集一次当前活动隧道的主机使用率（CPU / 内存 / GPU）。
+  Future<HostSample?> collectHostSample() async {
+    final client = _client;
+    if (client == null) return null;
+    return _sampleFrom(client);
+  }
+
+  /// 按主机类型构造采集命令：输出 `CPU=xx` / `MEM=xx` / `GPU=xx` / `GPUTEMP=xx`。
+  ///
+  /// 用原始字符串避免 Dart 对 `$`（awk 列 / PowerShell 变量）的插值转义。
+  /// 注意：dartssh2 的 `client.run()` 本身就是经远程 bash 执行命令，
+  /// 不能再包一层 `sh -c '...'`，否则 bash 单引号嵌套冲突（unexpected EOF）
+  /// 导致整条命令解析失败（曾实测：Linux 主机采集全失败）。
+  ///
+  /// Linux 分支对 ARM/精简/容器环境做了健壮化：
+  /// - CPU 用 /proc/stat（busybox awk 兼容），无匹配时输出 0；
+  /// - MEM 改用 /proc/meminfo（MemTotal - MemAvailable），不依赖 free 命令；
+  /// - GPU 使用率 / 温度各一行，无 nvidia-smi 时留空（解析为 -1）。
+  ///
+  /// Windows 分支：bash 会展开 `$`，PowerShell 变量的 `$` 必须转义为 `\$`，
+  /// 否则变量被 bash 展开为空导致采集失败。
+  String _buildSampleCommand(HostType type) {
+    if (type == HostType.linux) {
+      return r'''c=$(awk "/^cpu /{i=\$5+\$6+\$7; t=\$2+\$3+\$4+\$5+\$6+\$7+\$8; if(t>0){printf \"%.0f\",(t-i)*100/t}else{printf \"0\"}}" /proc/stat 2>/dev/null); m=$(awk "/^MemTotal:/{t=\$2} /^MemAvailable:/{a=\$2} END{if(t>0){printf \"%.0f\",(t-a)*100/t}else{printf \"0\"}}" /proc/meminfo 2>/dev/null); g=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1); gt=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1); [ -z "$c" ] && c=0; [ -z "$m" ] && m=0; echo "CPU=$c"; echo "MEM=$m"; echo "GPU=$g"; echo "GPUTEMP=$gt"''';
+    }
+    // Windows：性能计数器 + nvidia-smi（无 GPU 时 GPU 行留空，解析为 -1）。
+    // Get-Counter 首次读取可能返回 null，回退 0 避免解析异常。
+    return r'''powershell -NoProfile -Command "\$c=Get-Counter '\Processor(_Total)% Processor Time' -ErrorAction SilentlyContinue; \$cpu=if(\$c.CounterSamples[0].CookedValue -eq \$null){0}else{[int]\$c.CounterSamples[0].CookedValue}; \$m=Get-Counter '\Memory% Committed Bytes In Use' -ErrorAction SilentlyContinue; \$mem=if(\$m.CounterSamples[0].CookedValue -eq \$null){0}else{[int]\$m.CounterSamples[0].CookedValue}; \$gpu=(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>\$null); \$gt=(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>\$null); Write-Output ('CPU='+\$cpu); Write-Output ('MEM='+\$mem); Write-Output ('GPU='+\$gpu); Write-Output ('GPUTEMP='+\$gt)"''';
+  }
+
+  /// 解析采集输出（`CPU=xx` / `MEM=xx` / `GPU=xx` / `GPUTEMP=xx`）。
+  /// 数值取首个数字；GPU 多卡逗号分隔时取首个；缺行/空值视为 0 / -1。
+  HostSample? _parseSample(String out) {
+    var cpu = 0.0, mem = 0.0, gpu = -1.0, gpuTemp = -1.0;
+    for (final line in out.split('\n')) {
+      final t = line.trim();
+      if (t.startsWith('CPU=')) {
+        cpu = _firstNumber(t.substring(4));
+      } else if (t.startsWith('MEM=')) {
+        mem = _firstNumber(t.substring(4));
+      } else if (t.startsWith('GPU=')) {
+        final s = t.substring(4);
+        gpu = s.trim().isEmpty ? -1 : _firstNumber(s);
+      } else if (t.startsWith('GPUTEMP=')) {
+        final s = t.substring(7);
+        gpuTemp = s.trim().isEmpty ? -1 : _firstNumber(s);
+      }
+    }
+    return HostSample(
+      cpu: cpu.clamp(0, 100),
+      mem: mem.clamp(0, 100),
+      gpu: gpu >= 0 ? gpu.clamp(0, 100) : -1,
+      // GPU 温度常见 40~90℃，极端值按 0~150 夹取（>100 画在顶栏顶部被裁剪）
+      gpuTemp: gpuTemp >= 0 ? gpuTemp.clamp(0, 150) : -1,
+    );
+  }
+
+  /// 提取字符串中的首个数值（含小数）；无数值返回 0。
+  static double _firstNumber(String s) {
+    final m = RegExp(r'-?\d+(\.\d+)?').firstMatch(s);
+    if (m == null) return 0;
+    return double.tryParse(m.group(0) ?? '') ?? 0;
   }
 
   /// 主动断开隧道并清理。
@@ -342,10 +517,122 @@ class TunnelService {
     }
   }
 
+  // ================= 实例级主机资源监控（独立采集隧道）=================
+
+  /// 开启"默认主机资源监控"的实例索引，null 表示无。
+  int? _monitorProfileIndex;
+  SSHConfig? _monitorConfig;
+
+  /// 独立的监控采集 SSH 客户端（与活动隧道分开，用于采集指定实例的主机数据）。
+  SSHClient? _monitorClient;
+  bool _monitorConnecting = false;
+
+  /// 当前监控实例索引（null 表示无）。
+  int? get monitorProfileIndex => _monitorProfileIndex;
+
+  /// 设置监控实例：建立/关闭独立的监控采集隧道。
+  ///
+  /// [config] 为 null 或未配置时关闭现有监控隧道；
+  /// 否则建立到该实例的采集连接（与活动隧道相互独立，切换实例不受影响）。
+  Future<void> setupMonitorProfile(
+      SSHConfig? config, {int? profileIndex}) async {
+    _monitorProfileIndex = profileIndex;
+    _monitorConfig = (config != null && config.isConfigured) ? config : null;
+    // 监控实例可能变化：清空按会话的主机类型缓存
+    _hostTypes.clear();
+    await _closeMonitorClient();
+    final c = _monitorConfig;
+    if (c == null) return;
+    await _connectMonitor(c);
+  }
+
+  Future<void> _connectMonitor(SSHConfig config) async {
+    if (_monitorConnecting) return;
+    _monitorConnecting = true;
+    try {
+      final socket = await SSHSocket.connect(config.host, config.sshPort,
+          timeout: const Duration(seconds: 15));
+      final List<SSHKeyPair>? identities = config.useKey
+          ? SSHKeyPair.fromPem(config.privateKeyPem,
+              config.keyPassphrase.isEmpty ? null : config.keyPassphrase)
+          : null;
+      final client = SSHClient(
+        socket,
+        username: config.username,
+        identities: identities,
+        onPasswordRequest: config.useKey ? null : () async => config.password,
+        keepAliveInterval: const Duration(seconds: 10),
+        onVerifyHostKey: (hostkeyType, fingerprint) => true,
+      );
+      _monitorClient = client;
+      client.done.then(
+        (_) => _onMonitorClosed(client),
+        onError: (Object e) {
+          debugPrint('[DSH] monitor transport error: $e');
+          _onMonitorClosed(client, failed: true);
+        },
+      );
+      await client.authenticated
+          .timeout(const Duration(seconds: 20), onTimeout: () {
+        debugPrint('[DSH] monitor auth timed out');
+        throw const SocketException('监控连接认证超时');
+      });
+      debugPrint('[DSH] monitor tunnel ready '
+          '(profile=$_monitorProfileIndex ${config.host}:${config.sshPort})');
+    } catch (e) {
+      debugPrint('[DSH] monitor connect failed: $e');
+      final mc = _monitorClient;
+      _monitorClient = null;
+      mc?.close();
+    } finally {
+      _monitorConnecting = false;
+    }
+  }
+
+  void _onMonitorClosed(SSHClient client, {bool failed = false}) {
+    if (_monitorClient != client) return;
+    _monitorClient = null;
+    debugPrint('[DSH] monitor transport closed'
+        '${failed ? ' (with error)' : ''}');
+  }
+
+  Future<void> _closeMonitorClient() async {
+    final mc = _monitorClient;
+    _monitorClient = null;
+    if (mc != null) mc.close();
+  }
+
+  /// 确保监控隧道存在（懒连接）；无法建立返回 null。
+  Future<SSHClient?> _ensureMonitorClient() async {
+    if (_monitorClient != null) return _monitorClient;
+    final c = _monitorConfig;
+    if (c == null || _monitorConnecting) return null;
+    await _connectMonitor(c);
+    return _monitorClient;
+  }
+
+  /// 采集监控实例的主机使用率。
+  ///
+  /// 当前活动隧道恰好是监控实例时直接复用（避免双连接）；
+  /// 否则使用独立的监控采集隧道。
+  Future<HostSample?> collectMonitorSample() async {
+    if (_monitorProfileIndex == null) return null;
+    if (_activeProfileIndex == _monitorProfileIndex && _client != null) {
+      return _sampleFrom(_client!);
+    }
+    final mc = await _ensureMonitorClient();
+    if (mc == null) return null;
+    return _sampleFrom(mc);
+  }
+
   void dispose() {
     _disposed = true;
     _statusController.close();
     // 应用退出：停止前台服务并释放唤醒锁
     ForegroundTunnelService.instance.stop();
+    // 关闭独立的监控采集隧道
+    final mc = _monitorClient;
+    _monitorClient = null;
+    mc?.close();
   }
 }

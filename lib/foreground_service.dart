@@ -64,13 +64,13 @@ class ForegroundTunnelService {
       );
       if (ok) {
         _started = true;
-        print('[DSH] foreground service started');
+        debugPrint('[DSH] foreground service started');
       } else {
-        print('[DSH] foreground service NOT started '
+        debugPrint('[DSH] foreground service NOT started '
             '(通知权限未授予，后台保活不可用)');
       }
     } catch (e) {
-      print('[DSH] foreground service start error: $e');
+      debugPrint('[DSH] foreground service start error: $e');
     }
   }
 
@@ -80,9 +80,9 @@ class ForegroundTunnelService {
     _started = false;
     try {
       await FlutterForegroundTask.stopService();
-      print('[DSH] foreground service stopped');
+      debugPrint('[DSH] foreground service stopped');
     } catch (e) {
-      print('[DSH] foreground service stop error: $e');
+      debugPrint('[DSH] foreground service stop error: $e');
     }
   }
 }
