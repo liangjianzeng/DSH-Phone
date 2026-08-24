@@ -48,6 +48,7 @@ dependencies:
   file_picker: ^8.1.2                  # 下载完成后的系统"另存为"位置选择（SAF）
   path_provider: ^2.1.5                # 下载临时目录
   image_picker: ^1.1.2                 # 相机/相册选图：直传 DSH 消息输入窗口
+  lunar: ^1.7.1                        # 农历计算：相机按钮按初一到十五再到三十显示月相
   # 前台服务保活：隧道连接期间在后台保持进程与网络，避免后台/关屏后
   # SSH 保活停止导致远端空闲断开、恢复前台必然重连。
   flutter_foreground_task: ^4.0.0

@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:lunar/lunar.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'artifact_recognizer.dart';
@@ -12,6 +14,7 @@ import 'config.dart';
 import 'download_manager.dart';
 import 'download_screen.dart';
 import 'host_monitor.dart';
+import 'moon_painter.dart';
 import 'setup_screen.dart';
 import 'tunnel_service.dart';
 
@@ -1358,44 +1361,85 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   /// 相机入口浮动按钮：对话区左侧、屏幕底部往上约六分之一处（避开底部安全区与
-  /// 键盘、缩放控件）。淡蓝色圆形 + 蓝色边框 + 柔光发光样式，突出"视觉工具"能力，
-  /// 让用户一眼注意到可发送图片；默认开启，设置页可关。
+  /// 键盘、缩放控件）。按钮呈现为**实时月相**——按农历初一(新月)→十五(满月)→
+  /// 三十(新月)显示阴晴圆缺，发光强度随月相变化（满月最亮、新月留微光），
+  /// 让用户一眼注意到视觉工具入口；默认开启，设置页可关。
   Widget _buildPhotoControls(BuildContext context) {
     final screenHeight = MediaQuery.of(context).size.height;
-    // 淡蓝视觉提示：圆底 + 蓝色描边 + 双层柔光，图标用深蓝以保证浅底上清晰。
-    const borderColor = Color(0xFF64B5F6);
+    final day = _lunarDay(DateTime.now());
+    // 月相：初一=新月(0) → 十五=满月(0.5) → 三十=新月(≈1)，平滑循环。
+    final phase = ((day - 1) / 28.0) % 1.0;
+    // 照亮比例：0=全暗(新月) → 1=全亮(满月)，同时决定月相形状与发光强度。
+    final lit = (1 - math.cos(2 * math.pi * phase)) / 2;
+    final borderColor = const Color(0xFF64B5F6);
     return Positioned(
       left: 6,
       bottom: screenHeight / 6,
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: const Color(0xFFB3E5FC), // 淡蓝色背景
-          border: Border.all(color: borderColor, width: 2), // 圆形边框
-          boxShadow: [
-            // 发光效果：内层近光 + 外层大范围柔光
-            BoxShadow(
-              color: borderColor.withValues(alpha: 0.65),
-              blurRadius: 10,
-              spreadRadius: 1,
+      child: SizedBox(
+        width: 48,
+        height: 48,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border: Border.all(color: borderColor, width: 2), // 圆形边框
+            boxShadow: [
+              // 发光随月相变化：满月最亮，新月留微光保持入口可见。
+              BoxShadow(
+                color: borderColor.withValues(alpha: 0.12 + 0.55 * lit),
+                blurRadius: 6 + 12 * lit,
+                spreadRadius: 1 + 2 * lit,
+              ),
+              BoxShadow(
+                color: const Color(0xFF81D4FA)
+                    .withValues(alpha: 0.08 + 0.35 * lit),
+                blurRadius: 16 + 12 * lit,
+                spreadRadius: 2 + 3 * lit,
+              ),
+            ],
+          ),
+          child: CustomPaint(
+            painter: MoonPhasePainter(phase),
+            child: Center(
+              child: IconButton(
+                tooltip: '添加图片/拍照（视觉工具）·${_moonPhaseName(day)}'
+                    '·照明 ${(lit * 100).round()}%',
+                icon: Icon(
+                  Icons.camera_alt_outlined,
+                  color: lit >= 0.5
+                      ? const Color(0xFF1565C0) // 亮面：深蓝图标
+                      : Colors.white, // 暗面：白色图标
+                ),
+                iconSize: 22,
+                visualDensity: VisualDensity.compact,
+                onPressed: _pickAndSendImage,
+              ),
             ),
-            BoxShadow(
-              color: borderColor.withValues(alpha: 0.35),
-              blurRadius: 22,
-              spreadRadius: 4,
-            ),
-          ],
-        ),
-        child: IconButton(
-          tooltip: '添加图片/拍照（视觉工具）',
-          icon: const Icon(Icons.camera_alt_outlined,
-              color: Color(0xFF1565C0)),
-          iconSize: 22,
-          visualDensity: VisualDensity.compact,
-          onPressed: _pickAndSendImage,
+          ),
         ),
       ),
     );
+  }
+
+  /// 农历日（1~29/30）。用 lunar 包按公历推算；异常时退回 15（满月，最亮最显眼）。
+  static int _lunarDay(DateTime date) {
+    try {
+      return Solar.fromDate(date).getLunar().getDay();
+    } catch (_) {
+      return 15;
+    }
+  }
+
+  /// 按农历日给出八相位名称（北半球面南），用于 tooltip 提示。
+  static String _moonPhaseName(int day) {
+    if (day <= 2) return '朔·新月';
+    if (day <= 6) return '娥眉月';
+    if (day <= 8) return '上弦月';
+    if (day <= 14) return '盈凸月';
+    if (day <= 16) return '望·满月';
+    if (day <= 21) return '亏凸月';
+    if (day <= 23) return '下弦月';
+    if (day <= 28) return '残月';
+    return '朔·新月';
   }
 }
 
@@ -1431,3 +1475,5 @@ class _InstanceChip extends StatelessWidget {
     );
   }
 }
+
+
