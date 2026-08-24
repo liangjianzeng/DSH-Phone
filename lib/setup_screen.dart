@@ -25,6 +25,8 @@ class SetupScreen extends StatefulWidget {
     this.onRefreshCache,
     this.zoomControlsEnabled = false,
     this.onZoomControlsChanged,
+    this.photoControlsEnabled = true,
+    this.onPhotoControlsChanged,
     this.hostMonitorEnabled = true,
     this.onHostMonitorChanged,
     this.resourceViewEnabled = true,
@@ -66,6 +68,12 @@ class SetupScreen extends StatefulWidget {
 
   /// 切换对话区缩放控件显示（默认关闭）。
   final ValueChanged<bool>? onZoomControlsChanged;
+
+  /// 对话区左侧相机入口是否显示（默认开启）。
+  final bool photoControlsEnabled;
+
+  /// 切换对话区相机入口显示（默认开启）。
+  final ValueChanged<bool>? onPhotoControlsChanged;
 
   /// 主机监控开关（默认开启；关闭则不请求不呈现曲线）。
   final bool hostMonitorEnabled;
@@ -117,6 +125,9 @@ class _SetupScreenState extends State<SetupScreen> {
   /// 不会重建它，必须本地持有才能即时反映拨动效果）。
   late bool _zoomControlsEnabled;
 
+  /// 对话区相机入口开关的本地状态（同上）。
+  late bool _photoControlsEnabled;
+
   /// 工具类功能开关本地状态（同样本地持有以即时反映拨动）。
   late bool _hostMonitorEnabled;
   late bool _resourceViewEnabled;
@@ -128,6 +139,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _profileIndex = widget.profileIndex.clamp(0, SSHConfig.maxProfiles - 1);
     _timeoutSeconds = widget.timeoutSeconds;
     _zoomControlsEnabled = widget.zoomControlsEnabled;
+    _photoControlsEnabled = widget.photoControlsEnabled;
     _hostMonitorEnabled = widget.hostMonitorEnabled;
     _resourceViewEnabled = widget.resourceViewEnabled;
     _resourceDownloadEnabled = widget.resourceDownloadEnabled;
@@ -238,18 +250,20 @@ class _SetupScreenState extends State<SetupScreen> {
         if (i == _profileIndex) continue;
         final other = widget.profiles[i];
         if (!other.hostMonitorEnabled) continue;
-        await SSHConfig.saveProfile(i, SSHConfig(
-          host: other.host,
-          sshPort: other.sshPort,
-          username: other.username,
-          localPort: other.localPort,
-          authType: other.authType,
-          password: other.password,
-          privateKeyPem: other.privateKeyPem,
-          keyPassphrase: other.keyPassphrase,
-          alias: other.alias,
-          hostMonitorEnabled: false,
-        ));
+        await SSHConfig.saveProfile(
+            i,
+            SSHConfig(
+              host: other.host,
+              sshPort: other.sshPort,
+              username: other.username,
+              localPort: other.localPort,
+              authType: other.authType,
+              password: other.password,
+              privateKeyPem: other.privateKeyPem,
+              keyPassphrase: other.keyPassphrase,
+              alias: other.alias,
+              hostMonitorEnabled: false,
+            ));
       }
     }
     widget.onInstanceMonitorChanged?.call(on);
@@ -263,12 +277,9 @@ class _SetupScreenState extends State<SetupScreen> {
       username: _username.text.trim(),
       localPort: int.tryParse(_localPort.text.trim()) ?? 3081,
       authType: _authType,
-      password: _authType == SSHConfig.authTypePassword
-          ? _password.text
-          : '',
-      privateKeyPem: _authType == SSHConfig.authTypeKey
-          ? _privateKey.text.trim()
-          : '',
+      password: _authType == SSHConfig.authTypePassword ? _password.text : '',
+      privateKeyPem:
+          _authType == SSHConfig.authTypeKey ? _privateKey.text.trim() : '',
       keyPassphrase: _keyPassphrase.text,
       hostMonitorEnabled: _instanceHostMonitorEnabled,
     );
@@ -366,8 +377,7 @@ class _SetupScreenState extends State<SetupScreen> {
             ],
             selected: {_profileIndex},
             showSelectedIcon: true,
-            onSelectionChanged: (selection) =>
-                _switchProfile(selection.first),
+            onSelectionChanged: (selection) => _switchProfile(selection.first),
           ),
           const SizedBox(height: 16),
           const Text('SSH 连接配置', style: TextStyle(fontSize: 18)),
@@ -379,9 +389,8 @@ class _SetupScreenState extends State<SetupScreen> {
               hintText: '如 100.81.83.59',
               border: OutlineInputBorder(),
             ),
-            validator: (v) => (v == null || v.trim().isEmpty)
-                ? '请输入 SSH 地址'
-                : null,
+            validator: (v) =>
+                (v == null || v.trim().isEmpty) ? '请输入 SSH 地址' : null,
             onChanged: (_) => _scheduleAutoSave(),
           ),
           const SizedBox(height: 12),
@@ -408,9 +417,8 @@ class _SetupScreenState extends State<SetupScreen> {
                     hintText: '如 jianzengliang',
                     border: OutlineInputBorder(),
                   ),
-                  validator: (v) => (v == null || v.trim().isEmpty)
-                      ? '请输入用户名'
-                      : null,
+                  validator: (v) =>
+                      (v == null || v.trim().isEmpty) ? '请输入用户名' : null,
                   onChanged: (_) => _scheduleAutoSave(),
                 ),
               ),
@@ -488,13 +496,11 @@ class _SetupScreenState extends State<SetupScreen> {
               maxLines: 6,
               decoration: const InputDecoration(
                 labelText: '私钥内容 (PEM)',
-                hintText:
-                    '粘贴 -----BEGIN ... PRIVATE KEY----- 全文\n（留空则仅用密码）',
+                hintText: '粘贴 -----BEGIN ... PRIVATE KEY----- 全文\n（留空则仅用密码）',
                 border: OutlineInputBorder(),
               ),
-              validator: (v) => (v == null || v.trim().isEmpty)
-                  ? '请输入私钥内容'
-                  : null,
+              validator: (v) =>
+                  (v == null || v.trim().isEmpty) ? '请输入私钥内容' : null,
               onChanged: (_) => _scheduleAutoSave(),
             ),
             const SizedBox(height: 12),
@@ -694,6 +700,17 @@ class _SetupScreenState extends State<SetupScreen> {
               widget.onZoomControlsChanged?.call(v);
             },
           ),
+          SwitchListTile(
+            title: const Text('对话区显示相机入口'),
+            subtitle: const Text(
+              '默认开启；在对话区左侧显示添加图片/拍照浮动按钮，直传消息输入窗口',
+            ),
+            value: _photoControlsEnabled,
+            onChanged: (v) {
+              setState(() => _photoControlsEnabled = v);
+              widget.onPhotoControlsChanged?.call(v);
+            },
+          ),
           const SizedBox(height: 8),
           OutlinedButton.icon(
             onPressed: widget.onRefreshCache,
@@ -717,14 +734,15 @@ class _SetupScreenState extends State<SetupScreen> {
               ListTile(
                 leading: const Icon(Icons.info_outline),
                 title: const Text('版本'),
-                subtitle: const Text('DSH-Phone v0.1.5'),
+                subtitle: const Text('DSH-Phone v0.1.6'),
                 trailing: const Icon(Icons.chevron_right),
                 onTap: _showAbout,
               ),
               ListTile(
                 leading: const Icon(Icons.stars_outlined),
                 title: const Text('项目原理'),
-                subtitle: const Text('通过 SSH 隧道把手机端口转发到远程 DSH Web UI，用 WebView 加载'),
+                subtitle:
+                    const Text('通过 SSH 隧道把手机端口转发到远程 DSH Web UI，用 WebView 加载'),
                 onTap: _showAbout,
               ),
               ListTile(
@@ -732,15 +750,16 @@ class _SetupScreenState extends State<SetupScreen> {
                 title: const Text('开源地址'),
                 subtitle: const Text('github.com/liangjianzeng/DSH-Phone'),
                 trailing: const Icon(Icons.open_in_new),
-                onTap: () => _openUrl('https://github.com/liangjianzeng/DSH-Phone'),
+                onTap: () =>
+                    _openUrl('https://github.com/liangjianzeng/DSH-Phone'),
               ),
               ListTile(
                 leading: const Icon(Icons.menu_book_outlined),
                 title: const Text('README'),
                 subtitle: const Text('查看项目说明文档'),
                 trailing: const Icon(Icons.open_in_new),
-                onTap: () =>
-                    _openUrl('https://github.com/liangjianzeng/DSH-Phone#readme'),
+                onTap: () => _openUrl(
+                    'https://github.com/liangjianzeng/DSH-Phone#readme'),
               ),
             ],
           ),
@@ -770,7 +789,7 @@ class _SetupScreenState extends State<SetupScreen> {
         title: const Text('关于 DSH-Phone'),
         content: const SingleChildScrollView(
           child: Text(
-            'DSH-Phone v0.1.5\n\n'
+            'DSH-Phone v0.1.6\n\n'
             '一个在 Android 上通过 SSH 隧道访问 DeepSeek Harness Web UI 的客户端。\n\n'
             '工作原理：\n'
             '• 应用内置 dartssh2 建立 SSH 隧道\n'

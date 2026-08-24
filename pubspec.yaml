@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 0.1.5+11
+version: 0.1.6+12
 
 environment:
   sdk: ^3.6.0
@@ -47,6 +47,7 @@ dependencies:
   charset: ^2.0.1                      # 文件编码自动检测（UTF-8/GBK 等）
   file_picker: ^8.1.2                  # 下载完成后的系统"另存为"位置选择（SAF）
   path_provider: ^2.1.5                # 下载临时目录
+  image_picker: ^1.1.2                 # 相机/相册选图：直传 DSH 消息输入窗口
   # 前台服务保活：隧道连接期间在后台保持进程与网络，避免后台/关屏后
   # SSH 保活停止导致远端空闲断开、恢复前台必然重连。
   flutter_foreground_task: ^4.0.0

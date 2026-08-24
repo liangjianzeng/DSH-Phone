@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'artifact_recognizer.dart';
@@ -32,7 +34,8 @@ class _WebViewScreenState extends State<WebViewScreen>
   InAppWebViewController? _controller;
 
   // ---- 多实例配置 ----
-  List<SSHConfig> _profiles = List.filled(SSHConfig.maxProfiles, const SSHConfig());
+  List<SSHConfig> _profiles =
+      List.filled(SSHConfig.maxProfiles, const SSHConfig());
   int _activeIndex = 0;
   SSHConfig _config = const SSHConfig();
 
@@ -58,6 +61,9 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 对话区左侧浮动缩放控件的开关键（持久化，默认关闭）。
   static const String _zoomControlsPrefKey = 'webview_zoom_controls_enabled';
 
+  /// 对话区左侧相机入口的开关键（持久化，默认开启）。
+  static const String _photoControlsPrefKey = 'webview_photo_controls_enabled';
+
   // ---- 工具类功能开关（设置页"工具"分类控制）----
   bool _hostMonitorEnabled = true; // 主机监控（默认开：采样并呈现曲线）
   bool _resourceViewEnabled = true; // 资源查看（默认开）
@@ -68,6 +74,9 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   /// 对话区左侧浮动缩放控件是否显示（默认关闭，由设置页开关控制）。
   bool _zoomControlsEnabled = false;
+
+  /// 对话区左侧相机入口是否显示（默认开启，由设置页开关控制）。
+  bool _photoControlsEnabled = true;
 
   // ---- WebView 页面加载状态 ----
   bool _pageLoading = false; // 远程页面加载中（隧道已通，页面未就绪）
@@ -172,6 +181,11 @@ class _WebViewScreenState extends State<WebViewScreen>
   document.addEventListener('click', function(ev) {
     var t = ev.target;
 
+    // 0) 放行 composer 输入/附件区域：附件删除按钮/预览图/发送按钮等
+    //    点击归 DSH 处理，避免附件文件名（含 .png 等后缀）被误判为
+    //    "资源型成果"而触发查看/下载流程（导致无法删除、误开下载页）。
+    if (closestUp(t, ['[data-composer-card]'])) return;
+
     // 资源型后缀（apk/压缩包等二进制，走下载保存流程）
     var isResourceSuffix = /\.(apk|zip|tar|gz|tgz|rar|7z|xz|bin|exe|msi|dmg|iso|img|mp4|mp3|pdf|png|jpg|jpeg|gif|webp|svg|doc|docx|xls|xlsx|ppt|pptx|so|a|dll)(\?|#|$)/i;
 
@@ -274,6 +288,68 @@ class _WebViewScreenState extends State<WebViewScreen>
 })();
 ''';
 
+  /// 图片直传桥（方案 A）：把 Flutter 侧选好的图片注入 DSH 消息输入窗口。
+  ///
+  /// DSH Web UI 的图片附件只支持"拖拽 drop"（document 级 drop 事件 →
+  /// `onAddImages(files)`），没有 `input[type=file]`。本桥：
+  /// 1. 隐藏 file input 作为程序化接收文件的中转站（`input.files` 可赋值）；
+  /// 2. Flutter 注入 base64 → 构造 `File` → 塞进中转 input → 派发 change；
+  /// 3. 桥监听 change 拿到 `File` → 构造合成 drop 事件（`defineProperty`
+  ///    覆盖只读 dataTransfer）→ dispatch 到 document，DSH 附件槽收到图。
+  static const String _photoBridgeJs = r'''
+(function() {
+  // 隐藏 file input：仅用于原生选择器路径；base64 注入直接走 deliverDrop。
+  // 按 id 去重，避免页面导航/DOM 重建后重复创建。
+  var input = document.getElementById('__dshPhotoInput');
+  if (!input) {
+    input = document.createElement('input');
+    input.id = '__dshPhotoInput';
+    input.type = 'file';
+    input.accept = 'image/png,image/jpeg,image/webp,image/gif';
+    input.style.display = 'none';
+    document.body.appendChild(input);
+    input.addEventListener('change', function() {
+      var file = input.files && input.files[0];
+      if (!file) return;
+      input.value = '';
+      deliverDrop(file);
+    });
+  }
+
+  function deliverDrop(file) {
+    var dt = new DataTransfer();
+    dt.items.add(file);
+    var ev = new DragEvent('drop', { bubbles: true, cancelable: true });
+    try {
+      Object.defineProperty(ev, 'dataTransfer', { value: dt });
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+    document.dispatchEvent(ev);
+    return { ok: true };
+  }
+
+  // 每次注入都重置桥对象：页面导航/DOM 重建后确保 __dshPhotoBridge 始终可用，
+  // 不再用布尔哨兵提前 return 导致重建后漏建 input。
+  window.__dshPhotoBridge = {
+    // Flutter 注入：base64 → 图片文件 → drop 给 DSH 附件槽
+    pickImage: function(base64, name, mime) {
+      try {
+        var bin = atob(base64);
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        var file = new File([bytes], name || 'image.jpg', { type: mime || 'image/jpeg' });
+        // input.files 为只读属性，程序化赋值被静默忽略，
+        // 无法经 change 事件送达，故直接用已有 File 调用 deliverDrop drop 进附件槽。
+        return deliverDrop(file);
+      } catch (e) {
+        return { ok: false, error: String(e) };
+      }
+    }
+  };
+})();
+''';
+
   /// 若是网络超时/缓慢类错误，追加 VPN UDP QoS 友好提示。
   static String _appendQosHintIfTimeout(String message) {
     final lowered = message.toLowerCase();
@@ -302,6 +378,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     _load();
     _loadZoomScale();
     _loadZoomControls();
+    _loadPhotoControls();
     _loadToolSwitches();
     // 监控采样定时器常驻，内部仅在隧道 connected 时旁路采集。
     HostMonitor.instance.start();
@@ -367,6 +444,23 @@ class _WebViewScreenState extends State<WebViewScreen>
     );
   }
 
+  /// 读取持久化的对话区相机入口开关。
+  Future<void> _loadPhotoControls() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool(_photoControlsPrefKey) ?? true;
+    if (!mounted) return;
+    setState(() => _photoControlsEnabled = enabled);
+  }
+
+  /// 保存并应用对话区相机入口开关（默认开启）。
+  void _setPhotoControlsEnabled(bool enabled) {
+    if (!mounted) return;
+    setState(() => _photoControlsEnabled = enabled);
+    SharedPreferences.getInstance().then(
+      (prefs) => prefs.setBool(_photoControlsPrefKey, enabled),
+    );
+  }
+
   /// 读取工具类功能开关（监控 / 资源查看 / 资源下载），并同步监控采样器。
   Future<void> _loadToolSwitches() async {
     final hostMonitor = await SSHConfig.loadHostMonitorEnabled();
@@ -408,14 +502,14 @@ class _WebViewScreenState extends State<WebViewScreen>
   Future<void> _applyZoom() async {
     final c = _controller;
     if (c == null) return;
-    await c.evaluateJavascript(source:
-      "document.documentElement.style.zoom = '${_zoomScaleNotifier.value.toStringAsFixed(2)}'",
+    await c.evaluateJavascript(
+      source:
+          "document.documentElement.style.zoom = '${_zoomScaleNotifier.value.toStringAsFixed(2)}'",
     );
   }
 
   void _adjustZoom(double delta) {
-    final next =
-        (_zoomScaleNotifier.value + delta).clamp(_zoomMin, _zoomMax);
+    final next = (_zoomScaleNotifier.value + delta).clamp(_zoomMin, _zoomMax);
     if (next == _zoomScaleNotifier.value) return;
     _zoomScaleNotifier.value = next;
     _saveZoomScale();
@@ -513,8 +607,7 @@ class _WebViewScreenState extends State<WebViewScreen>
       _pageLoading = false;
     });
     try {
-      await TunnelService.instance
-          .connect(_config, profileIndex: _activeIndex);
+      await TunnelService.instance.connect(_config, profileIndex: _activeIndex);
       if (!mounted) return;
       _reconnectCount = 0; // 连接成功：重置重连计数
       setState(() => _tunnelStatus = TunnelStatus.connected);
@@ -607,6 +700,8 @@ class _WebViewScreenState extends State<WebViewScreen>
           onRefreshCache: _refreshCache,
           zoomControlsEnabled: _zoomControlsEnabled,
           onZoomControlsChanged: _setZoomControlsEnabled,
+          photoControlsEnabled: _photoControlsEnabled,
+          onPhotoControlsChanged: _setPhotoControlsEnabled,
           hostMonitorEnabled: _hostMonitorEnabled,
           onHostMonitorChanged: _setHostMonitorEnabled,
           resourceViewEnabled: _resourceViewEnabled,
@@ -668,6 +763,92 @@ class _WebViewScreenState extends State<WebViewScreen>
     );
     // 立即注入一次；页面导航后 onLoadStop 会再次注入。
     controller.evaluateJavascript(source: _artifactBridgeJs);
+  }
+
+  /// 图片直传桥：注入桥脚本（页面导航 DOM 重建后需重新注入）。
+  void _setupPhotoBridge(InAppWebViewController controller) {
+    controller.evaluateJavascript(source: _photoBridgeJs);
+  }
+
+  /// 页面导航后重新注入图片直传桥（每次导航 DOM 重建）。
+  void _injectPhotoBridge() {
+    final c = _controller;
+    if (c == null) return;
+    c.evaluateJavascript(source: _photoBridgeJs);
+  }
+
+  /// 相机/相册选图 → base64 → 注入 DSH 消息输入窗口（附件槽）。
+  Future<void> _pickAndSendImage() async {
+    final c = _controller;
+    if (c == null) return;
+    // 选择来源：相册 / 拍照
+    final source = await showModalBottomSheet<ImageSource>(
+      context: context,
+      builder: (_) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('从相册选择'),
+              onTap: () => Navigator.pop(context, ImageSource.gallery),
+            ),
+            ListTile(
+              leading: const Icon(Icons.camera_alt_outlined),
+              title: const Text('拍照'),
+              onTap: () => Navigator.pop(context, ImageSource.camera),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (source == null) return;
+    final picker = ImagePicker();
+    // 限制尺寸与质量：手机照片通常远小于 DSH 单图 20MB 上限，这里再压缩
+    final file = await picker.pickImage(
+      source: source,
+      maxWidth: 4096,
+      maxHeight: 4096,
+      imageQuality: 90,
+    );
+    if (file == null || !mounted) return;
+    // DSH 附件仅接受 png/jpeg/webp/gif；其它格式直接提示，避免页面侧报错
+    final name = file.name.isNotEmpty ? file.name : 'image.jpg';
+    final mime = _imageMimeForName(name);
+    if (mime == null) {
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..showSnackBar(const SnackBar(
+            content: Text('不支持的图片格式，请选择 PNG / JPEG / WebP / GIF')));
+      return;
+    }
+    final bytes = await file.readAsBytes();
+    if (!mounted) return;
+    final base64 = base64Encode(bytes);
+    // name 可能含中文/空格，用 jsonEncode 保证注入安全
+    final js =
+        "window.__dshPhotoBridge.pickImage('$base64', ${jsonEncode(name)}, '$mime')";
+    final result = await c.evaluateJavascript(source: js) as Object?;
+    debugPrint('[DSH] photo pick: name=$name mime=$mime '
+        'bytes=${bytes.length} result=$result');
+    if (!mounted) return;
+    // 页面侧注入失败（桥未就绪 / 解码异常）时明确提示，便于排查
+    if (result is Map && result['ok'] == false) {
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..showSnackBar(SnackBar(
+            content: Text('图片注入失败：${result['error'] ?? '未知错误'}')));
+    }
+  }
+
+  /// 依据文件名判断 DSH 附件可接受的图片 MIME（png/jpeg/webp/gif）。
+  static String? _imageMimeForName(String name) {
+    final lower = name.toLowerCase();
+    if (lower.endsWith('.png')) return 'image/png';
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+    if (lower.endsWith('.webp')) return 'image/webp';
+    if (lower.endsWith('.gif')) return 'image/gif';
+    return null;
   }
 
   /// 页面加载完成后注入成果监听脚本（每次导航 DOM 重建后重新绑定）。
@@ -785,9 +966,9 @@ class _WebViewScreenState extends State<WebViewScreen>
       if (!mounted || !_pageLoading) return;
       setState(() {
         _pageLoading = false;
-        _pageError = _appendQosHintIfTimeout(
-            '加载超时（${_loadTimeout.inSeconds} 秒未完成）。\n'
-            '请检查服务器状态、网络连接，或在设置中调大超时后重试。');
+        _pageError =
+            _appendQosHintIfTimeout('加载超时（${_loadTimeout.inSeconds} 秒未完成）。\n'
+                '请检查服务器状态、网络连接，或在设置中调大超时后重试。');
       });
     });
   }
@@ -891,7 +1072,8 @@ class _WebViewScreenState extends State<WebViewScreen>
                   Container(
                     color: theme.colorScheme.surface.withValues(alpha: 0.7),
                     padding: const EdgeInsets.symmetric(vertical: 2),
-                    child: Text('DSH-Phone', style: theme.textTheme.titleMedium),
+                    child:
+                        Text('DSH-Phone', style: theme.textTheme.titleMedium),
                   ),
                 ],
               ),
@@ -963,8 +1145,7 @@ class _WebViewScreenState extends State<WebViewScreen>
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const Icon(Icons.error_outline,
-                    size: 48, color: Colors.red),
+                const Icon(Icons.error_outline, size: 48, color: Colors.red),
                 const SizedBox(height: 16),
                 Text('连接失败：\n$_error', textAlign: TextAlign.center),
                 const SizedBox(height: 16),
@@ -1003,6 +1184,7 @@ class _WebViewScreenState extends State<WebViewScreen>
               onWebViewCreated: (controller) {
                 _controller = controller;
                 _setupArtifactBridge(controller);
+                _setupPhotoBridge(controller);
               },
               onLoadStart: (controller, url) => _onPageLoadStart(),
               onProgressChanged: (controller, progress) =>
@@ -1013,6 +1195,8 @@ class _WebViewScreenState extends State<WebViewScreen>
                 _applyZoom();
                 // 每次页面导航后重新注入成果监听脚本
                 _injectArtifactBridge();
+                // 每次页面导航后重新注入图片直传桥
+                _injectPhotoBridge();
               },
               onReceivedError: (controller, request, error) => _onPageError(
                 '加载失败：${error.description}\n'
@@ -1024,14 +1208,16 @@ class _WebViewScreenState extends State<WebViewScreen>
               ),
             ),
             // 页面加载中：进度遮罩（不透明白底，避免黑屏观感）
-            if (_pageLoading && _pageError == null)
-              _buildPageLoading(context),
+            if (_pageLoading && _pageError == null) _buildPageLoading(context),
             // 页面加载失败/超时：错误界面
             if (_pageError != null) _buildPageError(context),
             // 自定义缩放控件：左侧屏幕中央、竖排，避开右下角发送按钮。
             // 默认关闭，仅在设置页开启后显示。
             if (_zoomControlsEnabled && !_pageLoading && _pageError == null)
               _buildZoomControls(context),
+            // 相机入口浮动按钮：对话区左侧靠屏幕边居中偏上，默认开启。
+            if (_photoControlsEnabled && !_pageLoading && _pageError == null)
+              _buildPhotoControls(context),
           ],
         );
       case TunnelStatus.disconnected:
@@ -1097,8 +1283,7 @@ class _WebViewScreenState extends State<WebViewScreen>
             children: [
               const Icon(Icons.cloud_off, size: 56, color: Colors.red),
               const SizedBox(height: 16),
-              Text('无法加载远程界面',
-                  style: Theme.of(context).textTheme.titleMedium),
+              Text('无法加载远程界面', style: Theme.of(context).textTheme.titleMedium),
               const SizedBox(height: 12),
               ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 320),
@@ -1167,6 +1352,47 @@ class _WebViewScreenState extends State<WebViewScreen>
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  /// 相机入口浮动按钮：对话区左侧、屏幕底部往上约六分之一处（避开底部安全区与
+  /// 键盘、缩放控件）。淡蓝色圆形 + 蓝色边框 + 柔光发光样式，突出"视觉工具"能力，
+  /// 让用户一眼注意到可发送图片；默认开启，设置页可关。
+  Widget _buildPhotoControls(BuildContext context) {
+    final screenHeight = MediaQuery.of(context).size.height;
+    // 淡蓝视觉提示：圆底 + 蓝色描边 + 双层柔光，图标用深蓝以保证浅底上清晰。
+    const borderColor = Color(0xFF64B5F6);
+    return Positioned(
+      left: 6,
+      bottom: screenHeight / 6,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: const Color(0xFFB3E5FC), // 淡蓝色背景
+          border: Border.all(color: borderColor, width: 2), // 圆形边框
+          boxShadow: [
+            // 发光效果：内层近光 + 外层大范围柔光
+            BoxShadow(
+              color: borderColor.withValues(alpha: 0.65),
+              blurRadius: 10,
+              spreadRadius: 1,
+            ),
+            BoxShadow(
+              color: borderColor.withValues(alpha: 0.35),
+              blurRadius: 22,
+              spreadRadius: 4,
+            ),
+          ],
+        ),
+        child: IconButton(
+          tooltip: '添加图片/拍照（视觉工具）',
+          icon: const Icon(Icons.camera_alt_outlined,
+              color: Color(0xFF1565C0)),
+          iconSize: 22,
+          visualDensity: VisualDensity.compact,
+          onPressed: _pickAndSendImage,
         ),
       ),
     );
