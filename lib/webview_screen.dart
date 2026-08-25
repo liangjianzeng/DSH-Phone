@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
@@ -14,8 +13,11 @@ import 'config.dart';
 import 'download_manager.dart';
 import 'download_screen.dart';
 import 'host_monitor.dart';
+import 'moon_astronomy.dart';
+import 'moon_location.dart';
 import 'moon_painter.dart';
 import 'setup_screen.dart';
+import 'task_notifier.dart';
 import 'tunnel_service.dart';
 
 /// 主界面：SSH 隧道就绪后，用 WebView 加载 DSH Web UI，并带缓存加速与设置入口。
@@ -291,6 +293,71 @@ class _WebViewScreenState extends State<WebViewScreen>
 })();
 ''';
 
+  /// 任务状态桥 JS：监听 DSH 智能体任务的运行态并回传 Flutter。
+  ///
+  /// 运行指示器：ChatView 的 TurnStatus 组件渲染
+  /// `<div role="status" aria-live="polite">Deep diving...</div>`（硬编码文案，
+  /// 不随语言切换）。用「role=status + aria-live=polite + 文本含哨兵词」组合
+  /// 精确定位，避开遍布全 UI 的其它 role="status" 元素。
+  ///
+  /// 状态机：仅上报「运行 ↔ 结束」的切换；页面加载时若已在运行则直接上报
+  /// 运行态，否则只对齐基准不上报（避免每次导航误报"已完成"）。
+  static const String _taskBridgeJs = r'''
+(function() {
+  if (window.__dshTaskBridge) return;
+  window.__dshTaskBridge = true;
+
+  var SENTINEL = 'Deep diving';
+  var state = null; // 上次上报的运行态；null = 尚未对齐
+  var timer = null;
+
+  function report(next) {
+    try {
+      window.flutter_inappwebview.callHandler('onTaskState', { state: next });
+    } catch (e) {}
+  }
+
+  function scan() {
+    var running = false;
+    var nodes = document.querySelectorAll('[role="status"][aria-live="polite"]');
+    for (var i = 0; i < nodes.length; i++) {
+      if ((nodes[i].textContent || '').indexOf(SENTINEL) !== -1) {
+        running = true;
+        break;
+      }
+    }
+    var next = running ? 'running' : 'settled';
+    if (state === null) {
+      // 首次对齐：已在运行则上报，否则只记基准（不误报已完成）
+      state = next;
+      if (running) report('running');
+      return;
+    }
+    if (next !== state) {
+      state = next;
+      report(next);
+    }
+  }
+
+  // 运行指示器随元素增删出现/消失：只监听 childList（子树增删），
+  // 不做 characterData（流式输出高频文本变动），成本更低。
+  var pending = false;
+  function scheduleScan() {
+    if (pending) return;
+    pending = true;
+    timer = setTimeout(function() { pending = false; scan(); }, 250);
+  }
+  new MutationObserver(function(mutations) {
+    for (var i = 0; i < mutations.length; i++) {
+      if (mutations[i].type === 'childList') { scheduleScan(); break; }
+    }
+  }).observe(document.documentElement, { childList: true, subtree: true });
+
+  // 页面可能正运行中：立即对齐一次。
+  scan();
+})();
+''';
+
   /// 图片直传桥（方案 A）：把 Flutter 侧选好的图片注入 DSH 消息输入窗口。
   ///
   /// DSH Web UI 的图片附件只支持"拖拽 drop"（document 级 drop 事件 →
@@ -385,6 +452,21 @@ class _WebViewScreenState extends State<WebViewScreen>
     _loadToolSwitches();
     // 监控采样定时器常驻，内部仅在隧道 connected 时旁路采集。
     HostMonitor.instance.start();
+    // 月相按钮：异步解析观测者位置（GPS → 时区回退），到位后刷新盘面朝向。
+    _resolveMoonLocation();
+  }
+
+  /// 观测者位置（月相盘面朝向用）；解析完成前用同步回退值。
+  ObserverLocation? _observer;
+
+  Future<void> _resolveMoonLocation() async {
+    try {
+      final loc = await MoonLocation.resolve();
+      if (!mounted) return;
+      setState(() => _observer = loc);
+    } catch (_) {
+      // 解析失败保持回退位置即可。
+    }
   }
 
   /// 应用前后台切换记录：用于排查"后台→前台必然重连"问题。
@@ -778,6 +860,40 @@ class _WebViewScreenState extends State<WebViewScreen>
     final c = _controller;
     if (c == null) return;
     c.evaluateJavascript(source: _photoBridgeJs);
+  }
+
+  // ================= 任务状态桥（熄屏通知）=================
+
+  /// 注册任务状态 handler 并注入监听脚本。
+  ///
+  /// handler 随 controller 常驻；监听脚本按页面加载注入（onLoadStop），
+  /// 因为每次页面导航 DOM 都会重建。
+  void _setupTaskBridge(InAppWebViewController controller) {
+    controller.addJavaScriptHandler(
+      handlerName: 'onTaskState',
+      callback: (List<Object?> args) async {
+        if (args.isEmpty) return null;
+        final raw = args.first;
+        if (raw is! Map) return null;
+        final state = raw['state'] as String?;
+        debugPrint('[DSH] task state: $state');
+        switch (state) {
+          case 'running':
+            await TaskNotifier.instance.showRunning();
+          case 'settled':
+            await TaskNotifier.instance.showCompleted();
+        }
+        return null;
+      },
+    );
+    controller.evaluateJavascript(source: _taskBridgeJs);
+  }
+
+  /// 页面导航后重新注入任务状态桥（每次导航 DOM 重建）。
+  void _injectTaskBridge() {
+    final c = _controller;
+    if (c == null) return;
+    c.evaluateJavascript(source: _taskBridgeJs);
   }
 
   /// 相机/相册选图 → base64 → 注入 DSH 消息输入窗口（附件槽）。
@@ -1188,6 +1304,7 @@ class _WebViewScreenState extends State<WebViewScreen>
                 _controller = controller;
                 _setupArtifactBridge(controller);
                 _setupPhotoBridge(controller);
+                _setupTaskBridge(controller);
               },
               onLoadStart: (controller, url) => _onPageLoadStart(),
               onProgressChanged: (controller, progress) =>
@@ -1200,6 +1317,10 @@ class _WebViewScreenState extends State<WebViewScreen>
                 _injectArtifactBridge();
                 // 每次页面导航后重新注入图片直传桥
                 _injectPhotoBridge();
+                // 每次页面导航后重新注入任务状态桥，并复位可能残留的
+                // 「任务进行中」通知（桥会对齐当前状态，运行中会重新上报）。
+                _injectTaskBridge();
+                TaskNotifier.instance.reset();
               },
               onReceivedError: (controller, request, error) => _onPageError(
                 '加载失败：${error.description}\n'
@@ -1361,16 +1482,20 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   /// 相机入口浮动按钮：对话区左侧、屏幕底部往上约六分之一处（避开底部安全区与
-  /// 键盘、缩放控件）。按钮呈现为**实时月相**——按农历初一(新月)→十五(满月)→
-  /// 三十(新月)显示阴晴圆缺，发光强度随月相变化（满月最亮、新月留微光），
+  /// 键盘、缩放控件）。按钮呈现为**真实观测的月相**——用太阳/月球实际位置计算：
+  /// 照明度（小时级连续的朔望周期 29.53 天）与盘面朝向（亮缘位置角 + 观测者
+  /// 纬度/经度/时角决定的旋转，月出月落可见亮面旋转），满月最亮、新月留微光，
   /// 让用户一眼注意到视觉工具入口；默认开启，设置页可关。
   Widget _buildPhotoControls(BuildContext context) {
     final screenHeight = MediaQuery.of(context).size.height;
-    final day = _lunarDay(DateTime.now());
-    // 月相：初一=新月(0) → 十五=满月(0.5) → 三十=新月(≈1)，平滑循环。
-    final phase = ((day - 1) / 28.0) % 1.0;
-    // 照亮比例：0=全暗(新月) → 1=全亮(满月)，同时决定月相形状与发光强度。
-    final lit = (1 - math.cos(2 * math.pi * phase)) / 2;
+    final now = DateTime.now();
+    // 真实月球观测：绝对时间（UTC）+ 观测者位置。位置解析完成前用同步回退值
+    // （时区推导经度 + 默认纬度），GPS 到位后 setState 刷新朝向。
+    final obs = MoonAstronomy.compute(
+      now.toUtc(),
+      _observer ?? MoonLocation.fallback(),
+    );
+    final lit = obs.illumination;
     final borderColor = const Color(0xFF64B5F6);
     return Positioned(
       left: 6,
@@ -1398,11 +1523,12 @@ class _WebViewScreenState extends State<WebViewScreen>
             ],
           ),
           child: CustomPaint(
-            painter: MoonPhasePainter(phase),
+            painter: MoonPhasePainter(obs.phase01, obs.tiltDeg),
             child: Center(
               child: IconButton(
-                tooltip: '添加图片/拍照（视觉工具）·${_moonPhaseName(day)}'
-                    '·照明 ${(lit * 100).round()}%',
+                tooltip: '添加图片/拍照（视觉工具）·${obs.name}'
+                    '·照明 ${(lit * 100).round()}%'
+                    '·农历${_lunarDay(now)}',
                 icon: Icon(
                   Icons.camera_alt_outlined,
                   color: lit >= 0.5
@@ -1420,27 +1546,18 @@ class _WebViewScreenState extends State<WebViewScreen>
     );
   }
 
-  /// 农历日（1~29/30）。用 lunar 包按公历推算；异常时退回 15（满月，最亮最显眼）。
+  /// 农历日（1~29/30）。统一按北京时间（UTC+8）推算农历，避免设备时区差异
+  /// 导致月相差一天；异常时退回 15（满月，最亮最显眼）。
   static int _lunarDay(DateTime date) {
     try {
-      return Solar.fromDate(date).getLunar().getDay();
+      // 本地时间 → UTC → +8h 得到北京日历字段；lunar 只取年月日，忽略时分。
+      final beijing = date.toUtc().add(const Duration(hours: 8));
+      return Solar.fromDate(beijing).getLunar().getDay();
     } catch (_) {
       return 15;
     }
   }
 
-  /// 按农历日给出八相位名称（北半球面南），用于 tooltip 提示。
-  static String _moonPhaseName(int day) {
-    if (day <= 2) return '朔·新月';
-    if (day <= 6) return '娥眉月';
-    if (day <= 8) return '上弦月';
-    if (day <= 14) return '盈凸月';
-    if (day <= 16) return '望·满月';
-    if (day <= 21) return '亏凸月';
-    if (day <= 23) return '下弦月';
-    if (day <= 28) return '残月';
-    return '朔·新月';
-  }
 }
 
 /// 顶部实例切换器的展示 Chip：实例标签 + 连接状态点。

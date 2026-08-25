@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 0.1.6+12
+version: 0.1.7+13
 
 environment:
   sdk: ^3.6.0
@@ -52,6 +52,10 @@ dependencies:
   # 前台服务保活：隧道连接期间在后台保持进程与网络，避免后台/关屏后
   # SSH 保活停止导致远端空闲断开、恢复前台必然重连。
   flutter_foreground_task: ^4.0.0
+  # 熄屏通知：AI 智能体任务进行中/完成时发系统通知，锁屏可见。
+  flutter_local_notifications: ^17.2.2
+  # 观测者位置：月相按钮按真实纬度/经度计算盘面朝向（月出月落旋转）。
+  geolocator: ^11.1.0
 
 dependency_overrides:
   # 本地 fork 的 dartssh2：优化解密（processAll 批处理）+ 启用 zlib 压缩，

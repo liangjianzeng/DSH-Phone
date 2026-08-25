@@ -13,6 +13,9 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
+        // flutter_local_notifications 依赖 Java 8+ API（java.time 等），
+        // 低版本 Android 需要 core library desugaring。
+        coreLibraryDesugaringEnabled true
     }
 
     kotlinOptions {
@@ -54,6 +57,12 @@ android {
             signingConfig = hasKey ? signingConfigs.release : signingConfigs.debug
         }
     }
+}
+
+dependencies {
+    // core library desugaring：配合 compileOptions.coreLibraryDesugaringEnabled，
+    // 供 flutter_local_notifications 在 minSdk 23 上使用 java.time 等 API。
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.2'
 }
 
 flutter {

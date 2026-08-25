@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'config.dart';
 import 'foreground_service.dart';
 import 'setup_screen.dart';
+import 'task_notifier.dart';
 import 'tunnel_service.dart';
 import 'webview_screen.dart';
 
@@ -12,6 +13,9 @@ void main() async {
 
   // 前台服务保活初始化：隧道连接期间后台保持进程/网络，避免后台断线
   ForegroundTunnelService.init();
+
+  // 任务熄屏通知初始化：AI 智能体任务进行中/完成时发系统通知（锁屏可见）
+  TaskNotifier.instance.init();
 
   // 边缘到边缘全屏：应用内容延伸到系统状态栏/导航栏区域
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
