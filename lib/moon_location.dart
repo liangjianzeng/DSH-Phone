@@ -1,39 +1,102 @@
+import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'moon_astronomy.dart';
 
-/// 观测者位置解析：优先设备定位，失败时回退到「时区推导经度 + 默认纬度」。
+/// 月相观测位置模式。
+enum MoonLocationMode {
+  /// 定位获取：读取设备 GPS；失败/拒绝时回退默认北京。
+  auto,
+
+  /// 手动输入：使用用户填写的经纬度。
+  manual,
+
+  /// 默认北京：天安门坐标，无需任何权限。
+  beijing,
+}
+
+/// 月相按钮的观测者位置设置：默认北京，允许手动输入经纬度，也允许定位获取。
 ///
-/// 月相按钮的盘面朝向依赖观测纬度与月球时角（经度/时刻），必须知道
-/// 观测者在哪里；结果缓存在内存，后续直接用。
+/// 盘面朝向依赖观测纬度与月球时角（经度/时刻），必须知道观测者在哪里。
+/// 设置持久化到 SharedPreferences；[observer] 是响应式当前生效位置，
+/// 界面监听它即时刷新月相盘面。
 class MoonLocation {
   MoonLocation._();
 
-  static ObserverLocation? _cached;
+  static const String _modeKey = 'moon_location_mode';
+  static const String _latKey = 'moon_location_latitude';
+  static const String _lonKey = 'moon_location_longitude';
 
-  static const double _fallbackLatitude = 35.0; // 北半球中纬默认值（如华北）
+  /// 默认观测位置：北京（天安门）。
+  static const ObserverLocation beijing =
+      ObserverLocation(39.9042, 116.4074);
 
-  /// 同步回退位置：经度由设备时区偏移推导（每时区 15°），纬度用默认值。
-  static ObserverLocation fallback() {
-    final offsetMinutes = DateTime.now().timeZoneOffset.inMinutes;
-    return ObserverLocation(_fallbackLatitude, offsetMinutes / 60.0 * 15.0);
+  /// 当前生效的观测位置（GPS 成功后自动更新；界面监听此值重绘月相）。
+  static final ValueNotifier<ObserverLocation> observer =
+      ValueNotifier<ObserverLocation>(beijing);
+
+  /// 当前模式（持久化，默认北京）。
+  static MoonLocationMode mode = MoonLocationMode.beijing;
+
+  /// 手动模式下的经纬度（持久化；初始为北京坐标）。
+  static double manualLatitude = beijing.latitude;
+  static double manualLongitude = beijing.longitude;
+
+  /// 初始化：读取持久化设置并解析当前观测位置。
+  static Future<void> init() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final modeName = prefs.getString(_modeKey);
+      mode = MoonLocationMode.values.firstWhere(
+        (m) => m.name == modeName,
+        orElse: () => MoonLocationMode.beijing,
+      );
+      manualLatitude = prefs.getDouble(_latKey) ?? beijing.latitude;
+      manualLongitude = prefs.getDouble(_lonKey) ?? beijing.longitude;
+    } catch (_) {
+      // 读取失败保持默认。
+    }
+    await resolve();
   }
 
-  /// 解析观测者位置（异步，首次调用可能请求定位权限）。
-  static Future<ObserverLocation> resolve() async {
-    final cached = _cached;
-    if (cached != null) return cached;
-
-    // 1) 设备定位：GPS/网络。
-    final gps = await _tryGps();
-    if (gps != null) {
-      _cached = gps;
-      return gps;
+  /// 按当前模式解析观测位置并刷新 [observer]。
+  static Future<void> resolve() async {
+    ObserverLocation loc = beijing;
+    switch (mode) {
+      case MoonLocationMode.auto:
+        final gps = await _tryGps();
+        loc = gps ?? beijing;
+      case MoonLocationMode.manual:
+        loc = ObserverLocation(manualLatitude, manualLongitude);
+      case MoonLocationMode.beijing:
+        loc = beijing;
     }
+    observer.value = loc;
+  }
 
-    // 2) 回退：时区推导经度 + 默认纬度。
-    _cached = fallback();
-    return _cached!;
+  /// 更新模式与手动经纬度，持久化后重新解析。
+  static Future<void> update(
+    MoonLocationMode nextMode, {
+    double? latitude,
+    double? longitude,
+  }) async {
+    mode = nextMode;
+    if (latitude != null) {
+      manualLatitude = latitude.clamp(-90.0, 90.0);
+    }
+    if (longitude != null) {
+      manualLongitude = longitude.clamp(-180.0, 180.0);
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_modeKey, mode.name);
+      await prefs.setDouble(_latKey, manualLatitude);
+      await prefs.setDouble(_lonKey, manualLongitude);
+    } catch (_) {
+      // 写入失败不影响本次生效。
+    }
+    await resolve();
   }
 
   /// 尝试设备定位；失败（权限拒绝/定位关闭/无信号）返回 null。
@@ -61,11 +124,5 @@ class MoonLocation {
     } catch (_) {
       return null;
     }
-  }
-
-  /// 强制重新解析（如用户设置变更后）。
-  static Future<ObserverLocation> reResolve() async {
-    _cached = null;
-    return resolve();
   }
 }

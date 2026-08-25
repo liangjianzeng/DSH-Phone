@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'config.dart';
+import 'moon_location.dart';
 import 'tunnel_service.dart';
 
 /// 首次启动 / 设置页：配置 SSH 地址、用户名、认证方式（密钥或密码）、本地端口，
@@ -27,6 +28,10 @@ class SetupScreen extends StatefulWidget {
     this.onZoomControlsChanged,
     this.photoControlsEnabled = true,
     this.onPhotoControlsChanged,
+    this.moonLocationMode = MoonLocationMode.beijing,
+    this.moonManualLatitude = 39.9042,
+    this.moonManualLongitude = 116.4074,
+    this.onMoonLocationChanged,
     this.hostMonitorEnabled = true,
     this.onHostMonitorChanged,
     this.resourceViewEnabled = true,
@@ -74,6 +79,19 @@ class SetupScreen extends StatefulWidget {
 
   /// 切换对话区相机入口显示（默认开启）。
   final ValueChanged<bool>? onPhotoControlsChanged;
+
+  /// 月相观测位置模式（默认北京 / 手动经纬度 / 定位获取）。
+  final MoonLocationMode moonLocationMode;
+
+  /// 手动模式下的纬度（度）。
+  final double moonManualLatitude;
+
+  /// 手动模式下的经度（度）。
+  final double moonManualLongitude;
+
+  /// 月相观测位置变更回调（模式 + 手动经纬度；非手动模式经纬度传 null）。
+  final void Function(MoonLocationMode mode, {double? latitude, double? longitude})?
+      onMoonLocationChanged;
 
   /// 主机监控开关（默认开启；关闭则不请求不呈现曲线）。
   final bool hostMonitorEnabled;
@@ -128,6 +146,13 @@ class _SetupScreenState extends State<SetupScreen> {
   /// 对话区相机入口开关的本地状态（同上）。
   late bool _photoControlsEnabled;
 
+  /// 月相观测位置模式的本地状态（独立路由，本地持有即时反映选择）。
+  late MoonLocationMode _moonMode;
+
+  /// 手动经纬度输入框（仅手动模式显示）。
+  late TextEditingController _moonLatCtrl;
+  late TextEditingController _moonLonCtrl;
+
   /// 工具类功能开关本地状态（同样本地持有以即时反映拨动）。
   late bool _hostMonitorEnabled;
   late bool _resourceViewEnabled;
@@ -140,6 +165,11 @@ class _SetupScreenState extends State<SetupScreen> {
     _timeoutSeconds = widget.timeoutSeconds;
     _zoomControlsEnabled = widget.zoomControlsEnabled;
     _photoControlsEnabled = widget.photoControlsEnabled;
+    _moonMode = widget.moonLocationMode;
+    _moonLatCtrl =
+        TextEditingController(text: '${widget.moonManualLatitude}');
+    _moonLonCtrl =
+        TextEditingController(text: '${widget.moonManualLongitude}');
     _hostMonitorEnabled = widget.hostMonitorEnabled;
     _resourceViewEnabled = widget.resourceViewEnabled;
     _resourceDownloadEnabled = widget.resourceDownloadEnabled;
@@ -168,6 +198,8 @@ class _SetupScreenState extends State<SetupScreen> {
     _autoSaveTimer?.cancel();
     _autoSaveTimer = null;
     _persistCurrent();
+    _moonLatCtrl.dispose();
+    _moonLonCtrl.dispose();
     _host.dispose();
     _alias.dispose();
     _sshPort.dispose();
@@ -213,6 +245,23 @@ class _SetupScreenState extends State<SetupScreen> {
         !(await SSHConfig.loadActive()).isConfigured) {
       await SSHConfig.setActiveIndex(_profileIndex);
     }
+  }
+
+  /// 手动模式：解析两个经纬度输入框，数值合法（纬度 ±90 / 经度 ±180）
+  /// 且处于手动模式时才持久化；否则仅更新本地，避免保存残缺值。
+  void _persistManual() {
+    final lat = double.tryParse(_moonLatCtrl.text.trim());
+    final lon = double.tryParse(_moonLonCtrl.text.trim());
+    if (_moonMode != MoonLocationMode.manual ||
+        lat == null || lon == null ||
+        lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+      return;
+    }
+    widget.onMoonLocationChanged?.call(
+      MoonLocationMode.manual,
+      latitude: lat,
+      longitude: lon,
+    );
   }
 
   /// 校验实例别名：可空；非空时加权长度不超过 15。
@@ -709,6 +758,87 @@ class _SetupScreenState extends State<SetupScreen> {
             onChanged: (v) {
               setState(() => _photoControlsEnabled = v);
               widget.onPhotoControlsChanged?.call(v);
+            },
+          ),
+          const Divider(height: 24),
+          const Text(
+            '月相观测位置',
+            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+          ),
+          const Padding(
+            padding: EdgeInsets.only(top: 4),
+            child: Text(
+              '月相按钮按你的观测位置计算盘面朝向——纬度与经度（时区）决定'
+              '月出月落的亮面旋转与形态。',
+              style: TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+          ),
+          RadioListTile<MoonLocationMode>(
+            value: MoonLocationMode.beijing,
+            groupValue: _moonMode,
+            title: const Text('默认北京'),
+            subtitle: const Text('北京（39.9°N, 116.4°E），无需任何权限'),
+            onChanged: (v) {
+              if (v == null) return;
+              setState(() => _moonMode = v);
+              widget.onMoonLocationChanged?.call(v);
+            },
+          ),
+          RadioListTile<MoonLocationMode>(
+            value: MoonLocationMode.manual,
+            groupValue: _moonMode,
+            title: const Text('手动输入经纬度'),
+            subtitle: const Text('精确指定你的观测位置'),
+            onChanged: (v) {
+              if (v == null) return;
+              setState(() => _moonMode = v);
+              _persistManual();
+            },
+          ),
+          if (_moonMode == MoonLocationMode.manual)
+            Padding(
+              padding: const EdgeInsets.only(left: 16, right: 16, bottom: 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _moonLatCtrl,
+                      keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true, signed: true),
+                      decoration: const InputDecoration(
+                        labelText: '纬度（-90~90）',
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                      ),
+                      onChanged: (_) => _persistManual(),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: TextField(
+                      controller: _moonLonCtrl,
+                      keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true, signed: true),
+                      decoration: const InputDecoration(
+                        labelText: '经度（-180~180）',
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                      ),
+                      onChanged: (_) => _persistManual(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          RadioListTile<MoonLocationMode>(
+            value: MoonLocationMode.auto,
+            groupValue: _moonMode,
+            title: const Text('定位获取（GPS）'),
+            subtitle: const Text('读取设备当前位置；失败或拒绝时自动回退默认北京'),
+            onChanged: (v) {
+              if (v == null) return;
+              setState(() => _moonMode = v);
+              widget.onMoonLocationChanged?.call(v);
             },
           ),
           const SizedBox(height: 8),

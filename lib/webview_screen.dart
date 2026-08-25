@@ -452,20 +452,15 @@ class _WebViewScreenState extends State<WebViewScreen>
     _loadToolSwitches();
     // 监控采样定时器常驻，内部仅在隧道 connected 时旁路采集。
     HostMonitor.instance.start();
-    // 月相按钮：异步解析观测者位置（GPS → 时区回退），到位后刷新盘面朝向。
-    _resolveMoonLocation();
+    // 月相按钮：读取观测位置设置（默认北京/手动/GPS）并监听生效位置变化。
+    MoonLocation.observer.addListener(_onMoonLocationChanged);
+    MoonLocation.init();
   }
 
-  /// 观测者位置（月相盘面朝向用）；解析完成前用同步回退值。
-  ObserverLocation? _observer;
-
-  Future<void> _resolveMoonLocation() async {
-    try {
-      final loc = await MoonLocation.resolve();
-      if (!mounted) return;
-      setState(() => _observer = loc);
-    } catch (_) {
-      // 解析失败保持回退位置即可。
+  /// 观测位置变化（GPS 到位/设置变更）→ 重绘月相盘面。
+  void _onMoonLocationChanged() {
+    if (mounted) {
+      setState(() {});
     }
   }
 
@@ -544,6 +539,13 @@ class _WebViewScreenState extends State<WebViewScreen>
     SharedPreferences.getInstance().then(
       (prefs) => prefs.setBool(_photoControlsPrefKey, enabled),
     );
+  }
+
+  /// 月相观测位置设置变更：持久化并重新解析（observer 变化自动触发重绘）。
+  void _setMoonLocation(MoonLocationMode mode,
+      {double? latitude, double? longitude}) {
+    MoonLocation.update(mode,
+        latitude: latitude, longitude: longitude);
   }
 
   /// 读取工具类功能开关（监控 / 资源查看 / 资源下载），并同步监控采样器。
@@ -754,6 +756,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     _loadTimeoutTimer?.cancel();
     _tunnelSub?.cancel();
     _zoomScaleNotifier.dispose();
+    MoonLocation.observer.removeListener(_onMoonLocationChanged);
     HostMonitor.instance.stop();
     _disconnect();
     super.dispose();
@@ -787,6 +790,10 @@ class _WebViewScreenState extends State<WebViewScreen>
           onZoomControlsChanged: _setZoomControlsEnabled,
           photoControlsEnabled: _photoControlsEnabled,
           onPhotoControlsChanged: _setPhotoControlsEnabled,
+          moonLocationMode: MoonLocation.mode,
+          moonManualLatitude: MoonLocation.manualLatitude,
+          moonManualLongitude: MoonLocation.manualLongitude,
+          onMoonLocationChanged: _setMoonLocation,
           hostMonitorEnabled: _hostMonitorEnabled,
           onHostMonitorChanged: _setHostMonitorEnabled,
           resourceViewEnabled: _resourceViewEnabled,
@@ -1489,12 +1496,9 @@ class _WebViewScreenState extends State<WebViewScreen>
   Widget _buildPhotoControls(BuildContext context) {
     final screenHeight = MediaQuery.of(context).size.height;
     final now = DateTime.now();
-    // 真实月球观测：绝对时间（UTC）+ 观测者位置。位置解析完成前用同步回退值
-    // （时区推导经度 + 默认纬度），GPS 到位后 setState 刷新朝向。
-    final obs = MoonAstronomy.compute(
-      now.toUtc(),
-      _observer ?? MoonLocation.fallback(),
-    );
+    // 真实月球观测：绝对时间（UTC）+ 当前生效的观测位置（默认北京/手动/GPS，
+    // 设置页可改；observer 变化会触发本方法重建）。
+    final obs = MoonAstronomy.compute(now.toUtc(), MoonLocation.observer.value);
     final lit = obs.illumination;
     final borderColor = const Color(0xFF64B5F6);
     return Positioned(
