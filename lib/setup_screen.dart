@@ -853,7 +853,9 @@ class _SetupScreenState extends State<SetupScreen> {
               ),
               trailing: _moonMode == MoonLocationMode.auto
                   ? TextButton(
-                      onPressed: () => MoonLocation.resolve(),
+                      onPressed: () => MoonLocation.resolve(
+                        requestPermission: true,
+                      ),
                       child: const Text('重新获取'),
                     )
                   : null,
