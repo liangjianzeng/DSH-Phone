@@ -36,12 +36,19 @@ class MoonLocation {
   static final ValueNotifier<ObserverLocation> observer =
       ValueNotifier<ObserverLocation>(beijing);
 
+  /// 当前模式的实时状态文本（定位结果 / 失败回退 / 手动坐标 / 默认北京）。
+  /// 界面监听此值呈现定位信息。
+  static final ValueNotifier<String> statusText = ValueNotifier<String>('');
+
   /// 当前模式（持久化，默认北京）。
   static MoonLocationMode mode = MoonLocationMode.beijing;
 
   /// 手动模式下的经纬度（持久化；初始为北京坐标）。
   static double manualLatitude = beijing.latitude;
   static double manualLongitude = beijing.longitude;
+
+  static bool _gpsOk = false; // 最近一次 GPS 尝试是否成功
+  static bool _resolving = false; // 是否正在获取定位
 
   /// 初始化：读取持久化设置并解析当前观测位置。
   static Future<void> init() async {
@@ -60,19 +67,59 @@ class MoonLocation {
     await resolve();
   }
 
-  /// 按当前模式解析观测位置并刷新 [observer]。
+  /// 按当前模式解析观测位置并刷新 [observer] 与 [statusText]。
   static Future<void> resolve() async {
+    _resolving = true;
+    statusText.value = _statusLine();
     ObserverLocation loc = beijing;
     switch (mode) {
       case MoonLocationMode.auto:
         final gps = await _tryGps();
+        _gpsOk = gps != null;
         loc = gps ?? beijing;
       case MoonLocationMode.manual:
         loc = ObserverLocation(manualLatitude, manualLongitude);
       case MoonLocationMode.beijing:
         loc = beijing;
     }
+    _resolving = false;
     observer.value = loc;
+    statusText.value = _statusLine();
+  }
+
+  /// 当前模式的可读状态行：定位结果 / 失败回退 / 手动坐标 / 默认北京。
+  static String _statusLine() {
+    final loc = observer.value;
+    switch (mode) {
+      case MoonLocationMode.auto:
+        if (_resolving) return '正在获取定位…';
+        if (_gpsOk) {
+          return '已定位：${_coord(loc.latitude, '北纬', '南纬')}，'
+              '${_coord(loc.longitude, '东经', '西经')}';
+        }
+        return '无法获取定位结果，已回退默认北京'
+            '（${_coord(beijing.latitude, '北纬', '南纬')}，'
+            '${_coord(beijing.longitude, '东经', '西经')}）';
+      case MoonLocationMode.manual:
+        return '手动位置：${_coord(loc.latitude, '北纬', '南纬')}，'
+            '${_coord(loc.longitude, '东经', '西经')}';
+      case MoonLocationMode.beijing:
+        return '默认北京：${_coord(loc.latitude, '北纬', '南纬')}，'
+            '${_coord(loc.longitude, '东经', '西经')}';
+    }
+  }
+
+  /// 坐标格式化：北/南纬、东/西经，保留两位。
+  static String _coord(double v, String positive, String negative) {
+    final deg = v.abs().toStringAsFixed(2);
+    return v >= 0 ? '$positive$deg°' : '$negative$deg°';
+  }
+
+  /// 当前生效位置的紧凑文本（如：北纬31.23°，东经121.47°），用于月相按钮提示。
+  static String get observerLabel {
+    final loc = observer.value;
+    return '${_coord(loc.latitude, '北纬', '南纬')}，'
+        '${_coord(loc.longitude, '东经', '西经')}';
   }
 
   /// 更新模式与手动经纬度，持久化后重新解析。

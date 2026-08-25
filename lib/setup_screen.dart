@@ -841,6 +841,24 @@ class _SetupScreenState extends State<SetupScreen> {
               widget.onMoonLocationChanged?.call(v);
             },
           ),
+          // 实时呈现定位信息：GPS 成功显示坐标，失败显示回退提示；可重新获取。
+          ValueListenableBuilder<String>(
+            valueListenable: MoonLocation.statusText,
+            builder: (context, text, _) => ListTile(
+              dense: true,
+              leading: const Icon(Icons.my_location, size: 20),
+              title: Text(
+                text.isEmpty ? '正在获取定位…' : text,
+                style: const TextStyle(fontSize: 13),
+              ),
+              trailing: _moonMode == MoonLocationMode.auto
+                  ? TextButton(
+                      onPressed: () => MoonLocation.resolve(),
+                      child: const Text('重新获取'),
+                    )
+                  : null,
+            ),
+          ),
           const SizedBox(height: 8),
           OutlinedButton.icon(
             onPressed: widget.onRefreshCache,

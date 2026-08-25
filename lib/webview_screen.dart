@@ -1532,7 +1532,8 @@ class _WebViewScreenState extends State<WebViewScreen>
               child: IconButton(
                 tooltip: '添加图片/拍照（视觉工具）·${obs.name}'
                     '·照明 ${(lit * 100).round()}%'
-                    '·农历${_lunarDay(now)}',
+                    '·农历${_lunarDay(now)}'
+                    '·观测${MoonLocation.observerLabel}',
                 icon: Icon(
                   Icons.camera_alt_outlined,
                   color: lit >= 0.5
