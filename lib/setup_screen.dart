@@ -127,10 +127,18 @@ class _SetupScreenState extends State<SetupScreen> {
   late TextEditingController _keyPassphrase;
   late TextEditingController _localPort;
 
+  /// Unsloth Studio 配置控件（实例级）。
+  late TextEditingController _unslothPort;
+  late TextEditingController _unslothPassword;
+
   late String _authType;
 
   /// 当前编辑实例的"默认主机资源监控"开关（实例级，随实例切换回填）。
   late bool _instanceHostMonitorEnabled;
+
+  /// Unsloth Studio 启用开关与连接方式（随实例切换回填）。
+  late bool _unslothEnabled;
+  late bool _unslothUseSsh;
 
   bool _saving = false;
   String? _testResult;
@@ -187,8 +195,12 @@ class _SetupScreenState extends State<SetupScreen> {
     _privateKey = TextEditingController(text: c.privateKeyPem);
     _keyPassphrase = TextEditingController(text: c.keyPassphrase);
     _localPort = TextEditingController(text: '${c.localPort}');
+    _unslothPort = TextEditingController(text: '${c.unslothPort}');
+    _unslothPassword = TextEditingController(text: c.unslothPassword);
     _authType = c.authType;
     _instanceHostMonitorEnabled = c.hostMonitorEnabled;
+    _unslothEnabled = c.unslothEnabled;
+    _unslothUseSsh = c.unslothUseSsh;
   }
 
   @override
@@ -208,6 +220,8 @@ class _SetupScreenState extends State<SetupScreen> {
     _privateKey.dispose();
     _keyPassphrase.dispose();
     _localPort.dispose();
+    _unslothPort.dispose();
+    _unslothPassword.dispose();
     super.dispose();
   }
 
@@ -312,10 +326,47 @@ class _SetupScreenState extends State<SetupScreen> {
               keyPassphrase: other.keyPassphrase,
               alias: other.alias,
               hostMonitorEnabled: false,
+              unslothEnabled: other.unslothEnabled,
+              unslothPort: other.unslothPort,
+              unslothUseSsh: other.unslothUseSsh,
+              unslothPassword: other.unslothPassword,
             ));
       }
     }
     widget.onInstanceMonitorChanged?.call(on);
+  }
+
+  /// 即时保存 Unsloth Studio 开关：只写开关字段，不触碰表单其它未保存内容；
+  /// 开启时互斥关闭其他实例（与"默认主机资源监控"一致），
+  /// 顶栏图标全局打开该实例的 Unsloth Studio。
+  Future<void> _applyUnslothImmediately(bool on) async {
+    await SSHConfig.saveInstanceUnsloth(_profileIndex, on);
+    if (on) {
+      // 全局仅允许一个实例开启：关闭其他实例的开关（从内存配置读取完整信息）
+      for (var i = 0; i < SSHConfig.maxProfiles; i++) {
+        if (i == _profileIndex) continue;
+        final other = widget.profiles[i];
+        if (!other.unslothEnabled) continue;
+        await SSHConfig.saveProfile(
+            i,
+            SSHConfig(
+              host: other.host,
+              sshPort: other.sshPort,
+              username: other.username,
+              localPort: other.localPort,
+              authType: other.authType,
+              password: other.password,
+              privateKeyPem: other.privateKeyPem,
+              keyPassphrase: other.keyPassphrase,
+              alias: other.alias,
+              hostMonitorEnabled: other.hostMonitorEnabled,
+              unslothEnabled: false,
+              unslothPort: other.unslothPort,
+              unslothUseSsh: other.unslothUseSsh,
+              unslothPassword: other.unslothPassword,
+            ));
+      }
+    }
   }
 
   SSHConfig _buildConfig() {
@@ -331,6 +382,11 @@ class _SetupScreenState extends State<SetupScreen> {
           _authType == SSHConfig.authTypeKey ? _privateKey.text.trim() : '',
       keyPassphrase: _keyPassphrase.text,
       hostMonitorEnabled: _instanceHostMonitorEnabled,
+      unslothEnabled: _unslothEnabled,
+      unslothPort: int.tryParse(_unslothPort.text.trim()) ??
+          SSHConfig.defaultUnslothPort,
+      unslothUseSsh: _unslothUseSsh,
+      unslothPassword: _unslothPassword.text,
     );
   }
 
@@ -584,6 +640,84 @@ class _SetupScreenState extends State<SetupScreen> {
                   ));
               }
             },
+          ),
+          const SizedBox(height: 24),
+          const Text('Unsloth Studio', style: TextStyle(fontSize: 18)),
+          const SizedBox(height: 8),
+          SwitchListTile(
+            title: const Text('启用 Unsloth Studio'),
+            subtitle: const Text(
+              '默认关闭；开启后顶栏图标始终加载本实例的 Unsloth Studio'
+              '（默认 http://<主机>:8888），全局仅允许一个实例开启',
+            ),
+            value: _unslothEnabled,
+            onChanged: (v) {
+              setState(() => _unslothEnabled = v);
+              // 即时保存：切换即生效，无需等待防抖保存
+              _applyUnslothImmediately(v);
+              if (v) {
+                ScaffoldMessenger.of(context)
+                  ..clearSnackBars()
+                  ..showSnackBar(SnackBar(
+                    content: Text('已开启实例 ${_profileIndex + 1} 的 '
+                        'Unsloth Studio，其他实例已自动关闭该开关'),
+                  ));
+              }
+            },
+          ),
+          TextFormField(
+            controller: _unslothPort,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: 'Unsloth 连接端口',
+              helperText: '默认 8888，远程 Unsloth Studio 服务端口',
+              border: OutlineInputBorder(),
+            ),
+            validator: _validatePort,
+            onChanged: (_) => _scheduleAutoSave(),
+          ),
+          const SizedBox(height: 12),
+          const Text('连接方式', style: TextStyle(fontSize: 16)),
+          Row(
+            children: [
+              Expanded(
+                child: RadioListTile<String>(
+                  title: const Text('HTTP 直连'),
+                  subtitle: const Text('默认'),
+                  value: 'direct',
+                  groupValue: _unslothUseSsh ? 'ssh' : 'direct',
+                  onChanged: (v) {
+                    if (v == null) return;
+                    setState(() => _unslothUseSsh = false);
+                    _scheduleAutoSave();
+                  },
+                ),
+              ),
+              Expanded(
+                child: RadioListTile<String>(
+                  title: const Text('SSH 隧道'),
+                  subtitle: const Text('复用实例隧道'),
+                  value: 'ssh',
+                  groupValue: _unslothUseSsh ? 'ssh' : 'direct',
+                  onChanged: (v) {
+                    if (v == null) return;
+                    setState(() => _unslothUseSsh = true);
+                    _scheduleAutoSave();
+                  },
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          TextFormField(
+            controller: _unslothPassword,
+            obscureText: true,
+            decoration: const InputDecoration(
+              labelText: '登录密码（自动登录）',
+              helperText: '留空则不做自动登录，需手动输入密码',
+              border: OutlineInputBorder(),
+            ),
+            onChanged: (_) => _scheduleAutoSave(),
           ),
           const SizedBox(height: 24),
           if (_testResult != null)

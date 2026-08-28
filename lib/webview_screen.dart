@@ -19,6 +19,7 @@ import 'moon_painter.dart';
 import 'setup_screen.dart';
 import 'task_notifier.dart';
 import 'tunnel_service.dart';
+import 'unsloth_screen.dart';
 
 /// 主界面：SSH 隧道就绪后，用 WebView 加载 DSH Web UI，并带缓存加速与设置入口。
 ///
@@ -771,6 +772,38 @@ class _WebViewScreenState extends State<WebViewScreen>
     }
   }
 
+  /// 打开 Unsloth Studio 页面（全局唯一启用的实例，与当前连接实例无关）。
+  ///
+  /// 与"默认主机资源监控"一致：仅允许一个实例开启 unsloth，
+  /// 顶栏图标始终打开该实例的 Unsloth Studio（HTTP 直连 / SSH 隧道）。
+  void _openUnsloth() {
+    final index = _profiles.indexWhere((p) => p.unslothEnabled);
+    if (index < 0) {
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..showSnackBar(const SnackBar(
+          content: Text('未启用 Unsloth Studio，请到设置 → 主机中开启'),
+        ));
+      return;
+    }
+    final config = _profiles[index];
+    if (config.host.isEmpty) {
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..showSnackBar(const SnackBar(content: Text('该实例未配置主机地址')));
+      return;
+    }
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => UnslothScreen(
+          config: config,
+          profileIndex: index,
+          timeoutSeconds: _timeoutSeconds,
+        ),
+      ),
+    );
+  }
+
   Future<void> _openSettings({int? profileIndex}) async {
     final connected = _tunnelStatus == TunnelStatus.connected;
     final target = profileIndex ?? _activeIndex;
@@ -1206,6 +1239,11 @@ class _WebViewScreenState extends State<WebViewScreen>
             ),
             const Spacer(),
             _buildInstanceSwitcher(context),
+            IconButton(
+              tooltip: 'Unsloth Studio',
+              icon: const Icon(Icons.science_outlined),
+              onPressed: _openUnsloth,
+            ),
             IconButton(
               tooltip: '设置',
               icon: const Icon(Icons.settings),

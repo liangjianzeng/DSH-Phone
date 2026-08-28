@@ -495,6 +495,142 @@ class TunnelService {
     return double.tryParse(m.group(0) ?? '') ?? 0;
   }
 
+  // ================= Unsloth Studio：SSH 模式独立转发 =================
+
+  /// Unsloth Studio 专用 SSH 客户端（与活动隧道/监控隧道相互独立），
+  /// 保证顶栏图标可打开任意实例的 Unsloth Studio，即使它不是当前连接实例。
+  SSHClient? _unslothClient;
+  bool _unslothConnecting = false;
+
+  /// Unsloth Studio 本地监听（SSH 模式时存在），转发到远程 127.0.0.1 上的 unsloth 端口。
+  ServerSocket? _unslothServer;
+
+  /// Unsloth Studio 远程端口（取实例配置，默认 8888）。
+  int _unslothRemotePort = SSHConfig.defaultUnslothPort;
+
+  /// Unsloth Studio 本地端口（SSH 模式时 OS 动态分配；直连模式为 null）。
+  int? get unslothLocalPort => _unslothServer?.port;
+
+  /// 建立 Unsloth Studio 转发：建立到配置实例的独立 SSH 会话，
+  /// 本地监听端口由 OS 动态分配（bind 0），转发到远程 127.0.0.1:[unslothPort]。
+  ///
+  /// 配置未就绪 / 认证失败 / 绑定失败时返回 null，调用方提示错误。
+  /// [unslothPort] 可空：为空时使用配置端口（默认 8888）。
+  Future<int?> startUnslothForward(SSHConfig config,
+      {int? unslothPort}) async {
+    await stopUnslothForward();
+    if (!config.isConfigured) return null;
+    _unslothRemotePort = unslothPort ?? config.unslothPort;
+    // 建立独立的 unsloth SSH 会话（不依赖当前活动隧道）
+    if (!await _connectUnslothClient(config)) return null;
+    try {
+      final server = await ServerSocket.bind(
+          InternetAddress.loopbackIPv4, 0);
+      _unslothServer = server;
+      server.listen(_handleUnslothForward);
+      debugPrint('[DSH] unsloth forward up: '
+          '127.0.0.1:${server.port} -> 127.0.0.1:$_unslothRemotePort');
+      return server.port;
+    } catch (e) {
+      debugPrint('[DSH] unsloth forward failed: $e');
+      _unslothServer = null;
+      await _closeUnslothClient();
+      return null;
+    }
+  }
+
+  /// 建立 Unsloth Studio 独立 SSH 会话（认证流程与监控隧道一致）。
+  Future<bool> _connectUnslothClient(SSHConfig config) async {
+    if (_unslothConnecting) return _unslothClient != null;
+    _unslothConnecting = true;
+    try {
+      final socket = await SSHSocket.connect(config.host, config.sshPort,
+          timeout: const Duration(seconds: 15));
+      final List<SSHKeyPair>? identities = config.useKey
+          ? SSHKeyPair.fromPem(config.privateKeyPem,
+              config.keyPassphrase.isEmpty ? null : config.keyPassphrase)
+          : null;
+      final client = SSHClient(
+        socket,
+        username: config.username,
+        identities: identities,
+        onPasswordRequest: config.useKey ? null : () async => config.password,
+        keepAliveInterval: const Duration(seconds: 10),
+        onVerifyHostKey: (hostkeyType, fingerprint) => true,
+      );
+      _unslothClient = client;
+      client.done.then(
+        (_) => _onUnslothClientClosed(client),
+        onError: (Object e) {
+          debugPrint('[DSH] unsloth transport error: $e');
+          _onUnslothClientClosed(client, failed: true);
+        },
+      );
+      await client.authenticated
+          .timeout(const Duration(seconds: 20), onTimeout: () {
+        debugPrint('[DSH] unsloth auth timed out');
+        throw const SocketException('Unsloth 连接认证超时');
+      });
+      debugPrint('[DSH] unsloth ssh ready '
+          '(${config.host}:${config.sshPort})');
+      return true;
+    } catch (e) {
+      debugPrint('[DSH] unsloth connect failed: $e');
+      final c = _unslothClient;
+      _unslothClient = null;
+      c?.close();
+      return false;
+    } finally {
+      _unslothConnecting = false;
+    }
+  }
+
+  /// Unsloth 专用 SSH 会话关闭：连带关闭本地转发监听。
+  void _onUnslothClientClosed(SSHClient client, {bool failed = false}) {
+    if (_unslothClient != client) return;
+    _unslothClient = null;
+    debugPrint('[DSH] unsloth transport closed'
+        '${failed ? ' (with error)' : ''}');
+    final server = _unslothServer;
+    _unslothServer = null;
+    server?.close();
+  }
+
+  /// 处理一条 Unsloth Studio 本地连接：经独立 SSH 会话转发到远程端口。
+  Future<void> _handleUnslothForward(Socket local) async {
+    final client = _unslothClient;
+    if (client == null) {
+      local.destroy();
+      return;
+    }
+    try {
+      // 远程 Unsloth Studio 监听 127.0.0.1:<unslothRemotePort>
+      final forward =
+          await client.forwardLocal('127.0.0.1', _unslothRemotePort);
+      _pipe(local, forward);
+    } catch (_) {
+      local.destroy();
+    }
+  }
+
+  /// 关闭 Unsloth Studio 转发（页面关闭时调用），连带关闭独立 SSH 会话。
+  Future<void> stopUnslothForward() async {
+    final server = _unslothServer;
+    _unslothServer = null;
+    if (server != null) {
+      try {
+        await server.close();
+      } catch (_) {}
+    }
+    await _closeUnslothClient();
+  }
+
+  Future<void> _closeUnslothClient() async {
+    final c = _unslothClient;
+    _unslothClient = null;
+    if (c != null) c.close();
+  }
+
   /// 主动断开隧道并清理。
   Future<void> disconnect() async {
     await _disconnectInternal();
@@ -630,6 +766,8 @@ class TunnelService {
     _statusController.close();
     // 应用退出：停止前台服务并释放唤醒锁
     ForegroundTunnelService.instance.stop();
+    // 关闭 Unsloth Studio 转发
+    stopUnslothForward();
     // 关闭独立的监控采集隧道
     final mc = _monitorClient;
     _monitorClient = null;

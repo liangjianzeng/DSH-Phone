@@ -23,6 +23,9 @@ class SSHConfig {
   /// 页面加载超时（秒）最小值。
   static const int minTimeoutSeconds = 30;
 
+  /// Unsloth Studio 连接端口默认值。
+  static const int defaultUnslothPort = 8888;
+
   // shared_preferences keys（旧单实例键名，用于迁移）
   static const String keyHost = 'host';
   static const String keySshPort = 'ssh_port';
@@ -43,10 +46,18 @@ class SSHConfig {
   // 实例级"默认主机资源监控"开关（最多一个实例开启）
   static const String keyInstanceHostMonitor = 'instance_host_monitor';
 
+  // Unsloth Studio 实例级配置（非敏感项）
+  static const String keyUnslothEnabled = 'unsloth_enabled';
+  static const String keyUnslothPort = 'unsloth_port';
+  static const String keyUnslothUseSsh = 'unsloth_use_ssh';
+
   // secure storage keys（旧单实例键名，用于迁移）
   static const String secPassword = 'password';
   static const String secPrivateKey = 'private_key';
   static const String secKeyPassphrase = 'key_passphrase';
+
+  // Unsloth Studio 登录密码（敏感项）
+  static const String secUnslothPassword = 'unsloth_password';
 
   static const String authTypeKey = 'key';
   static const String authTypePassword = 'password';
@@ -68,6 +79,19 @@ class SSHConfig {
   /// 所有实例默认关闭，且全局最多一个实例开启。
   final bool hostMonitorEnabled;
 
+  /// Unsloth Studio 启用开关（实例级，默认关闭；全局仅允许一个实例开启，
+  /// 顶栏图标始终打开该实例的 Unsloth Studio，与当前连接实例无关）。
+  final bool unslothEnabled;
+
+  /// Unsloth Studio 连接端口（默认 8888）。
+  final int unslothPort;
+
+  /// Unsloth Studio 是否走 SSH 隧道（默认否 → HTTP 直连）。
+  final bool unslothUseSsh;
+
+  /// Unsloth Studio 登录密码（敏感项，存 secure storage；用于登录页自动登录）。
+  final String unslothPassword;
+
   const SSHConfig({
     this.host = '',
     this.sshPort = 22,
@@ -79,6 +103,10 @@ class SSHConfig {
     this.keyPassphrase = '',
     this.alias = '',
     this.hostMonitorEnabled = false,
+    this.unslothEnabled = false,
+    this.unslothPort = defaultUnslothPort,
+    this.unslothUseSsh = false,
+    this.unslothPassword = '',
   });
 
   bool get isConfigured =>
@@ -124,6 +152,8 @@ class SSHConfig {
           await _safeSecRead(storage, _sKey(i, secPrivateKey));
       final keyPassphrase =
           await _safeSecRead(storage, _sKey(i, secKeyPassphrase));
+      final unslothPassword =
+          await _safeSecRead(storage, _sKey(i, secUnslothPassword));
       list.add(SSHConfig(
         host: prefs.getString(_pKey(i, keyHost)) ?? '',
         sshPort: prefs.getInt(_pKey(i, keySshPort)) ?? 22,
@@ -136,6 +166,12 @@ class SSHConfig {
         alias: prefs.getString(_pKey(i, keyAlias)) ?? '',
         hostMonitorEnabled:
             prefs.getBool(_pKey(i, keyInstanceHostMonitor)) ?? false,
+        unslothEnabled:
+            prefs.getBool(_pKey(i, keyUnslothEnabled)) ?? false,
+        unslothPort:
+            prefs.getInt(_pKey(i, keyUnslothPort)) ?? defaultUnslothPort,
+        unslothUseSsh: prefs.getBool(_pKey(i, keyUnslothUseSsh)) ?? false,
+        unslothPassword: unslothPassword,
       ));
     }
     return list;
@@ -175,6 +211,9 @@ class SSHConfig {
     await prefs.setString(_pKey(i, keyAlias), config.alias);
     await prefs.setBool(
         _pKey(i, keyInstanceHostMonitor), config.hostMonitorEnabled);
+    await prefs.setBool(_pKey(i, keyUnslothEnabled), config.unslothEnabled);
+    await prefs.setInt(_pKey(i, keyUnslothPort), config.unslothPort);
+    await prefs.setBool(_pKey(i, keyUnslothUseSsh), config.unslothUseSsh);
 
     const storage = FlutterSecureStorage();
     // 敏感项写入/删除双方向同步：用户清空某项时，旧值不能滞留在 keystore。
@@ -194,6 +233,12 @@ class SSHConfig {
           key: _sKey(i, secKeyPassphrase), value: config.keyPassphrase);
     } else {
       await storage.delete(key: _sKey(i, secKeyPassphrase));
+    }
+    if (config.unslothPassword.isNotEmpty) {
+      await storage.write(
+          key: _sKey(i, secUnslothPassword), value: config.unslothPassword);
+    } else {
+      await storage.delete(key: _sKey(i, secUnslothPassword));
     }
   }
 
@@ -319,6 +364,23 @@ class SSHConfig {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(
         _pKey(index.clamp(0, maxProfiles - 1), keyInstanceHostMonitor),
+        enabled);
+  }
+
+  // ============ 实例级 Unsloth Studio（全局唯一）============
+
+  /// 读取开启"Unsloth Studio"的实例索引（无则 -1；全局最多一个实例开启）。
+  static Future<int> loadUnslothProfileIndex() async {
+    final profiles = await loadAllProfiles();
+    return profiles.indexWhere((p) => p.unslothEnabled);
+  }
+
+  /// 仅保存指定实例的"Unsloth Studio"开关（不触碰表单其它字段，
+  /// 用于设置页即时保存）。
+  static Future<void> saveInstanceUnsloth(int index, bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(
+        _pKey(index.clamp(0, maxProfiles - 1), keyUnslothEnabled),
         enabled);
   }
 }
