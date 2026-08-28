@@ -5,8 +5,8 @@
 DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 用户名 / 认证方式（SSH 密钥或密码），应用自动建立 SSH 隧道（`127.0.0.1:<localPort>` → 远程 `127.0.0.1:3080`），并通过 WebView 加载 DSH Web UI。内置本地缓存加速、SSH 保活、界面缩放与全屏显示、主题自适应，以及手动修改连接配置 / 刷新缓存 / 查看关于的入口。
 
 - **开源地址**：https://github.com/liangjianzeng/DSH-Phone
-- **当前版本**：v0.1.6（build 12）
-- **安装包**：最新构建产物见 `build/app/outputs/flutter-apk/app-release.apk`（历史版本 [`apk/DSH-Phone-v0.1.6.apk`](apk/DSH-Phone-v0.1.6.apk)、[`apk/DSH-Phone-v0.1.3.apk`](apk/DSH-Phone-v0.1.3.apk)、[`apk/DSH-Phone-v0.1.2.apk`](apk/DSH-Phone-v0.1.2.apk)、[`apk/DSH-Phone-v0.1.1.apk`](apk/DSH-Phone-v0.1.1.apk)）
+- **当前版本**：v0.1.8（build 14）
+- **安装包**：最新构建产物见 `build/app/outputs/flutter-apk/app-release.apk`（历史版本 [`apk/DSH-Phone-v0.1.8.apk`](apk/DSH-Phone-v0.1.8.apk)、[`apk/DSH-Phone-v0.1.7.apk`](apk/DSH-Phone-v0.1.7.apk)、[`apk/DSH-Phone-v0.1.6.apk`](apk/DSH-Phone-v0.1.6.apk)、[`apk/DSH-Phone-v0.1.3.apk`](apk/DSH-Phone-v0.1.3.apk)、[`apk/DSH-Phone-v0.1.2.apk`](apk/DSH-Phone-v0.1.2.apk)、[`apk/DSH-Phone-v0.1.1.apk`](apk/DSH-Phone-v0.1.1.apk)）
 
 ## 工作原理
 
@@ -61,6 +61,7 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - 🧩 **隐藏产物路径解析**：DSH 产物 chips 被隐藏时，自动用可见产物的目录 + 文件名拼接并经 SSH 验证定位云端路径，确保点击仍能正确分流查看/下载。
 - 📊 **主机监控（10 分钟趋势）**：每 10s 采集远程主机 CPU / 内存 / GPU 使用率 / GPU 温度，顶栏背景显示最近 10 分钟趋势曲线（紫色=GPU 使用率 · 黄色=CPU · 蓝色=内存 · 中国红=GPU 温度）；采集命令对 ARM / 精简 / 容器环境健壮（/proc/stat + /proc/meminfo），Windows 走 PowerShell 性能计数器。
 - 🎯 **实例级"默认主机资源监控"**：每路实例可单独开启（默认关闭，全局仅允许一个实例开启）；开启后该实例成为全局监控目标，顶栏曲线始终显示它的主机数据（与当前连接实例无关），切换实例曲线不断。
+- 🧪 **Unsloth Studio 远程加载**：顶栏设置旁新增 ⚗️ 图标，一键加载远程 Unsloth Studio（复用 WebView 能力）；支持缓存加载与缓存刷新；配置按实例独立——连接端口（默认 8888）、连接方式（HTTP 直连 / SSH 隧道）；登录页**自动登录**（配置登录密码后自动填写并提交，用户名固定 `unsloth`）；默认关闭、全局仅允许一个实例开启（同"默认主机资源监控"模式），顶栏图标始终打开启用实例的 Unsloth Studio。
 - ⚡ **设置自动保存**：表单编辑停止即自动落盘（无右上角"保存"按钮），返回设置页自动重连应用最新配置；实例级监控开关切换即生效。
 - 🖥️ **全屏边缘到边缘**：顶栏延伸到系统状态栏区域，最大化显示面积。
 - 🌗 **主题自适应**：跟随系统深色 / 浅色模式，背景与状态栏图标自动切换。
@@ -93,7 +94,7 @@ flutter build apk --release
 
 1. 首次打开 → 配置 SSH 地址（如 `100.81.83.59`）、用户名（如 `jianzengliang`）、认证方式与本地端口（默认 `3081`）；最多可配置 3 路实例。
 2. 保存并连接，隧道建立后自动加载 `http://127.0.0.1:3081` 的 DSH Web UI。
-3. 顶栏：实例切换器 + 连接状态 + 设置入口。设置页含 SSH 配置、加载超时、界面缩放 / 刷新缓存、关于信息。
+3. 顶栏：实例切换器 + 连接状态 + Unsloth Studio 入口 + 设置入口。设置页含 SSH 配置、Unsloth Studio 配置、加载超时、界面缩放 / 刷新缓存、关于信息。
 
 > 说明：远程 DSH 默认只监听 `127.0.0.1:3080`，且配置类接口（如 `settings.describe`）被设计为仅 loopback 访问。DSH-Phone 通过 SSH 隧道把手机本机端口转发到远程，使 WebView 以 loopback 身份访问，从而获得完整功能。
 >
@@ -130,6 +131,7 @@ lib/
 ├── artifact_viewer_screen.dart # 成果原生查看器（md/html/代码渲染 + 另存为）
 ├── download_manager.dart     # 会话级下载管理（断点续传 / 暂停 / 取消）
 ├── download_screen.dart      # 资源下载页（进度 / 暂停继续 / 另存为）
+├── unsloth_screen.dart       # Unsloth Studio 页面（独立 WebView / 缓存刷新 / 自动登录）
 └── foreground_service.dart   # 前台服务保活封装（隧道连接期间后台保持进程/网络）
 third_party/dartssh2/                 # 本地 fork 的 dartssh2（吞吐优化 + SFTP 会话释放）
 third_party/flutter_foreground_task/  # 本地 fork 的 flutter_foreground_task（AGP 8.x namespace 兼容）
@@ -137,6 +139,8 @@ third_party/flutter_foreground_task/  # 本地 fork 的 flutter_foreground_task�
 
 ## 版本记录
 
+- **v0.1.8（build 14）**：**Unsloth Studio 远程加载**——顶栏设置旁新增 ⚗️ 图标，独立 WebView 页面加载远程 Unsloth Studio；缓存加载 + 缓存刷新（清缓存重载）；配置按实例独立：连接端口（默认 8888）、连接方式（HTTP 直连默认 / SSH 隧道）；登录页自动登录（配置登录密码后自动填写提交，用户名固定 `unsloth`，失败提示检查密码）；默认关闭、全局仅允许一个实例开启（同"默认主机资源监控"模式），顶栏图标始终打开启用实例的 Unsloth Studio；SSH 隧道模式使用独立会话，不依赖当前连接实例；修复自动登录后首页子资源错误误报"无法加载"（仅主框架错误视为致命）。
+- **v0.1.7（build 13）**：**真实月相天文模型 + 锁屏任务通知**——相机入口按钮呈现真实观测月相（太阳/月球实际位置计算照明度与盘面朝向，含农历日）；观测位置设置（默认北京 / 手动经纬度 / GPS 定位，失败自动回退）；AI 智能体任务进行中/完成时发系统通知（锁屏可见）。
 - **v0.1.6（build 12）**：**图片直传（视觉工具入口）**——对话区左侧淡蓝色圆形发光相机按钮（浅蓝圆底 + 蓝色描边 + 双层柔光，突出视觉模型能力）；拍照/相册选图后自动压缩直传 DSH 消息输入窗口附件槽（png/jpeg/webp/gif，非支持格式友好提示）；相机入口可在设置 → 界面设置中开关（默认开启）。
 - **v0.1.5（build 11）**：**主机监控完善**——实例级"默认主机资源监控"（每路实例可单独开启、全局仅一个，独立采集隧道，切换实例曲线不断）；**GPU 温度**（中国红曲线）；采集命令健壮化（Linux 用 /proc/stat + /proc/meminfo，ARM/精简/容器兼容；修复 dartssh2 经 bash 执行时 `sh -c` 包装导致的引号嵌套 EOF；Windows PowerShell 变量 `$` 转义）；监控曲线步长修复（10 分钟固定步长、最新点右对齐）；**设置自动保存**（去掉右上角"保存"按钮，表单编辑停止即落盘，返回自动重连生效）。
 - **v0.1.4（build 9/10）**：代码质量与隐患修复——设置保存后强制重连（配置立即生效）、下载取消"死任务"修复与断点续传并发守卫、下载任务内存释放、connect/disconnect 竞态守卫、secure storage 读取兜底与敏感项删除同步、重连 off-by-one、print→debugPrint、JS 桥 fetch 大小/超时限制与敏感数据清理、端口范围校验、资源下载链接型 APK 路径反查与失败自动重试、主机监控窗口 1 小时 → 10 分钟。

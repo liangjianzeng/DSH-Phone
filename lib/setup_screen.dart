@@ -1018,7 +1018,7 @@ class _SetupScreenState extends State<SetupScreen> {
               ListTile(
                 leading: const Icon(Icons.info_outline),
                 title: const Text('版本'),
-                subtitle: const Text('DSH-Phone v0.1.6'),
+                subtitle: const Text('DSH-Phone v0.1.8'),
                 trailing: const Icon(Icons.chevron_right),
                 onTap: _showAbout,
               ),
@@ -1073,7 +1073,7 @@ class _SetupScreenState extends State<SetupScreen> {
         title: const Text('关于 DSH-Phone'),
         content: const SingleChildScrollView(
           child: Text(
-            'DSH-Phone v0.1.6\n\n'
+            'DSH-Phone v0.1.8\n\n'
             '一个在 Android 上通过 SSH 隧道访问 DeepSeek Harness Web UI 的客户端。\n\n'
             '工作原理：\n'
             '• 应用内置 dartssh2 建立 SSH 隧道\n'
