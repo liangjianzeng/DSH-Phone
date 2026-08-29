@@ -123,8 +123,10 @@ class SSHConfig {
   // ============ 单实例键名（按索引）============
 
   static String _pfx(int i) => 'profile_$i';
+
+  /// 统一键名：shared_preferences 与 secure storage 共用同一键名空间
+  /// （前缀 profile_<i>_ 区分实例，键名后缀区分用途；两者互不冲突）。
   static String _pKey(int i, String k) => '${_pfx(i)}_$k';
-  static String _sKey(int i, String k) => '${_pfx(i)}_$k';
 
   // ============ 多实例读写 ============
 
@@ -147,13 +149,13 @@ class SSHConfig {
 
     final list = <SSHConfig>[];
     for (var i = 0; i < maxProfiles; i++) {
-      final password = await _safeSecRead(storage, _sKey(i, secPassword));
+      final password = await _safeSecRead(storage, _pKey(i, secPassword));
       final privateKeyPem =
-          await _safeSecRead(storage, _sKey(i, secPrivateKey));
+          await _safeSecRead(storage, _pKey(i, secPrivateKey));
       final keyPassphrase =
-          await _safeSecRead(storage, _sKey(i, secKeyPassphrase));
+          await _safeSecRead(storage, _pKey(i, secKeyPassphrase));
       final unslothPassword =
-          await _safeSecRead(storage, _sKey(i, secUnslothPassword));
+          await _safeSecRead(storage, _pKey(i, secUnslothPassword));
       list.add(SSHConfig(
         host: prefs.getString(_pKey(i, keyHost)) ?? '',
         sshPort: prefs.getInt(_pKey(i, keySshPort)) ?? 22,
@@ -218,27 +220,27 @@ class SSHConfig {
     const storage = FlutterSecureStorage();
     // 敏感项写入/删除双方向同步：用户清空某项时，旧值不能滞留在 keystore。
     if (config.password.isNotEmpty) {
-      await storage.write(key: _sKey(i, secPassword), value: config.password);
+      await storage.write(key: _pKey(i, secPassword), value: config.password);
     } else {
-      await storage.delete(key: _sKey(i, secPassword));
+      await storage.delete(key: _pKey(i, secPassword));
     }
     if (config.privateKeyPem.isNotEmpty) {
       await storage.write(
-          key: _sKey(i, secPrivateKey), value: config.privateKeyPem);
+          key: _pKey(i, secPrivateKey), value: config.privateKeyPem);
     } else {
-      await storage.delete(key: _sKey(i, secPrivateKey));
+      await storage.delete(key: _pKey(i, secPrivateKey));
     }
     if (config.keyPassphrase.isNotEmpty) {
       await storage.write(
-          key: _sKey(i, secKeyPassphrase), value: config.keyPassphrase);
+          key: _pKey(i, secKeyPassphrase), value: config.keyPassphrase);
     } else {
-      await storage.delete(key: _sKey(i, secKeyPassphrase));
+      await storage.delete(key: _pKey(i, secKeyPassphrase));
     }
     if (config.unslothPassword.isNotEmpty) {
       await storage.write(
-          key: _sKey(i, secUnslothPassword), value: config.unslothPassword);
+          key: _pKey(i, secUnslothPassword), value: config.unslothPassword);
     } else {
-      await storage.delete(key: _sKey(i, secUnslothPassword));
+      await storage.delete(key: _pKey(i, secUnslothPassword));
     }
   }
 
@@ -320,15 +322,15 @@ class SSHConfig {
         prefs.getString(keyAuthType) ?? authTypeKey);
     if (password.isNotEmpty) {
       await storage.write(
-          key: _sKey(0, secPassword), value: password);
+          key: _pKey(0, secPassword), value: password);
     }
     if (privateKeyPem.isNotEmpty) {
       await storage.write(
-          key: _sKey(0, secPrivateKey), value: privateKeyPem);
+          key: _pKey(0, secPrivateKey), value: privateKeyPem);
     }
     if (keyPassphrase.isNotEmpty) {
       await storage.write(
-          key: _sKey(0, secKeyPassphrase), value: keyPassphrase);
+          key: _pKey(0, secKeyPassphrase), value: keyPassphrase);
     }
 
     // 清理旧键
