@@ -32,6 +32,10 @@ class DownloadProgress {
 /// 数据先缓存在内存（BytesBuilder），支持**会话内断点续传**：
 /// 暂停时记下已下载量，恢复时以该 offset 重新打开 SFTP 继续读取，
 /// 追加到已有缓冲区。完成时一次性取整字节供"另存为"。
+///
+/// 注意：全内存缓存的代价是超大文件会耗尽内存，故 [DownloadManager]
+/// 对单任务下载量设上限（[DownloadManager.maxDownloadBytes]），
+/// 超限即中止并提示，避免移动端 OOM 崩溃。
 class DownloadTask {
   DownloadTask({required this.remotePath, required this.fileName});
 
@@ -93,6 +97,11 @@ class DownloadTask {
 class DownloadManager {
   DownloadManager._();
   static final DownloadManager instance = DownloadManager._();
+
+  /// 单任务最大下载量（256MB）：超过即中止并提示。
+  /// 下载数据全量驻留内存（BytesBuilder），移动端内存有限，
+  /// 无上限会让大体积 APK/压缩包直接 OOM。
+  static const int maxDownloadBytes = 256 * 1024 * 1024;
 
   /// 以远端路径为键，同一资源只保留一个任务。
   final Map<String, DownloadTask> _tasks = {};
@@ -175,6 +184,17 @@ class DownloadManager {
       final attrs = await file.stat();
       task.totalBytes = attrs.size ?? 0;
       task._file = file;
+      // 已知文件大小超限：直接中止，避免下载到一半才失败。
+      // （totalBytes 为 0 表示未知大小，仍需在分块时实时检查。）
+      if (task.totalBytes != null && task.totalBytes! > maxDownloadBytes) {
+        task._running = false;
+        await file.close();
+        task._file = null;
+        task.error = '文件过大（超过 ${maxDownloadBytes ~/ (1024 * 1024)}MB），'
+            '当前下载方式仅支持内存缓存，无法保存超大文件';
+        task._emitStatus(DownloadStatus.failed);
+        return;
+      }
       // onProgress 的 bytesRead 是相对本次读取起点（offset）的，
       // 界面总进度 = offset + bytesRead。
       final stream = file.read(
@@ -183,7 +203,21 @@ class DownloadManager {
             task._emitProgress(offset + bytesRead, task.totalBytes),
       );
       task._sub = stream.listen(
-        (chunk) => task._buffer.add(chunk),
+        (chunk) {
+          // 分块累计超限：中止下载并释放资源（内存保护）
+          if (task._buffer.length + chunk.length > maxDownloadBytes) {
+            task._running = false;
+            task._sub?.cancel();
+            task._sub = null;
+            task._file?.close();
+            task._file = null;
+            task.error = '文件过大（超过 ${maxDownloadBytes ~/ (1024 * 1024)}MB），'
+                '已中止下载';
+            task._emitStatus(DownloadStatus.failed);
+            return;
+          }
+          task._buffer.add(chunk);
+        },
         onDone: () async {
           task._running = false;
           await file.close();

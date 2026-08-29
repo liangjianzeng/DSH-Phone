@@ -612,21 +612,27 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   /// 隧道状态流回调：同步界面状态；断开/失败时带守卫自动重连。
   ///
-  /// 首次异常（[_reconnectCount] == 0）不提示：保持当前状态直接默认重试，
-  /// 避免隐藏后台 / 黑屏一段时间后频繁闪现异常界面；再次异常才显示提示。
+  /// 首次异常（[_reconnectCount] == 0）不显示错误文案（静默重连，
+  /// 避免隐藏后台 / 黑屏一段时间后频繁闪现异常界面），
+  /// 但仍把状态置为 disconnected——顶栏不再显示"已连接"误导用户，
+  /// 回到前台时看到的是诚实的"隧道已断开"，而非残留的绿色状态点。
   void _onTunnelStatus(TunnelStatus s) {
     if (!mounted) return;
-    if (!_switching &&
-        (s == TunnelStatus.disconnected || s == TunnelStatus.failed)) {
+    final isBreak =
+        s == TunnelStatus.disconnected || s == TunnelStatus.failed;
+    if (!_switching && isBreak) {
       if (_reconnectCount == 0) {
-        // 首次异常：不更新状态（界面不闪现提示），直接默认重试
+        if (_tunnelStatus == TunnelStatus.connected) {
+          // 仅更新状态（不设错误文案，_buildBody 的 disconnected 分支
+          // 显示"隧道已断开"，不会闪现红色错误界面）
+          setState(() => _tunnelStatus = TunnelStatus.disconnected);
+        }
         _scheduleReconnect();
         return;
       }
     }
     setState(() => _tunnelStatus = s);
-    if (!_switching &&
-        (s == TunnelStatus.disconnected || s == TunnelStatus.failed)) {
+    if (!_switching && isBreak) {
       _scheduleReconnect();
     }
   }
@@ -807,6 +813,10 @@ class _WebViewScreenState extends State<WebViewScreen>
   Future<void> _openSettings({int? profileIndex}) async {
     final connected = _tunnelStatus == TunnelStatus.connected;
     final target = profileIndex ?? _activeIndex;
+    // 进入设置前的配置快照：返回后据此判断是否需要断开重连
+    final snapshotProfiles = List<SSHConfig>.of(_profiles);
+    final snapshotTimeout = _timeoutSeconds;
+    final snapshotActive = _activeIndex;
     await Navigator.of(context).push<bool>(
       MaterialPageRoute(
         builder: (_) => SetupScreen(
@@ -839,10 +849,60 @@ class _WebViewScreenState extends State<WebViewScreen>
       ),
     );
     // 设置已自动保存（表单编辑即落盘）：无论返回方式（点完成/返回键），
-    // 返回后都断开重连，以应用最新配置；否则隧道仍 connected 时 _connect()
-    // 会提前返回，修改的地址/端口/凭据不会生效。
-    await TunnelService.instance.disconnect();
+    // 返回后读取最新配置。仅当配置/激活实例/加载超时确实变化时才断开重连，
+    // 否则保持现有隧道——避免"只打开看一眼设置"就打断当前会话。
+    final profiles = await SSHConfig.loadAllProfiles();
+    final activeIndex = await SSHConfig.loadActiveIndex();
+    final timeout = await SSHConfig.loadTimeoutSeconds();
+    if (!mounted) return;
+    final changed = _settingsChanged(
+      before: snapshotProfiles,
+      beforeTimeout: snapshotTimeout,
+      beforeActive: snapshotActive,
+      after: profiles,
+      afterTimeout: timeout,
+      afterActive: activeIndex,
+    );
+    if (changed) {
+      await TunnelService.instance.disconnect();
+    }
     await _load();
+  }
+
+  /// 对比设置页返回后的配置与进入前快照：任一字段/激活实例/加载超时
+  /// 变化即视为需要重连（地址/端口/凭据修改必须重连才生效）。
+  static bool _settingsChanged({
+    required List<SSHConfig> before,
+    required int beforeTimeout,
+    required int beforeActive,
+    required List<SSHConfig> after,
+    required int afterTimeout,
+    required int afterActive,
+  }) {
+    if (beforeTimeout != afterTimeout || beforeActive != afterActive) {
+      return true;
+    }
+    for (var i = 0; i < SSHConfig.maxProfiles; i++) {
+      final a = before[i];
+      final b = after[i];
+      if (a.host != b.host ||
+          a.sshPort != b.sshPort ||
+          a.username != b.username ||
+          a.localPort != b.localPort ||
+          a.authType != b.authType ||
+          a.password != b.password ||
+          a.privateKeyPem != b.privateKeyPem ||
+          a.keyPassphrase != b.keyPassphrase ||
+          a.alias != b.alias ||
+          a.hostMonitorEnabled != b.hostMonitorEnabled ||
+          a.unslothEnabled != b.unslothEnabled ||
+          a.unslothPort != b.unslothPort ||
+          a.unslothUseSsh != b.unslothUseSsh ||
+          a.unslothPassword != b.unslothPassword) {
+        return true;
+      }
+    }
+    return false;
   }
 
   String get _targetUrl => 'http://127.0.0.1:${_config.localPort}';

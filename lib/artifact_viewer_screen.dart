@@ -78,6 +78,12 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
           _asyncContent = text;
           _loading = false;
         });
+        // 加载失败兜底：置 _loading=false 让 _buildBody 走 _buildLoadError()
+        // 分支（_effectiveContent 为空 + loader 存在 → 读取失败界面）。
+      }).catchError((Object e) {
+        debugPrint('VIEWER load error: $e');
+        if (!mounted) return;
+        setState(() => _loading = false);
       });
     }
   }
@@ -209,6 +215,10 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
         _asyncContent = text;
         _loading = false;
       });
+    }).catchError((Object e) {
+      debugPrint('VIEWER retry load error: $e');
+      if (!mounted) return;
+      setState(() => _loading = false);
     });
   }
 
@@ -312,11 +322,11 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
         backgroundColor: Colors.transparent,
       ),
       codeblockDecoration: BoxDecoration(
-        color: scheme.surfaceVariant,
+        color: scheme.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(8),
       ),
       blockquoteDecoration: BoxDecoration(
-        color: scheme.surfaceVariant,
+        color: scheme.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(4),
       ),
     );

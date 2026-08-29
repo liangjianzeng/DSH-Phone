@@ -399,8 +399,8 @@ class _SetupScreenState extends State<SetupScreen> {
     });
     final config = _buildConfig();
     try {
-      await TunnelService.instance.connect(config);
-      await TunnelService.instance.disconnect();
+      // 独立认证测试：不建立转发、不联动前台服务、不影响当前活动隧道
+      await TunnelService.instance.testConnection(config);
       setState(() {
         _testPassed = true;
         _testResult = '连接成功 ✅';

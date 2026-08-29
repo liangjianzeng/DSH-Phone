@@ -103,18 +103,29 @@ class MoonLocation {
     _resolving = true;
     statusText.value = _statusLine();
     ObserverLocation loc = beijing;
-    switch (mode) {
-      case MoonLocationMode.auto:
-        final gps =
-            await _tryGps(requestPermission: requestPermission);
-        _gpsOk = gps != null;
-        loc = gps ?? beijing;
-      case MoonLocationMode.manual:
-        loc = ObserverLocation(manualLatitude, manualLongitude);
-      case MoonLocationMode.beijing:
-        loc = beijing;
+    try {
+      switch (mode) {
+        case MoonLocationMode.auto:
+          final gps =
+              await _tryGps(requestPermission: requestPermission);
+          _gpsOk = gps != null;
+          loc = gps ?? beijing;
+        case MoonLocationMode.manual:
+          loc = ObserverLocation(manualLatitude, manualLongitude);
+        case MoonLocationMode.beijing:
+          loc = beijing;
+      }
+    } catch (e) {
+      // 定位库抛出的 PlatformException 等异常：兜底回退默认北京，
+      // 并记录失败原因，避免 _resolving 卡死导致界面永远"正在获取定位…"。
+      debugPrint('[DSH] moon location resolve error: $e');
+      _gpsOk = false;
+      _gpsFailure = GpsFailure.error;
+      _gpsFailureDetail = e.toString();
+      loc = beijing;
+    } finally {
+      _resolving = false;
     }
-    _resolving = false;
     observer.value = loc;
     statusText.value = _statusLine();
   }
@@ -203,7 +214,17 @@ class MoonLocation {
   static Future<ObserverLocation?> _tryGps(
       {required bool requestPermission}) async {
     // 1) 权限：先检查，必要时弹框（仅用户操作触发）。
-    var perm = await Geolocator.checkPermission();
+    // checkPermission 在部分设备/系统上可能抛 PlatformException，
+    // 这里兜底按"权限未授予"处理，避免整个解析流程中断。
+    LocationPermission perm;
+    try {
+      perm = await Geolocator.checkPermission();
+    } catch (e) {
+      debugPrint('[DSH] moon location checkPermission error: $e');
+      _gpsFailure = GpsFailure.permissionNotGranted;
+      _gpsFailureDetail = '';
+      return null;
+    }
     if (perm == LocationPermission.denied) {
       if (!requestPermission) {
         _gpsFailure = GpsFailure.permissionNotGranted;
@@ -269,16 +290,19 @@ class MoonLocation {
       _gpsFailure = GpsFailure.none;
       _gpsFailureDetail = '';
       return ObserverLocation(pos.latitude, pos.longitude);
-    } on TimeoutException {
-      _gpsFailure = GpsFailure.timeout;
-      _gpsFailureDetail = '';
-      return null;
+    // 注意 catch 顺序：geolocator 的 LocationServiceDisabledException /
+    // PermissionDeniedException 均继承自 TimeoutException，
+    // 必须先于 TimeoutException 匹配，否则服务关闭/权限拒绝会被误报为"超时"。
     } on LocationServiceDisabledException {
       _gpsFailure = GpsFailure.serviceDisabled;
       _gpsFailureDetail = '';
       return null;
     } on PermissionDeniedException {
       _gpsFailure = GpsFailure.permissionDenied;
+      _gpsFailureDetail = '';
+      return null;
+    } on TimeoutException {
+      _gpsFailure = GpsFailure.timeout;
       _gpsFailureDetail = '';
       return null;
     } catch (e) {

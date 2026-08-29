@@ -63,9 +63,15 @@ class HostMonitor extends ChangeNotifier {
     if (!_enabled) return;
     // 无"默认主机资源监控"实例时不采集
     if (TunnelService.instance.monitorProfileIndex == null) return;
-    // 采集目标是监控实例（独立采集隧道），与当前连接实例无关
-    final s = await TunnelService.instance.collectMonitorSample();
-    if (s != null) _add(s);
+    // 采集目标是监控实例（独立采集隧道），与当前连接实例无关。
+    // 采集可能因会话断开/命令超时抛异常：Timer 回调中未捕获会进入
+    // Flutter zone 的未处理错误通道，这里兜底忽略，等下一轮采样。
+    try {
+      final s = await TunnelService.instance.collectMonitorSample();
+      if (s != null) _add(s);
+    } catch (e) {
+      debugPrint('[DSH] host monitor sample error: $e');
+    }
   }
 }
 

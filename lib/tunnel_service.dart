@@ -52,7 +52,6 @@ class TunnelService {
 
   SSHClient? _client;
   ServerSocket? _server;
-  bool _disposed = false;
   bool _connecting = false;
 
   /// 当前激活（已连接/正在连接）的实例索引，null 表示无。
@@ -66,7 +65,8 @@ class TunnelService {
 
   void _setStatus(TunnelStatus s) {
     _status = s;
-    if (!_disposed) _statusController.add(s);
+    // 广播流无监听者时 add 会被安全丢弃，无需 _disposed 守卫。
+    _statusController.add(s);
     _syncForegroundService(s);
   }
 
@@ -166,6 +166,47 @@ class TunnelService {
       rethrow;
     } finally {
       _connecting = false;
+    }
+  }
+
+  /// 仅验证 SSH 认证是否成功（设置页"测试连接"专用）。
+  ///
+  /// 与 [connect] 的区别：不建立本地转发、不改变隧道状态、不联动前台服务，
+  /// 认证完成后立即关闭会话释放资源，避免测试时通知栏/前台服务启停闪烁，
+  /// 也避免污染当前活动隧道。
+  ///
+  /// 认证成功正常返回；连接/认证失败抛出异常（由调用方呈现错误）。
+  Future<void> testConnection(SSHConfig config) async {
+    final socket = await SSHSocket.connect(config.host, config.sshPort,
+        timeout: const Duration(seconds: 15));
+    SSHClient? client;
+    try {
+      final List<SSHKeyPair>? identities = config.useKey
+          ? SSHKeyPair.fromPem(config.privateKeyPem,
+              config.keyPassphrase.isEmpty ? null : config.keyPassphrase)
+          : null;
+      client = SSHClient(
+        socket,
+        username: config.username,
+        identities: identities,
+        onPasswordRequest: config.useKey ? null : () async => config.password,
+        keepAliveInterval: const Duration(seconds: 10),
+        onVerifyHostKey: (hostkeyType, fingerprint) => true,
+      );
+      await client.authenticated
+          .timeout(const Duration(seconds: 20), onTimeout: () {
+        debugPrint('[DSH] test connection auth timed out');
+        throw const SocketException('SSH 认证超时');
+      });
+      debugPrint('[DSH] test connection ok '
+          '(${config.host}:${config.sshPort})');
+    } finally {
+      client?.close();
+      // fromPem 解析失败等 client 未建立时，直接关闭底层 socket 防泄漏
+      if (client == null) {
+        // 忽略异步关闭结果（finally 中无法 await）
+        socket.close();
+      }
     }
   }
 
@@ -762,9 +803,11 @@ class TunnelService {
   }
 
   void dispose() {
-    _disposed = true;
-    _statusController.close();
-    // 应用退出：停止前台服务并释放唤醒锁
+    // 释放隧道与后台资源。注意：不关闭状态流、不置永久失效标志——
+    // TunnelService 是应用级单例，根 State 可能在运行期重建
+    // （例如 Flutter 框架重建根路由），关闭后单例将永久不可用，
+    // 隧道无法再次建立。进程退出时资源由系统回收即可。
+    // 停止前台服务并释放唤醒锁
     ForegroundTunnelService.instance.stop();
     // 关闭 Unsloth Studio 转发
     stopUnslothForward();
@@ -772,5 +815,7 @@ class TunnelService {
     final mc = _monitorClient;
     _monitorClient = null;
     mc?.close();
+    // 断开活动隧道（含本地端口监听与 SSH 会话）
+    _disconnectInternal();
   }
 }
