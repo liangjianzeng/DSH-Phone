@@ -47,6 +47,11 @@ class TunnelService {
   TunnelService._();
   static final TunnelService instance = TunnelService._();
 
+  /// SFTP 单次内存读取上限（8MB）：与成果 JS 桥的 fetch 上限一致。
+  /// 超过该大小的文件不读入内存（readBytes），避免移动端 OOM，
+  /// 大文件应走 [DownloadManager] 的下载/断点续传流程。
+  static const int maxRemoteReadBytes = 8 * 1024 * 1024;
+
   final StreamController<TunnelStatus> _statusController =
       StreamController<TunnelStatus>.broadcast();
 
@@ -301,6 +306,9 @@ class TunnelService {
   /// 采用 **SFTP** 读取：绕开 shell 命令对中文路径的编码问题（Windows cmd 用
   /// GBK 而 exec 命令按 UTF-8 发送，中文路径会被误解码）。
   /// 隧道未连接时返回空字符串（由查看器提示）。
+  ///
+  /// 大小保护：超过 [maxRemoteReadBytes] 的文件不读入内存（避免 OOM），
+  /// 返回空字符串走查看器的"读取失败"流程（可另存为下载）。
   Future<String> readRemoteFile(String remotePath) async {
     final client = _client;
     if (client == null) return '';
@@ -311,6 +319,15 @@ class TunnelService {
       try {
         sftp = await client.sftp();
         file = await sftp.open(path);
+        // 先 stat 再 readBytes：超大文件不入内存，防移动端 OOM
+        final attrs = await file.stat();
+        final size = attrs.size ?? 0;
+        if (size > maxRemoteReadBytes) {
+          debugPrint('[DSH] readRemoteFile skipped '
+              '($size bytes > ${maxRemoteReadBytes ~/ (1024 * 1024)}MB) '
+              'for "$path"');
+          return '';
+        }
         final bytes = await file.readBytes();
         return _decodeBytes(bytes);
       } catch (e) {
@@ -377,11 +394,20 @@ class TunnelService {
 
   /// 读取云端文件原始字节（用于"另存为"时保留原始编码，如 GBK）。
   ///
-  /// 打开失败返回 null。仅读内存（小文本文件），大文件请走下载流。
+  /// 打开失败返回 null。仅读内存（小文本文件），大文件请走下载流；
+  /// 超过 [maxRemoteReadBytes] 同样返回 null（防 OOM）。
   Future<Uint8List?> readRemoteFileBytes(String remotePath) async {
     final file = await openRemoteFile(remotePath);
     if (file == null) return null;
     try {
+      // 先 stat 再 readBytes：超大文件不入内存，防移动端 OOM
+      final attrs = await file.stat();
+      final size = attrs.size ?? 0;
+      if (size > maxRemoteReadBytes) {
+        debugPrint('[DSH] readRemoteFileBytes skipped '
+            '($size bytes > ${maxRemoteReadBytes ~/ (1024 * 1024)}MB)');
+        return null;
+      }
       return await file.readBytes();
     } catch (e) {
       debugPrint('[DSH] readRemoteFileBytes failed: $e');
