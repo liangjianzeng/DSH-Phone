@@ -107,6 +107,7 @@ class _WillStartForegroundTaskState extends State<WillStartForegroundTask>
         case AppLifecycleState.paused:
           _startForegroundTask();
           break;
+        case AppLifecycleState.hidden:
         case AppLifecycleState.inactive:
         case AppLifecycleState.detached:
       }
