@@ -930,7 +930,7 @@ class SSHTransport {
 }
 
 /// 把 zlib 输出累积进 [BytesBuilder] 的转换 sink（BytesBuilder 无 close，
-/// 不满足 Sink<List<int>>，故用此包装）。
+/// 不满足 Sink\<List\<int\>\>，故用此包装）。
 class _AccumulatorSink extends ByteConversionSink {
   _AccumulatorSink(this.builder);
   final BytesBuilder builder;
