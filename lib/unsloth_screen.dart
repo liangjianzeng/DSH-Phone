@@ -242,17 +242,51 @@ class _UnslothScreenState extends State<UnslothScreen> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Unsloth Studio'),
-        actions: [
-          IconButton(
-            tooltip: '刷新缓存',
-            icon: const Icon(Icons.refresh),
-            onPressed: _refreshCache,
+      body: Column(
+        children: [
+          _buildTopBar(context),
+          Expanded(
+            child: ColoredBox(color: scheme.surface, child: _buildBody(context)),
           ),
         ],
       ),
-      body: ColoredBox(color: scheme.surface, child: _buildBody(context)),
+    );
+  }
+
+  /// 自定义紧凑顶栏：与主界面（WebViewScreen）顶栏同构——背景延伸到状态栏
+  /// 区域（边缘到边缘），内容用 SafeArea 避让状态图标，高度由内容驱动
+  /// （48dp 图标按钮），不再使用默认 AppBar（56dp + 状态栏，偏高）。
+  Widget _buildTopBar(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      color: theme.colorScheme.surface,
+      child: SafeArea(
+        bottom: false,
+        child: Row(
+          children: [
+            IconButton(
+              tooltip: '返回',
+              icon: const Icon(Icons.arrow_back),
+              onPressed: () => Navigator.of(context).maybePop(),
+            ),
+            const SizedBox(width: 4),
+            Expanded(
+              child: Text(
+                'Unsloth Studio',
+                style: theme.textTheme.titleMedium,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            IconButton(
+              tooltip: '刷新缓存',
+              icon: const Icon(Icons.refresh),
+              onPressed: _refreshCache,
+            ),
+            const SizedBox(width: 4),
+          ],
+        ),
+      ),
     );
   }
 
