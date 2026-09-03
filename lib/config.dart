@@ -59,6 +59,11 @@ class SSHConfig {
   // Unsloth Studio 登录密码（敏感项）
   static const String secUnslothPassword = 'unsloth_password';
 
+  // DSH Web 访问 Token（敏感项）：新版 dsh(>=0.1.2-rc.1) 启用一次性 launch
+  // token 鉴权。token 随进程重启变化，首次用它换取 30 天签名 cookie 后
+  // 即可免 token 访问；cookie 过期后需重新填写。
+  static const String secAccessToken = 'access_token';
+
   static const String authTypeKey = 'key';
   static const String authTypePassword = 'password';
 
@@ -92,6 +97,14 @@ class SSHConfig {
   /// Unsloth Studio 登录密码（敏感项，存 secure storage；用于登录页自动登录）。
   final String unslothPassword;
 
+  /// DSH Web 访问 Token（敏感项，存 secure storage）。
+  ///
+  /// 新版 DSH(>=0.1.2-rc.1) 服务端启用 token 鉴权：Web 界面需
+  /// `http://<host>:<port>/?token=X` 访问。填写后 App 在首次加载时携带
+  /// token 换取持久签名 cookie（默认 30 天有效），之后免 token 访问；
+  /// cookie 过期或服务端更换签名密钥后需更新此值。留空 = 旧版无鉴权直连。
+  final String accessToken;
+
   const SSHConfig({
     this.host = '',
     this.sshPort = 22,
@@ -107,6 +120,7 @@ class SSHConfig {
     this.unslothPort = defaultUnslothPort,
     this.unslothUseSsh = false,
     this.unslothPassword = '',
+    this.accessToken = '',
   });
 
   bool get isConfigured =>
@@ -156,6 +170,8 @@ class SSHConfig {
           await _safeSecRead(storage, _pKey(i, secKeyPassphrase));
       final unslothPassword =
           await _safeSecRead(storage, _pKey(i, secUnslothPassword));
+      final accessToken =
+          await _safeSecRead(storage, _pKey(i, secAccessToken));
       list.add(SSHConfig(
         host: prefs.getString(_pKey(i, keyHost)) ?? '',
         sshPort: prefs.getInt(_pKey(i, keySshPort)) ?? 22,
@@ -174,6 +190,7 @@ class SSHConfig {
             prefs.getInt(_pKey(i, keyUnslothPort)) ?? defaultUnslothPort,
         unslothUseSsh: prefs.getBool(_pKey(i, keyUnslothUseSsh)) ?? false,
         unslothPassword: unslothPassword,
+        accessToken: accessToken,
       ));
     }
     return list;
@@ -241,6 +258,12 @@ class SSHConfig {
           key: _pKey(i, secUnslothPassword), value: config.unslothPassword);
     } else {
       await storage.delete(key: _pKey(i, secUnslothPassword));
+    }
+    if (config.accessToken.isNotEmpty) {
+      await storage.write(
+          key: _pKey(i, secAccessToken), value: config.accessToken);
+    } else {
+      await storage.delete(key: _pKey(i, secAccessToken));
     }
   }
 

@@ -127,6 +127,9 @@ class _SetupScreenState extends State<SetupScreen> {
   late TextEditingController _keyPassphrase;
   late TextEditingController _localPort;
 
+  /// DSH Web 访问 Token（可选；新版 dsh>=0.1.2-rc.1 启用 token 鉴权时填写）。
+  late TextEditingController _accessToken;
+
   /// Unsloth Studio 配置控件（实例级）。
   late TextEditingController _unslothPort;
   late TextEditingController _unslothPassword;
@@ -139,6 +142,9 @@ class _SetupScreenState extends State<SetupScreen> {
   /// Unsloth Studio 启用开关与连接方式（随实例切换回填）。
   late bool _unslothEnabled;
   late bool _unslothUseSsh;
+
+  /// Token 输入明文/密文切换（默认密文显示）。
+  bool _obscureToken = true;
 
   bool _saving = false;
   String? _testResult;
@@ -195,6 +201,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _privateKey = TextEditingController(text: c.privateKeyPem);
     _keyPassphrase = TextEditingController(text: c.keyPassphrase);
     _localPort = TextEditingController(text: '${c.localPort}');
+    _accessToken = TextEditingController(text: c.accessToken);
     _unslothPort = TextEditingController(text: '${c.unslothPort}');
     _unslothPassword = TextEditingController(text: c.unslothPassword);
     _authType = c.authType;
@@ -220,6 +227,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _privateKey.dispose();
     _keyPassphrase.dispose();
     _localPort.dispose();
+    _accessToken.dispose();
     _unslothPort.dispose();
     _unslothPassword.dispose();
     super.dispose();
@@ -387,6 +395,7 @@ class _SetupScreenState extends State<SetupScreen> {
           SSHConfig.defaultUnslothPort,
       unslothUseSsh: _unslothUseSsh,
       unslothPassword: _unslothPassword.text,
+      accessToken: _accessToken.text.trim(),
     );
   }
 
@@ -553,6 +562,27 @@ class _SetupScreenState extends State<SetupScreen> {
               border: OutlineInputBorder(),
             ),
             validator: _validatePort,
+            onChanged: (_) => _scheduleAutoSave(),
+          ),
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: _accessToken,
+            obscureText: _obscureToken,
+            decoration: InputDecoration(
+              labelText: 'DSH 访问 Token（可选）',
+              hintText: '如 WKmvWqjUHFpJXhJd8gbnV7Tm8TQXSyp5L8wwEzgImsg',
+              helperText: '新版 DSH(≥0.1.2) 启用 token 鉴权，首次访问需携带；'
+                  '换取 30 天签名 cookie 后免 token，过期需重新填写',
+              border: const OutlineInputBorder(),
+              suffixIcon: IconButton(
+                icon: Icon(_obscureToken
+                    ? Icons.visibility_off_outlined
+                    : Icons.visibility_outlined),
+                tooltip: _obscureToken ? '显示 Token' : '隐藏 Token',
+                onPressed: () =>
+                    setState(() => _obscureToken = !_obscureToken),
+              ),
+            ),
             onChanged: (_) => _scheduleAutoSave(),
           ),
           const SizedBox(height: 16),

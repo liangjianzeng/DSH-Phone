@@ -580,14 +580,23 @@ class _WebViewScreenState extends State<WebViewScreen>
           a.unslothEnabled != b.unslothEnabled ||
           a.unslothPort != b.unslothPort ||
           a.unslothUseSsh != b.unslothUseSsh ||
-          a.unslothPassword != b.unslothPassword) {
+          a.unslothPassword != b.unslothPassword ||
+          a.accessToken != b.accessToken) {
         return true;
       }
     }
     return false;
   }
 
-  String get _targetUrl => 'http://127.0.0.1:${_config.localPort}';
+  /// DSH 入口 URL。配置了访问 Token 时拼上 `?token=`，让新版 DSH
+  /// (>=0.1.2-rc.1) 在首次访问完成鉴权并下发 30 天签名 cookie；
+  /// 未配置 Token（旧版服务 / 已换过 cookie）则保持裸地址直连。
+  String get _targetUrl {
+    final base = 'http://127.0.0.1:${_config.localPort}';
+    final token = _config.accessToken.trim();
+    if (token.isEmpty) return base;
+    return '$base/?token=${Uri.encodeQueryComponent(token)}';
+  }
 
   Future<void> _loadTargetUrl() async {
     final c = _controller;
@@ -1113,9 +1122,16 @@ class _WebViewScreenState extends State<WebViewScreen>
                 '加载失败：${error.description}\n'
                 '（${error.type}）',
               ),
-              onReceivedHttpError: (controller, response, error) =>
+              onReceivedHttpError: (controller, request, errorResponse) =>
                   _onPageError(
-                '服务器返回错误，请确认远程服务正常运行后重试。',
+                // 401/403：新版 DSH 已启用 token 鉴权，明确提示填 Token
+                errorResponse.statusCode == 401 ||
+                        errorResponse.statusCode == 403
+                    ? '访问被拒绝（HTTP ${errorResponse.statusCode}）：远程 '
+                        'DSH 已启用 Token 鉴权。\n请在设置中填入正确的'
+                        '「DSH 访问 Token」（或确认服务端未更换鉴权密钥）。'
+                    : '服务器返回错误（HTTP ${errorResponse.statusCode}），'
+                        '请确认远程服务正常运行后重试。',
               ),
             ),
             // 页面加载中：进度遮罩（不透明白底，避免黑屏观感）
