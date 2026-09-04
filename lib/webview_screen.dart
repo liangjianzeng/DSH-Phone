@@ -85,6 +85,15 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 对话区左侧相机入口是否显示（默认开启，由设置页开关控制）。
   bool _photoControlsEnabled = true;
 
+  // ---- 浮动控件纵向位置（可拖拽自由上下移动）----
+  /// 缩放控件纵向位置：归一化 0~1（0=屏幕顶、1=屏幕底），默认屏幕中央。
+  double _zoomControlsDy = 0.5;
+  /// 相机入口纵向位置：归一化 0~1，默认屏幕底部往上约六分之一处。
+  double _photoControlsDy = 1.0 - 1 / 6;
+  /// 拖拽锚点：pan 开始时的全局 Y（屏幕坐标），用于累加偏移。
+  double _zoomPanAnchorDy = 0;
+  double _photoPanAnchorDy = 0;
+
   // ---- WebView 页面加载状态 ----
   bool _pageLoading = false; // 远程页面加载中（隧道已通，页面未就绪）
   int _loadProgress = 0; // 0-100
@@ -222,6 +231,38 @@ class _WebViewScreenState extends State<WebViewScreen>
     SharedPreferences.getInstance().then(
       (prefs) => prefs.setBool(_photoControlsPrefKey, enabled),
     );
+  }
+
+  // ---- 浮动控件可拖拽上下移动 ----
+
+  /// 缩放控件拖拽：纵向拖拽更新归一化位置（0~1）。
+  void _onZoomControlsPanStart(DragStartDetails details) {
+    _zoomPanAnchorDy = details.globalPosition.dy;
+  }
+
+  void _onZoomControlsPanUpdate(DragUpdateDetails details) {
+    final screenHeight = MediaQuery.of(context).size.height;
+    final next = (_zoomControlsDy +
+            (details.globalPosition.dy - _zoomPanAnchorDy) / screenHeight)
+        .clamp(0.0, 1.0);
+    if ((next - _zoomControlsDy).abs() > 1e-6) {
+      setState(() => _zoomControlsDy = next);
+    }
+  }
+
+  /// 相机入口拖拽：纵向拖拽更新归一化位置（0~1）。
+  void _onPhotoControlsPanStart(DragStartDetails details) {
+    _photoPanAnchorDy = details.globalPosition.dy;
+  }
+
+  void _onPhotoControlsPanUpdate(DragUpdateDetails details) {
+    final screenHeight = MediaQuery.of(context).size.height;
+    final next = (_photoControlsDy +
+            (details.globalPosition.dy - _photoPanAnchorDy) / screenHeight)
+        .clamp(0.0, 1.0);
+    if ((next - _photoControlsDy).abs() > 1e-6) {
+      setState(() => _photoControlsDy = next);
+    }
   }
 
   /// 月相观测位置设置变更：持久化并重新解析（observer 变化自动触发重绘）。
@@ -459,6 +500,12 @@ class _WebViewScreenState extends State<WebViewScreen>
       await c.reload();
     }
   }
+
+  /// 是否存在任意启用了 Unsloth Studio 的实例。
+  ///
+  /// 顶栏 Unsloth 入口据此显示/隐藏：全部未启用时隐藏入口（无意义），
+  /// 进入时仍保留兜底提示（防御并发修改配置）。
+  bool get _unslothAvailable => _profiles.any((p) => p.unslothEnabled);
 
   /// 打开 Unsloth Studio 页面（全局唯一启用的实例，与当前连接实例无关）。
   ///
@@ -990,11 +1037,13 @@ class _WebViewScreenState extends State<WebViewScreen>
             ),
             const Spacer(),
             _buildInstanceSwitcher(context),
-            IconButton(
-              tooltip: 'Unsloth Studio',
-              icon: const Icon(Icons.science_outlined),
-              onPressed: _openUnsloth,
-            ),
+            // Unsloth 入口：全部实例未启用时隐藏（首页无意义）
+            if (_unslothAvailable)
+              IconButton(
+                tooltip: 'Unsloth Studio',
+                icon: const Icon(Icons.science_outlined),
+                onPressed: _openUnsloth,
+              ),
             IconButton(
               tooltip: '设置',
               icon: const Icon(Icons.settings),
@@ -1238,19 +1287,23 @@ class _WebViewScreenState extends State<WebViewScreen>
     );
   }
 
-  /// 自定义浮动缩放控件：定位在**左侧屏幕中央、竖排**，替代原生右下角
-  /// 缩放控件（后者固定右下、常覆盖发送按钮）。半透明小尺寸，尽量少遮挡。
+  /// 自定义浮动缩放控件：定位在**左侧**、竖排，替代原生右下角
+  /// 缩放控件（后者固定右下、常覆盖发送按钮）。
+  ///
+  /// 位置可拖拽自由上下移动（归一化 0~1，默认屏幕中央）；按钮背景透明，
+  /// 尽量少遮挡页面内容。
   Widget _buildZoomControls(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
+    final screenHeight = MediaQuery.of(context).size.height;
     return Positioned(
       left: 6,
-      top: 0,
-      bottom: 0,
-      child: Center(
+      top: _zoomControlsDy * screenHeight,
+      child: GestureDetector(
+        // opaque：占满命中区域以便捕获拖拽；纯点击仍透传给内部按钮
+        behavior: HitTestBehavior.opaque,
+        onPanStart: _onZoomControlsPanStart,
+        onPanUpdate: _onZoomControlsPanUpdate,
         child: Material(
-          color: scheme.surface.withValues(alpha: 0.55),
-          borderRadius: BorderRadius.circular(24),
-          elevation: 2,
+          color: Colors.transparent,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -1299,30 +1352,35 @@ class _WebViewScreenState extends State<WebViewScreen>
     final borderColor = const Color(0xFF64B5F6);
     return Positioned(
       left: 6,
-      bottom: screenHeight / 6,
-      child: SizedBox(
-        width: 48,
-        height: 48,
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            border: Border.all(color: borderColor, width: 2), // 圆形边框
-            boxShadow: [
-              // 发光随月相变化：满月最亮，新月留微光保持入口可见。
-              BoxShadow(
-                color: borderColor.withValues(alpha: 0.12 + 0.55 * lit),
-                blurRadius: 6 + 12 * lit,
-                spreadRadius: 1 + 2 * lit,
-              ),
-              BoxShadow(
-                color: const Color(0xFF81D4FA)
-                    .withValues(alpha: 0.08 + 0.35 * lit),
-                blurRadius: 16 + 12 * lit,
-                spreadRadius: 2 + 3 * lit,
-              ),
-            ],
-          ),
-          child: CustomPaint(
+      top: _photoControlsDy * screenHeight,
+      // 可拖拽自由上下移动：占满命中区域捕获拖拽，点击透传给内部相机按钮
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onPanStart: _onPhotoControlsPanStart,
+        onPanUpdate: _onPhotoControlsPanUpdate,
+        child: SizedBox(
+          width: 48,
+          height: 48,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              border: Border.all(color: borderColor, width: 2), // 圆形边框
+              boxShadow: [
+                // 发光随月相变化：满月最亮，新月留微光保持入口可见。
+                BoxShadow(
+                  color: borderColor.withValues(alpha: 0.12 + 0.55 * lit),
+                  blurRadius: 6 + 12 * lit,
+                  spreadRadius: 1 + 2 * lit,
+                ),
+                BoxShadow(
+                  color: const Color(0xFF81D4FA)
+                      .withValues(alpha: 0.08 + 0.35 * lit),
+                  blurRadius: 16 + 12 * lit,
+                  spreadRadius: 2 + 3 * lit,
+                ),
+              ],
+            ),
+            child: CustomPaint(
             painter: MoonPhasePainter(obs.phase01, obs.tiltDeg),
             child: Center(
               child: IconButton(
@@ -1344,6 +1402,7 @@ class _WebViewScreenState extends State<WebViewScreen>
           ),
         ),
       ),
+    ),
     );
   }
 
