@@ -85,14 +85,26 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 对话区左侧相机入口是否显示（默认开启，由设置页开关控制）。
   bool _photoControlsEnabled = true;
 
-  // ---- 浮动控件纵向位置（可拖拽自由上下移动）----
-  /// 缩放控件纵向位置：归一化 0~1（0=屏幕顶、1=屏幕底），默认屏幕中央。
-  double _zoomControlsDy = 0.5;
-  /// 相机入口纵向位置：归一化 0~1，默认屏幕底部往上约六分之一处。
-  double _photoControlsDy = 1.0 - 1 / 6;
-  /// 拖拽锚点：pan 开始时的全局 Y（屏幕坐标），用于累加偏移。
-  double _zoomPanAnchorDy = 0;
-  double _photoPanAnchorDy = 0;
+  // ---- 浮动控件可拖拽上下移动 ----
+  // 位置以“像素”记录（相对对话区 Stack 的 top），拖拽时控件顶边跟随手指，
+  // 避免“控件从手指下溜走→手势丢失→重新抓取→乱跳”的常见问题。
+
+  /// 对话区 Stack 内可用高度（px），由 LayoutBuilder 填入（顶栏之下）。
+  double _bodyHeight = 0;
+
+  /// 缩放控件顶边 Y（相对 Stack，px），默认屏幕中央。
+  double _zoomControlsTop = 0;
+
+  /// 相机入口顶边 Y（相对 Stack，px），默认底部往上约六分之一处。
+  double _photoControlsTop = 0;
+
+  /// 拖拽抓手偏移：pan 起始时“手指 Y − 控件顶边 Y”，使控件顶边始终跟随手指。
+  double _zoomGripOffset = 0;
+  double _photoGripOffset = 0;
+
+  /// 控件拖拽时顶边允许的最大值（Stack 高度 − 控件高度），保证不滑出屏外。
+  static const double _zoomControlHeight = 120; // 3 图标 + 2 分隔，近似
+  static const double _photoControlHeight = 48; // 圆形按钮 48×48
 
   // ---- WebView 页面加载状态 ----
   bool _pageLoading = false; // 远程页面加载中（隧道已通，页面未就绪）
@@ -234,42 +246,41 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   // ---- 浮动控件可拖拽上下移动 ----
+  // 以“手指 − 抓手偏移”计算控件新顶边：控件顶边严格跟随手指，手抓在哪
+  // 就跟到哪，不会从手指下溜走；clamp 到 [0, bodyHeight − controlHeight]
+  // 保证拖到尽头也不滑出屏外（避免“消失”）。
 
-  /// 缩放控件拖拽：纵向拖拽更新归一化位置（0~1）。
-  void _onZoomControlsPanStart(DragStartDetails details) {
-    _zoomPanAnchorDy = details.globalPosition.dy;
+  /// 缩放控件拖拽：更新归一化顶边（相对 Stack，px）。stackHeight 为 Stack 高。
+  void _onZoomControlsPanStart(DragStartDetails details, double stackHeight) {
+    _zoomGripOffset = details.globalPosition.dy - _zoomControlsTop;
   }
 
-  void _onZoomControlsPanUpdate(DragUpdateDetails details) {
-    final screenHeight = MediaQuery.of(context).size.height;
-    final next = (_zoomControlsDy +
-            (details.globalPosition.dy - _zoomPanAnchorDy) / screenHeight)
-        .clamp(0.0, 1.0);
-    if ((next - _zoomControlsDy).abs() > 1e-6) {
-      setState(() => _zoomControlsDy = next);
+  void _onZoomControlsPanUpdate(DragUpdateDetails details, double stackHeight) {
+    final newTop = (details.globalPosition.dy - _zoomGripOffset)
+        .clamp(0.0, stackHeight - _zoomControlHeight);
+    if ((newTop - _zoomControlsTop).abs() > 1.0) {
+      setState(() => _zoomControlsTop = newTop);
     }
   }
 
-  /// 相机入口拖拽：纵向拖拽更新归一化位置（0~1）。
-  void _onPhotoControlsPanStart(DragStartDetails details) {
-    _photoPanAnchorDy = details.globalPosition.dy;
+  /// 相机入口拖拽：更新归一化顶边（相对 Stack，px）。
+  void _onPhotoControlsPanStart(DragStartDetails details, double stackHeight) {
+    _photoGripOffset = details.globalPosition.dy - _photoControlsTop;
   }
 
-  void _onPhotoControlsPanUpdate(DragUpdateDetails details) {
-    final screenHeight = MediaQuery.of(context).size.height;
-    final next = (_photoControlsDy +
-            (details.globalPosition.dy - _photoPanAnchorDy) / screenHeight)
-        .clamp(0.0, 1.0);
-    if ((next - _photoControlsDy).abs() > 1e-6) {
-      setState(() => _photoControlsDy = next);
+  void _onPhotoControlsPanUpdate(
+      DragUpdateDetails details, double stackHeight) {
+    final newTop = (details.globalPosition.dy - _photoGripOffset)
+        .clamp(0.0, stackHeight - _photoControlHeight);
+    if ((newTop - _photoControlsTop).abs() > 1.0) {
+      setState(() => _photoControlsTop = newTop);
     }
   }
 
   /// 月相观测位置设置变更：持久化并重新解析（observer 变化自动触发重绘）。
   void _setMoonLocation(MoonLocationMode mode,
       {double? latitude, double? longitude}) {
-    MoonLocation.update(mode,
-        latitude: latitude, longitude: longitude);
+    MoonLocation.update(mode, latitude: latitude, longitude: longitude);
   }
 
   /// 读取工具类功能开关（监控 / 资源查看 / 资源下载），并同步监控采样器。
@@ -341,8 +352,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 回到前台时看到的是诚实的"隧道已断开"，而非残留的绿色状态点。
   void _onTunnelStatus(TunnelStatus s) {
     if (!mounted) return;
-    final isBreak =
-        s == TunnelStatus.disconnected || s == TunnelStatus.failed;
+    final isBreak = s == TunnelStatus.disconnected || s == TunnelStatus.failed;
     if (!_switching && isBreak) {
       if (_reconnectCount == 0) {
         if (_tunnelStatus == TunnelStatus.connected) {
@@ -793,8 +803,8 @@ class _WebViewScreenState extends State<WebViewScreen>
     if (result is Map && result['ok'] == false) {
       ScaffoldMessenger.of(context)
         ..clearSnackBars()
-        ..showSnackBar(SnackBar(
-            content: Text('图片注入失败：${result['error'] ?? '未知错误'}')));
+        ..showSnackBar(
+            SnackBar(content: Text('图片注入失败：${result['error'] ?? '未知错误'}')));
     }
   }
 
@@ -1128,73 +1138,91 @@ class _WebViewScreenState extends State<WebViewScreen>
           ),
         );
       case TunnelStatus.connected:
-        return Stack(
-          fit: StackFit.expand,
-          children: [
-            InAppWebView(
-              initialUrlRequest: URLRequest(url: WebUri(_targetUrl)),
-              initialSettings: InAppWebViewSettings(
-                // 本地缓存加速：优先用缓存，缺时才走网络
-                cacheMode: CacheMode.LOAD_CACHE_ELSE_NETWORK,
-                // DSH 是含 WebSocket 的 SPA
-                javaScriptEnabled: true,
-                transparentBackground: false,
-                // 原生双指缩放（保留手势），但禁用原生右下角缩放控件
-                // （原生控件位置固定、常覆盖发送按钮），改用自定义
-                // 左侧中央竖排浮动控件（_buildZoomControls）。
-                supportZoom: true,
-                displayZoomControls: false,
-              ),
-              onWebViewCreated: (controller) {
-                _controller = controller;
-                _setupArtifactBridge(controller);
-                _setupPhotoBridge(controller);
-                _setupTaskBridge(controller);
-              },
-              onLoadStart: (controller, url) => _onPageLoadStart(),
-              onProgressChanged: (controller, progress) =>
-                  _onPageProgress(progress),
-              onLoadStop: (controller, url) {
-                _onPageLoadStop();
-                // 页面就绪后应用持久化的缩放比例
-                _applyZoom();
-                // 每次页面导航后重新注入成果监听脚本
-                _injectArtifactBridge();
-                // 每次页面导航后重新注入图片直传桥
-                _injectPhotoBridge();
-                // 每次页面导航后重新注入任务状态桥，并复位可能残留的
-                // 「任务进行中」通知（桥会对齐当前状态，运行中会重新上报）。
-                _injectTaskBridge();
-                TaskNotifier.instance.reset();
-              },
-              onReceivedError: (controller, request, error) => _onPageError(
-                '加载失败：${error.description}\n'
-                '（${error.type}）',
-              ),
-              onReceivedHttpError: (controller, request, errorResponse) =>
-                  _onPageError(
-                // 401/403：新版 DSH 已启用 token 鉴权，明确提示填 Token
-                errorResponse.statusCode == 401 ||
-                        errorResponse.statusCode == 403
-                    ? '访问被拒绝（HTTP ${errorResponse.statusCode}）：远程 '
-                        'DSH 已启用 Token 鉴权。\n请在设置中填入正确的'
-                        '「DSH 访问 Token」（或确认服务端未更换鉴权密钥）。'
-                    : '服务器返回错误（HTTP ${errorResponse.statusCode}），'
-                        '请确认远程服务正常运行后重试。',
-              ),
-            ),
-            // 页面加载中：进度遮罩（不透明白底，避免黑屏观感）
-            if (_pageLoading && _pageError == null) _buildPageLoading(context),
-            // 页面加载失败/超时：错误界面
-            if (_pageError != null) _buildPageError(context),
-            // 自定义缩放控件：左侧屏幕中央、竖排，避开右下角发送按钮。
-            // 默认关闭，仅在设置页开启后显示。
-            if (_zoomControlsEnabled && !_pageLoading && _pageError == null)
-              _buildZoomControls(context),
-            // 相机入口浮动按钮：对话区左侧靠屏幕边居中偏上，默认开启。
-            if (_photoControlsEnabled && !_pageLoading && _pageError == null)
-              _buildPhotoControls(context),
-          ],
+        // 用 LayoutBuilder 拿到对话区 Stack 的实际高度（顶栏之下），用于
+        // 浮动控件的定位与拖拽 clamp；并在此首次布局时设定控件默认位置。
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            final stackHeight = constraints.maxHeight;
+            if (_bodyHeight == 0) {
+              _bodyHeight = stackHeight;
+              _zoomControlsTop = stackHeight * 0.5; // 默认屏幕中央
+              _photoControlsTop = stackHeight * (1 - 1 / 6); // 底部往上约六分之一
+            } else if ((stackHeight - _bodyHeight).abs() > 1) {
+              // 容器高度变化（键盘/旋转等）时同步基准高度
+              _bodyHeight = stackHeight;
+            }
+            return Stack(
+              fit: StackFit.expand,
+              children: [
+                InAppWebView(
+                  initialUrlRequest: URLRequest(url: WebUri(_targetUrl)),
+                  initialSettings: InAppWebViewSettings(
+                    // 本地缓存加速：优先用缓存，缺时才走网络
+                    cacheMode: CacheMode.LOAD_CACHE_ELSE_NETWORK,
+                    // DSH 是含 WebSocket 的 SPA
+                    javaScriptEnabled: true,
+                    transparentBackground: false,
+                    // 原生双指缩放（保留手势），但禁用原生右下角缩放控件
+                    // （原生控件位置固定、常覆盖发送按钮），改用自定义
+                    // 左侧中央竖排浮动控件（_buildZoomControls）。
+                    supportZoom: true,
+                    displayZoomControls: false,
+                  ),
+                  onWebViewCreated: (controller) {
+                    _controller = controller;
+                    _setupArtifactBridge(controller);
+                    _setupPhotoBridge(controller);
+                    _setupTaskBridge(controller);
+                  },
+                  onLoadStart: (controller, url) => _onPageLoadStart(),
+                  onProgressChanged: (controller, progress) =>
+                      _onPageProgress(progress),
+                  onLoadStop: (controller, url) {
+                    _onPageLoadStop();
+                    // 页面就绪后应用持久化的缩放比例
+                    _applyZoom();
+                    // 每次页面导航后重新注入成果监听脚本
+                    _injectArtifactBridge();
+                    // 每次页面导航后重新注入图片直传桥
+                    _injectPhotoBridge();
+                    // 每次页面导航后重新注入任务状态桥，并复位可能残留的
+                    // 「任务进行中」通知（桥会对齐当前状态，运行中会重新上报）。
+                    _injectTaskBridge();
+                    TaskNotifier.instance.reset();
+                  },
+                  onReceivedError: (controller, request, error) => _onPageError(
+                    '加载失败：${error.description}\n'
+                    '（${error.type}）',
+                  ),
+                  onReceivedHttpError: (controller, request, errorResponse) =>
+                      _onPageError(
+                    // 401/403：新版 DSH 已启用 token 鉴权，明确提示填 Token
+                    errorResponse.statusCode == 401 ||
+                            errorResponse.statusCode == 403
+                        ? '访问被拒绝（HTTP ${errorResponse.statusCode}）：远程 '
+                            'DSH 已启用 Token 鉴权。\n请在设置中填入正确的'
+                            '「DSH 访问 Token」（或确认服务端未更换鉴权密钥）。'
+                        : '服务器返回错误（HTTP ${errorResponse.statusCode}），'
+                            '请确认远程服务正常运行后重试。',
+                  ),
+                ),
+                // 页面加载中：进度遮罩（不透明白底，避免黑屏观感）
+                if (_pageLoading && _pageError == null)
+                  _buildPageLoading(context),
+                // 页面加载失败/超时：错误界面
+                if (_pageError != null) _buildPageError(context),
+                // 自定义缩放控件：左侧、竖排，可拖拽上下移动，避开右下角发送按钮。
+                // 默认关闭，仅在设置页开启后显示。
+                if (_zoomControlsEnabled && !_pageLoading && _pageError == null)
+                  _buildZoomControls(context, stackHeight),
+                // 相机入口浮动按钮：对话区左侧靠屏幕边，可拖拽上下移动，默认开启。
+                if (_photoControlsEnabled &&
+                    !_pageLoading &&
+                    _pageError == null)
+                  _buildPhotoControls(context, stackHeight),
+              ],
+            );
+          },
         );
       case TunnelStatus.disconnected:
         return Center(
@@ -1290,18 +1318,18 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 自定义浮动缩放控件：定位在**左侧**、竖排，替代原生右下角
   /// 缩放控件（后者固定右下、常覆盖发送按钮）。
   ///
-  /// 位置可拖拽自由上下移动（归一化 0~1，默认屏幕中央）；按钮背景透明，
-  /// 尽量少遮挡页面内容。
-  Widget _buildZoomControls(BuildContext context) {
-    final screenHeight = MediaQuery.of(context).size.height;
+  /// 位置可拖拽自由上下移动（顶边像素坐标，默认屏幕中央）；按钮背景透明，
+  /// 尽量少遮挡页面内容。stackHeight 为对话区 Stack 实际高度。
+  Widget _buildZoomControls(BuildContext context, double stackHeight) {
     return Positioned(
       left: 6,
-      top: _zoomControlsDy * screenHeight,
+      top: _zoomControlsTop,
       child: GestureDetector(
         // opaque：占满命中区域以便捕获拖拽；纯点击仍透传给内部按钮
         behavior: HitTestBehavior.opaque,
-        onPanStart: _onZoomControlsPanStart,
-        onPanUpdate: _onZoomControlsPanUpdate,
+        onPanStart: (details) => _onZoomControlsPanStart(details, stackHeight),
+        onPanUpdate: (details) =>
+            _onZoomControlsPanUpdate(details, stackHeight),
         child: Material(
           color: Colors.transparent,
           child: Column(
@@ -1342,8 +1370,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 照明度（小时级连续的朔望周期 29.53 天）与盘面朝向（亮缘位置角 + 观测者
   /// 纬度/经度/时角决定的旋转，月出月落可见亮面旋转），满月最亮、新月留微光，
   /// 让用户一眼注意到视觉工具入口；默认开启，设置页可关。
-  Widget _buildPhotoControls(BuildContext context) {
-    final screenHeight = MediaQuery.of(context).size.height;
+  Widget _buildPhotoControls(BuildContext context, double stackHeight) {
     final now = DateTime.now();
     // 真实月球观测：绝对时间（UTC）+ 当前生效的观测位置（默认北京/手动/GPS，
     // 设置页可改；observer 变化会触发本方法重建）。
@@ -1352,12 +1379,13 @@ class _WebViewScreenState extends State<WebViewScreen>
     final borderColor = const Color(0xFF64B5F6);
     return Positioned(
       left: 6,
-      top: _photoControlsDy * screenHeight,
+      top: _photoControlsTop,
       // 可拖拽自由上下移动：占满命中区域捕获拖拽，点击透传给内部相机按钮
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onPanStart: _onPhotoControlsPanStart,
-        onPanUpdate: _onPhotoControlsPanUpdate,
+        onPanStart: (details) => _onPhotoControlsPanStart(details, stackHeight),
+        onPanUpdate: (details) =>
+            _onPhotoControlsPanUpdate(details, stackHeight),
         child: SizedBox(
           width: 48,
           height: 48,
@@ -1381,28 +1409,28 @@ class _WebViewScreenState extends State<WebViewScreen>
               ],
             ),
             child: CustomPaint(
-            painter: MoonPhasePainter(obs.phase01, obs.tiltDeg),
-            child: Center(
-              child: IconButton(
-                tooltip: '添加图片/拍照（视觉工具）·${obs.name}'
-                    '·照明 ${(lit * 100).round()}%'
-                    '·农历${_lunarDay(now)}'
-                    '·观测${MoonLocation.observerLabel}',
-                icon: Icon(
-                  Icons.camera_alt_outlined,
-                  color: lit >= 0.5
-                      ? const Color(0xFF1565C0) // 亮面：深蓝图标
-                      : Colors.white, // 暗面：白色图标
+              painter: MoonPhasePainter(obs.phase01, obs.tiltDeg),
+              child: Center(
+                child: IconButton(
+                  tooltip: '添加图片/拍照（视觉工具）·${obs.name}'
+                      '·照明 ${(lit * 100).round()}%'
+                      '·农历${_lunarDay(now)}'
+                      '·观测${MoonLocation.observerLabel}',
+                  icon: Icon(
+                    Icons.camera_alt_outlined,
+                    color: lit >= 0.5
+                        ? const Color(0xFF1565C0) // 亮面：深蓝图标
+                        : Colors.white, // 暗面：白色图标
+                  ),
+                  iconSize: 22,
+                  visualDensity: VisualDensity.compact,
+                  onPressed: _pickAndSendImage,
                 ),
-                iconSize: 22,
-                visualDensity: VisualDensity.compact,
-                onPressed: _pickAndSendImage,
               ),
             ),
           ),
         ),
       ),
-    ),
     );
   }
 
@@ -1417,7 +1445,6 @@ class _WebViewScreenState extends State<WebViewScreen>
       return 15;
     }
   }
-
 }
 
 /// 顶部实例切换器的展示 Chip：实例标签 + 连接状态点。
@@ -1452,5 +1479,3 @@ class _InstanceChip extends StatelessWidget {
     );
   }
 }
-
-
