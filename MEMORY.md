@@ -57,3 +57,13 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 - **静态分析**：`flutter analyze`（项目根目录）。分析单文件：`flutter analyze lib/webview_screen.dart`。
 - **构建 APK**：`flutter build apk --release`，产物 `build/app/outputs/flutter-apk/app-release.apk`。
 - 改完代码后先 `flutter analyze` 确认无报错再提交。
+
+---
+
+## 质量整改记录（2026-09 体检整改，commit 2360f85）
+
+- **主机密钥 TOFU**：`tunnel_service.dart` 不再无条件信任主机密钥。指纹按 `host:port+算法` 存 SharedPreferences（键 `ssh_hostkey_*`）；首次记录、后续比对、不匹配拒绝并提示。服务器重装/换密钥后：设置页「清除指纹」按钮（`TunnelService.clearHostKeyFingerprints()`）清除后重新记录。
+- **明文流量**：`AndroidManifest.xml` 移除全局 `usesCleartextTraffic="true"`，改用 `res/xml/network_security_config.xml` 仅对 `127.0.0.1`/`localhost` 放行明文（SSH 隧道 WebView 访问）。
+- **APK 不再提交 Git**：`apk/` 已入 `.gitignore`，历史版本上传 GitHub Releases；本地构建产物仍为 `build/app/outputs/flutter-apk/app-release.apk`。
+- **测试与 CI**：`test/` 有 4 个单元测试（artifact_recognizer / moon_astronomy / config / download）；`.github/workflows/ci.yml` 跑 analyze+test（Flutter 3.27.0/stable 矩阵），打 tag 自动构建 APK 并上传 Releases。
+- **版本号**：界面展示版本统一读 `SSHConfig.appVersion`（`lib/config.dart`），发版时与 `pubspec.yaml` 的 `version` 同步改。
