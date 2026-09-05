@@ -426,7 +426,7 @@ class _SetupScreenState extends State<SetupScreen> {
   /// 清除已保存的主机密钥指纹（TOFU）：服务器重装/更换密钥后使用，
   /// 避免"指纹不匹配"拒绝连接无法恢复。
   Future<void> _clearHostKeys() async {
-    await TunnelService.instance.clearHostKeyFingerprints();
+    await TunnelService.clearHostKeyFingerprints();
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('已清除主机密钥指纹，下次连接将重新记录')),
