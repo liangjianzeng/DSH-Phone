@@ -51,6 +51,9 @@ crash_logcat.txt
 crash_startup.txt
 test_artifacts/
 
+# 构建产物 APK（历史版本请上传 GitHub Releases，不提交进 Git）
+apk/
+
 # 签名密钥（含密码，绝不提交）
 /android/key.properties
 /android/key.jks

@@ -11,6 +11,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 class SSHConfig {
   // ============ 常量 ============
 
+  /// 应用显示版本号（用于"关于"对话框等界面展示）。
+  /// 发版时与 pubspec.yaml 的 version 同步更新。
+  static const String appVersion = 'v0.1.8';
+
   /// 最多支持的 SSH 实例数量。
   static const int maxProfiles = 3;
 

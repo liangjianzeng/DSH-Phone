@@ -6,7 +6,7 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 
 - **开源地址**：https://github.com/liangjianzeng/DSH-Phone
 - **当前版本**：v0.1.8（build 14）
-- **安装包**：最新构建产物见 `build/app/outputs/flutter-apk/app-release.apk`（历史版本 [`apk/DSH-Phone-v0.1.8.apk`](apk/DSH-Phone-v0.1.8.apk)、[`apk/DSH-Phone-v0.1.7.apk`](apk/DSH-Phone-v0.1.7.apk)、[`apk/DSH-Phone-v0.1.6.apk`](apk/DSH-Phone-v0.1.6.apk)、[`apk/DSH-Phone-v0.1.3.apk`](apk/DSH-Phone-v0.1.3.apk)、[`apk/DSH-Phone-v0.1.2.apk`](apk/DSH-Phone-v0.1.2.apk)、[`apk/DSH-Phone-v0.1.1.apk`](apk/DSH-Phone-v0.1.1.apk)）
+- **安装包**：最新构建产物见 `build/app/outputs/flutter-apk/app-release.apk`；历史版本请在 **GitHub Releases** 下载（仓库不再提交 APK 二进制）。
 
 ## 工作原理
 
@@ -89,7 +89,7 @@ flutter pub run flutter_launcher_icons   # 从 icon/logo.png 生成启动图标
 flutter build apk --release
 ```
 
-产物：`build/app/outputs/flutter-apk/app-release.apk`
+产物：`build/app/outputs/flutter-apk/app-release.apk`（发版时上传 GitHub Releases，仓库不提交 APK 二进制）
 
 ### 使用
 
@@ -124,15 +124,20 @@ flutter build apk --release
 lib/
 ├── main.dart                 # 应用入口：主题/全屏、首次启动判断
 ├── config.dart               # SSH 配置模型 + 持久化（最多 3 路实例 / 加载超时 / DSH 访问 Token / 旧配置迁移）
-├── tunnel_service.dart       # SSH 隧道服务（认证 / 转发 / 保活 / 断线重连 / SFTP 读取 / 路径解析）
+├── tunnel_service.dart       # SSH 隧道服务（认证 / 转发 / 保活 / 断线重连 / SFTP 读取 / 路径解析 / 主机密钥 TOFU）
 ├── setup_screen.dart         # 设置 / 首次引导页（实例编辑 / 超时 / 界面控制 / 关于）
 ├── webview_screen.dart       # WebView 主界面（实例切换 / 缓存 / 缩放 / 成果识别桥 / 路由）
+├── webview_bridges.dart      # WebView 注入的 JS 桥脚本常量（成果点击 / 任务状态 / 图片直传）
 ├── host_monitor.dart         # 主机监控（10 分钟趋势采样 / 环形缓冲 / 趋势绘制）
 ├── artifact_recognizer.dart  # 成果类型识别（markdown/html/代码/文件/资源）
 ├── artifact_viewer_screen.dart # 成果原生查看器（md/html/代码渲染 + 另存为）
 ├── download_manager.dart     # 会话级下载管理（断点续传 / 暂停 / 取消）
 ├── download_screen.dart      # 资源下载页（进度 / 暂停继续 / 另存为）
 ├── unsloth_screen.dart       # Unsloth Studio 页面（独立 WebView / 缓存刷新 / 自动登录）
+├── moon_astronomy.dart       # 真实月球观测计算（Meeus 算法：相位/照明度/盘面朝向）
+├── moon_location.dart        # 观测位置解析（默认北京 / 手动经纬度 / GPS）
+├── moon_painter.dart         # 月相盘面 CustomPainter（明暗界线椭圆画法）
+├── task_notifier.dart        # AI 任务进行中/完成系统通知（锁屏可见）
 └── foreground_service.dart   # 前台服务保活封装（隧道连接期间后台保持进程/网络）
 third_party/dartssh2/                 # 本地 fork 的 dartssh2（吞吐优化 + SFTP 会话释放）
 third_party/flutter_foreground_task/  # 本地 fork 的 flutter_foreground_task（AGP 8.x namespace 兼容）

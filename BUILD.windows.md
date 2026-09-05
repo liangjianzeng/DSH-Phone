@@ -20,8 +20,8 @@
 & 'C:\dev-tools\flutter\bin\flutter.bat' analyze lib
 # 4. 构建 release APK
 & 'C:\dev-tools\flutter\bin\flutter.bat' build apk --release
-# 5. 拷贝产物
-Copy-Item build/app/outputs/flutter-apk/app-release.apk apk/DSH-Phone-v0.1.2.apk
+# 5. 发版：上传 build/app/outputs/flutter-apk/app-release.apk 到 GitHub Releases
+#    （历史版本不再提交进 Git，apk/ 已被 .gitignore 忽略）
 ```
 
 ## 关键构建配置（Windows 特有）

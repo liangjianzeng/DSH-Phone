@@ -423,6 +423,16 @@ class _SetupScreenState extends State<SetupScreen> {
     }
   }
 
+  /// 清除已保存的主机密钥指纹（TOFU）：服务器重装/更换密钥后使用，
+  /// 避免"指纹不匹配"拒绝连接无法恢复。
+  Future<void> _clearHostKeys() async {
+    await TunnelService.instance.clearHostKeyFingerprints();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('已清除主机密钥指纹，下次连接将重新记录')),
+    );
+  }
+
   Future<void> _save() async {
     // 自动保存模式下，表单已随编辑落盘；这里仅做校验 + 提交动作
     // （首次启动根页面通知父级 / 编辑页返回并重连）。
@@ -570,7 +580,7 @@ class _SetupScreenState extends State<SetupScreen> {
             obscureText: _obscureToken,
             decoration: InputDecoration(
               labelText: 'DSH 访问 Token（可选）',
-              hintText: '如 WKmvWqjUHFpJXhJd8gbnV7Tm8TQXSyp5L8wwEzgImsg',
+              hintText: '粘贴 DSH 访问 Token（留空则不启用）',
               helperText: '新版 DSH(≥0.1.2) 启用 token 鉴权，首次访问需携带；'
                   '换取 30 天签名 cookie 后免 token，过期需重新填写',
               border: const OutlineInputBorder(),
@@ -768,6 +778,14 @@ class _SetupScreenState extends State<SetupScreen> {
                   onPressed: _saving ? null : _testConnection,
                   icon: const Icon(Icons.wifi_tethering),
                   label: Text(_saving ? '测试中…' : '测试连接'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: _saving ? null : _clearHostKeys,
+                  icon: const Icon(Icons.security),
+                  label: const Text('清除指纹'),
                 ),
               ),
             ],
@@ -1048,7 +1066,7 @@ class _SetupScreenState extends State<SetupScreen> {
               ListTile(
                 leading: const Icon(Icons.info_outline),
                 title: const Text('版本'),
-                subtitle: const Text('DSH-Phone v0.1.8'),
+                subtitle: Text('DSH-Phone ${SSHConfig.appVersion}'),
                 trailing: const Icon(Icons.chevron_right),
                 onTap: _showAbout,
               ),
@@ -1101,9 +1119,9 @@ class _SetupScreenState extends State<SetupScreen> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('关于 DSH-Phone'),
-        content: const SingleChildScrollView(
+        content: SingleChildScrollView(
           child: Text(
-            'DSH-Phone v0.1.8\n\n'
+            'DSH-Phone ${SSHConfig.appVersion}\n\n'
             '一个在 Android 上通过 SSH 隧道访问 DeepSeek Harness Web UI 的客户端。\n\n'
             '工作原理：\n'
             '• 应用内置 dartssh2 建立 SSH 隧道\n'

@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:charset/charset.dart' show Charset, gbk;
 import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:dartssh2/dartssh2.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'config.dart';
 import 'foreground_service.dart';
@@ -59,6 +60,9 @@ class TunnelService {
   ServerSocket? _server;
   bool _connecting = false;
 
+  /// 主机密钥指纹不匹配标志：连接失败时用于追加明确提示。
+  bool _hostKeyMismatch = false;
+
   /// 当前激活（已连接/正在连接）的实例索引，null 表示无。
   int? _activeProfileIndex;
   int? get activeProfileIndex => _activeProfileIndex;
@@ -94,6 +98,8 @@ class TunnelService {
     if (_status == TunnelStatus.connected) return;
 
     _connecting = true;
+    // 每次新连接重置主机密钥不匹配标志（仅主连接路径消费该提示）
+    _hostKeyMismatch = false;
     try {
       await _disconnectInternal();
 
@@ -120,8 +126,9 @@ class TunnelService {
             config.useKey ? null : () async => config.password,
         // SSH 保活：每 10s 发一次 keep-alive，降低移动网络空闲断连概率
         keepAliveInterval: const Duration(seconds: 10),
-        // 信任用户自建的主机（手机端无 known_hosts）
-        onVerifyHostKey: (hostkeyType, fingerprint) => true,
+        // 主机密钥 TOFU：首次记录指纹，后续比对（见 _verifyHostKey）
+        onVerifyHostKey: (hostkeyType, fingerprint) =>
+            _verifyHostKey(config, hostkeyType, fingerprint),
       );
 
       _client = client;
@@ -168,6 +175,11 @@ class TunnelService {
       _setStatus(TunnelStatus.connected);
     } catch (e) {
       debugPrint('[DSH] connect failed: $e');
+      if (_hostKeyMismatch) {
+        _hostKeyMismatch = false;
+        throw SocketException('主机密钥指纹与上次不一致，已拒绝连接。'
+            '若为服务器重装/更换密钥，请确认后清除保存的指纹再试。');
+      }
       rethrow;
     } finally {
       _connecting = false;
@@ -196,7 +208,8 @@ class TunnelService {
         identities: identities,
         onPasswordRequest: config.useKey ? null : () async => config.password,
         keepAliveInterval: const Duration(seconds: 10),
-        onVerifyHostKey: (hostkeyType, fingerprint) => true,
+        onVerifyHostKey: (hostkeyType, fingerprint) =>
+            _verifyHostKey(config, hostkeyType, fingerprint),
       );
       await client.authenticated
           .timeout(const Duration(seconds: 20), onTimeout: () {
@@ -417,6 +430,61 @@ class TunnelService {
     }
   }
 
+  /// 主机密钥 TOFU（Trust On First Use）校验。
+  ///
+  /// 首次连接某 `host:port` 时记录其密钥指纹；后续连接比对指纹，
+  /// 一致则信任，不一致则拒绝（防止中间人替换主机密钥）。
+  /// 指纹按 `host:port + 算法类型` 分别持久化，互不干扰。
+  ///
+  /// 返回 true 表示信任（首次连接时同时完成记录）；false 表示拒绝。
+  Future<bool> _verifyHostKey(
+      SSHConfig config, String hostkeyType, Uint8List fingerprint) async {
+    final key = 'ssh_hostkey_${config.host}_${config.sshPort}_$hostkeyType';
+    final hex =
+        fingerprint.map((b) => b.toRadixString(16).padLeft(2, '0')).join(':');
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getString(key);
+      if (saved == null) {
+        // 首次连接：记录指纹并信任（TOFU 首连假设）
+        await prefs.setString(key, hex);
+        debugPrint('[DSH] host key first-seen for $key, recorded '
+            'fingerprint=$hex');
+        return true;
+      }
+      if (saved == hex) {
+        return true;
+      }
+      // 指纹变化：拒绝连接并提示（可能是中间人，也可能是服务器重装）
+      debugPrint('[DSH] host key MISMATCH for $key: '
+          'saved=$saved current=$hex');
+      _hostKeyMismatch = true;
+      return false;
+    } catch (e) {
+      // 存储异常时退回"信任"以保持可用性，但记录日志便于排查
+      debugPrint('[DSH] host key store unavailable, fallback trust: $e');
+      return true;
+    }
+  }
+
+  /// 清除全部已保存的主机密钥指纹（TOFU 记录）。
+  ///
+  /// 服务器重装/更换密钥导致指纹不匹配时调用，清除后下次连接重新记录。
+  static Future<void> clearHostKeyFingerprints() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final keys = prefs.getKeys()
+          .where((k) => k.startsWith('ssh_hostkey_'))
+          .toList();
+      for (final k in keys) {
+        await prefs.remove(k);
+      }
+      debugPrint('[DSH] cleared ${keys.length} host key fingerprint(s)');
+    } catch (e) {
+      debugPrint('[DSH] clear host key fingerprints failed: $e');
+    }
+  }
+
   /// 健壮解码：先自动检测编码（UTF-8 → GBK/GB2312 → ASCII），
   /// 检测/解码异常时兜底 UTF-8 宽松解码，避免返回空导致白屏。
   String _decodeBytes(Uint8List bytes) {
@@ -623,7 +691,8 @@ class TunnelService {
         identities: identities,
         onPasswordRequest: config.useKey ? null : () async => config.password,
         keepAliveInterval: const Duration(seconds: 10),
-        onVerifyHostKey: (hostkeyType, fingerprint) => true,
+        onVerifyHostKey: (hostkeyType, fingerprint) =>
+            _verifyHostKey(config, hostkeyType, fingerprint),
       );
       _unslothClient = client;
       client.done.then(
@@ -765,7 +834,8 @@ class TunnelService {
         identities: identities,
         onPasswordRequest: config.useKey ? null : () async => config.password,
         keepAliveInterval: const Duration(seconds: 10),
-        onVerifyHostKey: (hostkeyType, fingerprint) => true,
+        onVerifyHostKey: (hostkeyType, fingerprint) =>
+            _verifyHostKey(config, hostkeyType, fingerprint),
       );
       _monitorClient = client;
       client.done.then(
