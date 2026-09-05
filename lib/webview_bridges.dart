@@ -65,14 +65,49 @@ const String artifactBridgeJs = r'''
   // 在整个文档中查找 file-mention 按钮（"产物"chips，title 存完整路径），
   // 返回其 title（完整路径）。用于把对话里"文件名文本"（表格单元格/代码块）
   // 解析成产物路径：文件名是 DSH 产物时，chips 里必有对应按钮。
+  // 取元素的远端路径候选：title / aria-label / data-* 路径属性。
+  // 放宽对 chips 渲染形式的依赖：DSH 可能把产物渲染成 button/a/span 或带
+  // data-file-path 等属性的元素，统一由这里取路径。
+  function elementPath(el) {
+    var t = el.getAttribute('title');
+    if (t) return t;
+    var a = el.getAttribute('aria-label');
+    if (a) return a;
+    var d = el.getAttribute('data-file-path') ||
+            el.getAttribute('data-remote-path') ||
+            el.getAttribute('data-path');
+    if (d) return d;
+    return '';
+  }
+
+  // 路径形似判断：含路径分隔符，或形如盘符/家目录，避开普通文本与 tooltip。
+  function looksLikePath(p) {
+    return /\\/.test(p) || p.indexOf('/') >= 0 ||
+           /^[a-zA-Z]:\//.test(p) ||
+           p === '~' || p.startsWith('~') || p.startsWith('.');
+  }
+
+  // 是否为产物 chip：className 含 fileMention，或带显式路径 data 属性。
+  function isChipLike(el) {
+    var cls = (el.className || '');
+    if (typeof cls === 'string' && cls.indexOf('fileMention') >= 0) return true;
+    return !!el.getAttribute('data-file-path') ||
+           !!el.getAttribute('data-remote-path') ||
+           !!el.getAttribute('data-path');
+  }
+
+  // 在整个文档中查找 file-mention chip（不限于 button，兼容 a/span/data-*），
+  // 返回其完整路径（title/aria-label/data-*）。
   function findMentionPath(filename) {
-    var buttons = document.querySelectorAll('button');
-    for (var i = 0; i < buttons.length; i++) {
-      var b = buttons[i];
-      var title = b.getAttribute('title') || '';
-      if (!title) continue;
-      var base = title.split(/[\\/]+/).pop() || '';
-      if (base === filename) return title;
+    var els = document.querySelectorAll(
+        'button, a, span, [data-file-path], [data-remote-path], [data-path]');
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      var p = elementPath(el);
+      if (!p) continue;
+      var lastSep = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+      var base = lastSep >= 0 ? p.substring(lastSep + 1) : p;
+      if (base === filename) return p;
     }
     return '';
   }
@@ -81,13 +116,14 @@ const String artifactBridgeJs = r'''
   // 反查不到路径时（chips 被隐藏），用目录 + 文件名拼接候选路径。
   function collectProducedDirs() {
     var dirs = [];
-    var buttons = document.querySelectorAll('button');
-    for (var i = 0; i < buttons.length; i++) {
-      var title = buttons[i].getAttribute('title') || '';
-      if (!title) continue;
-      var at = Math.max(title.lastIndexOf('/'), title.lastIndexOf('\\'));
+    var els = document.querySelectorAll(
+        'button, a, span, [data-file-path], [data-remote-path], [data-path]');
+    for (var i = 0; i < els.length; i++) {
+      var p = elementPath(els[i]);
+      if (!p) continue;
+      var at = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
       if (at > 0) {
-        var dir = title.slice(0, at);
+        var dir = p.slice(0, at);
         if (dirs.indexOf(dir) < 0) dirs.push(dir);
       }
     }
@@ -137,12 +173,12 @@ const String artifactBridgeJs = r'''
     //    <button class="_fileMention_*" title="云端路径">文件名</button>，
     //    云端路径在 title/aria-label 里，须先于代码块检测。
     //    资源类按钮同样以路径形式存在，这里放宽：路径带资源/可查看后缀即拦截。
-    var mention = closestUp(t, ['button']);
+    var mention = closestUp(t, ['button', 'a', 'span', '[data-file-path]', '[data-remote-path]', '[data-path]']);
     if (mention) {
       var cls = mention.className || '';
       var title = mention.getAttribute('title') || '';
       var label = mention.getAttribute('aria-label') || '';
-      var filePath = title || label || '';
+      var filePath = elementPath(mention) || title || label || '';
       var isMention = cls.indexOf('fileMention') >= 0 ||
           /\.(md|markdown|html|htm|txt|json|csv|apk|zip|tar|gz|tgz|rar|7z|xz|bin|exe|msi|dmg|iso|img|mp4|mp3|pdf|png|jpg|jpeg|gif|webp|svg|doc|docx|xls|xlsx|ppt|pptx|so|a|dll)(\?|#|$)/i.test(filePath);
       if (isMention && filePath) {
@@ -190,6 +226,35 @@ const String artifactBridgeJs = r'''
       if (m) lang = m[1];
       send({type: 'code', url: '', language: lang, content: text});
       return;
+    }
+
+    // 4) 正文纯文本路径：命中 p/span/td/li 等正文容器，内容形似单个
+    //    资源/文件路径（含路径分隔符，或为 chips 文件名）时，按资源/文件处理。
+    //    这是"对话里模型写下的下载路径/目录"点击可下载的关键兜底（chips 未必存在）。
+    var body = closestUp(t, ['p', 'span', 'td', 'li']);
+    if (body && !isChipLike(body)) {
+      var raw = (body.innerText || body.textContent || '').trim();
+      var plainSingle = raw.indexOf('\n') < 0 && raw.indexOf('\r') < 0 && raw.length > 0;
+      if (plainSingle) {
+        var lastBack = raw.lastIndexOf('\\');
+        var lastSlash = raw.lastIndexOf('/');
+        var lastSep = Math.max(lastBack, lastSlash);
+        var bodyBase = lastSep >= 0 ? raw.substring(lastSep + 1) : raw;
+        var bodyMention = bodyBase ? findMentionPath(bodyBase) : '';
+        var bodyPath = bodyMention || raw;
+        var suffixes = ['.md', '.html', '.htm', '.txt', '.json', '.csv', '.apk', '.zip', '.tar', '.gz', '.tgz', '.rar', '.7z', '.xz', '.bin', '.exe', '.msi', '.dmg', '.iso', '.img', '.mp4', '.mp3', '.pdf', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.so', '.a', '.dll'];
+        // 形似路径：含反斜杠、以 / 开头的绝对路径、~，或无空格且带已知后缀。
+        var looksPath = raw.indexOf('\\') >= 0 || raw.indexOf('/') === 0 ||
+            raw === '~' ||
+            (raw.indexOf(' ') < 0 && suffixes.some(function(s) { return raw.toLowerCase().endsWith(s); }));
+        if (looksPath) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          var isResource = isResourceSuffix.test(bodyPath);
+          send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: bodyPath, dirs: collectProducedDirs()});
+          return;
+        }
+      }
     }
 
     // 3) Markdown 成果：仅显式标记容器，避免误报
@@ -329,4 +394,4 @@ const String photoBridgeJs = r'''
     }
   };
 })();
-''';
+''';
