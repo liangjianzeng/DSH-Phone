@@ -5,8 +5,10 @@
 DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 用户名 / 认证方式（SSH 密钥或密码），应用自动建立 SSH 隧道（`127.0.0.1:<localPort>` → 远程 `127.0.0.1:3080`），并通过 WebView 加载 DSH Web UI。内置本地缓存加速、SSH 保活、界面缩放与全屏显示、主题自适应，以及手动修改连接配置 / 刷新缓存 / 查看关于的入口。
 
 - **开源地址**：https://github.com/liangjianzeng/DSH-Phone
-- **当前版本**：v0.1.8（build 14）
+- **当前版本**：v0.1.9（build 15）
 - **安装包**：最新构建产物见 `build/app/outputs/flutter-apk/app-release.apk`；历史版本请在 **GitHub Releases** 下载（仓库不再提交 APK 二进制）。
+
+<!-- 发版检查清单：1) pubspec.yaml 的 version（唯一版本来源，构建 versionName/versionCode）；2) 同步下方「当前版本」；3) lib/config.dart 的 fallbackAppVersion 仅作读取失败兜底，正常 release 自动读取构建版本无需改；4) 打 tag 触发 CI 构建 Releases。 -->
 
 ## 工作原理
 
@@ -56,6 +58,7 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - 🔍 **界面缩放**：双指缩放 + 顶栏/设置页 放大、缩小、重置；缩放比例**自动保存**，下次沿用。
 - 🎛️ **对话区缩放控件开关**：对话区左侧的放大/缩小/重置浮动按钮默认隐藏，可在设置 → 界面设置中一键开启，避免遮挡内容。
 - 📷 **图片直传（视觉工具入口）**：对话区左侧**淡蓝色圆形发光相机按钮**，一眼即可识别视觉能力；点击拍照/相册选图，自动压缩（≤4096px / 90% 质量）后直传 DSH 消息输入窗口附件槽，支持 png/jpeg/webp/gif；默认开启，设置 → 界面设置可关。
+- 📤 **文件上传对话处理**：相机入口选择器新增「选择文件上传」——从手机本地选文件（浏览器/网盘等下载到手机的文件），经 SSH 隧道（SFTP）上传至服务器临时目录（自动探测 home 下 `dsh_phone_uploads/`），并把**服务器本地绝对路径**注入消息输入框；补充指令（如 `/home/u/dsh_phone_uploads/xxx.doc 请阅读后总结输出md`）发送后由云端模型处理，产物再经已有下载能力回传手机，形成"端侧上送 → 云端处理 → 结果下载"闭环；上传大小上限**默认 10M、可配置 1–30M**（设置 → 工具）。
 - 📄 **成果原生查看器**：点击对话中的成果（Markdown / HTML / 代码 / 文本文件）直接以原生渲染打开——Markdown 渲染、HTML 原生渲染、代码语法高亮，背景跟随深浅色主题；查看页状态栏提供**另存为**按钮，可随时保存到本机。
 - 💾 **编码自动检测**：通过 SFTP 读取云端文件，自动识别 UTF-8 / GBK（GB2312）/ ASCII，中文路径与内容不再乱码。
 - 📦 **资源下载（断点续传 + 另存为）**：点击 apk / 压缩包等二进制成果进入下载页，显示进度与大小；支持**暂停 / 继续（断点续传）**、取消、失败重试；下载完成弹窗提示，通过系统文件选择器（SAF）**选择保存位置**。
@@ -123,11 +126,11 @@ flutter build apk --release
 ```
 lib/
 ├── main.dart                 # 应用入口：主题/全屏、首次启动判断
-├── config.dart               # SSH 配置模型 + 持久化（最多 3 路实例 / 加载超时 / DSH 访问 Token / 旧配置迁移）
-├── tunnel_service.dart       # SSH 隧道服务（认证 / 转发 / 保活 / 断线重连 / SFTP 读取 / 路径解析 / 主机密钥 TOFU）
-├── setup_screen.dart         # 设置 / 首次引导页（实例编辑 / 超时 / 界面控制 / 关于）
-├── webview_screen.dart       # WebView 主界面（实例切换 / 缓存 / 缩放 / 成果识别桥 / 路由）
-├── webview_bridges.dart      # WebView 注入的 JS 桥脚本常量（成果点击 / 任务状态 / 图片直传）
+├── config.dart               # SSH 配置模型 + 持久化（最多 3 路实例 / 加载超时 / 上传大小上限 / DSH 访问 Token / 旧配置迁移）
+├── tunnel_service.dart       # SSH 隧道服务（认证 / 转发 / 保活 / 断线重连 / SFTP 读取与上传 / 路径解析 / 主机密钥 TOFU）
+├── setup_screen.dart         # 设置 / 首次引导页（实例编辑 / 超时 / 上传大小上限 / 界面控制 / 关于）
+├── webview_screen.dart       # WebView 主界面（实例切换 / 缓存 / 缩放 / 成果识别桥 / 文件上传注入 / 路由）
+├── webview_bridges.dart      # WebView 注入的 JS 桥脚本常量（成果点击 / 任务状态 / 图片直传 / 文本注入）
 ├── host_monitor.dart         # 主机监控（10 分钟趋势采样 / 环形缓冲 / 趋势绘制）
 ├── artifact_recognizer.dart  # 成果类型识别（markdown/html/代码/文件/资源）
 ├── artifact_viewer_screen.dart # 成果原生查看器（md/html/代码渲染 + 另存为）

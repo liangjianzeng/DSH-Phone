@@ -172,6 +172,12 @@ class _SetupScreenState extends State<SetupScreen> {
   late bool _resourceViewEnabled;
   late bool _resourceDownloadEnabled;
 
+  /// 文件上传大小上限（MB），默认 10，范围 1~30（全局配置）。
+  late int _uploadMaxMb;
+
+  /// 应用显示版本号（运行时从构建产物读取，异步加载后回填；默认兜底值先行）。
+  late String _appVersion;
+
   @override
   void initState() {
     super.initState();
@@ -187,7 +193,24 @@ class _SetupScreenState extends State<SetupScreen> {
     _hostMonitorEnabled = widget.hostMonitorEnabled;
     _resourceViewEnabled = widget.resourceViewEnabled;
     _resourceDownloadEnabled = widget.resourceDownloadEnabled;
+    _uploadMaxMb = SSHConfig.defaultUploadMaxMb;
+    _appVersion = SSHConfig.fallbackAppVersion;
     _loadFromProfile(_profileIndex);
+    _loadUploadLimit();
+    _loadAppVersion();
+  }
+
+  /// 异步加载应用版本号（"关于"对话框展示；单一来源为 pubspec.yaml 的
+  /// version，运行时经 package_info_plus 读取构建产物，避免手工同步遗漏）。
+  Future<void> _loadAppVersion() async {
+    final v = await SSHConfig.appVersion();
+    if (mounted) setState(() => _appVersion = v);
+  }
+
+  /// 异步加载全局"文件上传大小上限"（设置页独立路由，本地持有即时反映）。
+  Future<void> _loadUploadLimit() async {
+    final v = await SSHConfig.loadUploadMaxMb();
+    if (mounted) setState(() => _uploadMaxMb = v);
   }
 
   /// 把指定实例配置回填到表单控件。
@@ -262,6 +285,7 @@ class _SetupScreenState extends State<SetupScreen> {
   Future<void> _persistCurrent() async {
     await SSHConfig.saveProfile(_profileIndex, _buildConfig());
     await SSHConfig.saveTimeoutSeconds(_timeoutSeconds);
+    await SSHConfig.saveUploadMaxMb(_uploadMaxMb);
     // 首次配置时，若尚无激活实例则把当前编辑实例设为激活
     if (widget.profileIndex == _profileIndex ||
         !(await SSHConfig.loadActive()).isConfigured) {
@@ -842,6 +866,36 @@ class _SetupScreenState extends State<SetupScreen> {
           style: const TextStyle(fontSize: 12, color: Colors.grey),
         ),
         const Divider(),
+        const Text('文件上传大小上限', style: TextStyle(fontSize: 16)),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                '选择文件上传的大小上限（MB）：$_uploadMaxMb',
+                style: const TextStyle(fontSize: 14),
+              ),
+            ),
+            const Text('默认 10 · 最大 30',
+                style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ],
+        ),
+        Slider(
+          value: _uploadMaxMb.toDouble(),
+          min: SSHConfig.minUploadMaxMb.toDouble(),
+          max: SSHConfig.maxUploadMaxMb.toDouble(),
+          divisions: 29,
+          label: '$_uploadMaxMb MB',
+          onChanged: (v) {
+            setState(() => _uploadMaxMb = v.round());
+            _scheduleAutoSave();
+          },
+        ),
+        Text(
+          '文件经 SSH 隧道上传到服务器临时目录时，超过该大小会被拒绝。',
+          style: const TextStyle(fontSize: 12, color: Colors.grey),
+        ),
+        const Divider(),
         // 主机监控：默认开启，关闭则不请求不呈现
         SwitchListTile(
           title: const Text('主机监控'),
@@ -1066,7 +1120,7 @@ class _SetupScreenState extends State<SetupScreen> {
               ListTile(
                 leading: const Icon(Icons.info_outline),
                 title: const Text('版本'),
-                subtitle: Text('DSH-Phone ${SSHConfig.appVersion}'),
+                subtitle: Text('DSH-Phone $_appVersion'),
                 trailing: const Icon(Icons.chevron_right),
                 onTap: _showAbout,
               ),
@@ -1121,7 +1175,7 @@ class _SetupScreenState extends State<SetupScreen> {
         title: const Text('关于 DSH-Phone'),
         content: SingleChildScrollView(
           child: Text(
-            'DSH-Phone ${SSHConfig.appVersion}\n\n'
+            'DSH-Phone $_appVersion\n\n'
             '一个在 Android 上通过 SSH 隧道访问 DeepSeek Harness Web UI 的客户端。\n\n'
             '工作原理：\n'
             '• 应用内置 dartssh2 建立 SSH 隧道\n'

@@ -67,6 +67,9 @@ class TunnelService {
   int? _activeProfileIndex;
   int? get activeProfileIndex => _activeProfileIndex;
 
+  /// 当前激活实例的配置（用于上传目录等需要用户名的回退策略）。
+  SSHConfig? _activeConfig;
+
   TunnelStatus _status = TunnelStatus.idle;
   TunnelStatus get status => _status;
 
@@ -132,6 +135,7 @@ class TunnelService {
       );
 
       _client = client;
+      _activeConfig = config;
 
       // 传输异常/断开时通知，并清理资源
       client.done.then(
@@ -236,6 +240,7 @@ class TunnelService {
         '(activeProfile=$_activeProfileIndex)');
     _client = null;
     _activeProfileIndex = null;
+    _activeConfig = null;
 
     final server = _server;
     _server = null;
@@ -427,6 +432,149 @@ class TunnelService {
       return null;
     } finally {
       await file.close();
+    }
+  }
+
+  // ================= 文件上传（端侧 → 服务器临时目录）================
+
+  /// 服务器临时上传目录名（建在服务器 home 目录下）。
+  static const String uploadDirName = 'dsh_phone_uploads';
+
+  /// 探测服务器 home 目录（用于拼接上传目录）。
+  ///
+  /// Linux 走 `cd ~ && pwd`；Windows 默认 cmd 走 `echo %USERPROFILE%`，
+  /// 若输出仍含 `%USERPROFILE%`（说明远程 shell 是 bash），回退 `cd` 打印
+  /// 当前目录。探测失败返回 null。
+  Future<String?> _detectHomeDir(SSHClient client) async {
+    final type = await _detectHostType(client);
+    if (type == HostType.windows) {
+      final out = await _execOn(client, 'echo %USERPROFILE%');
+      final t = (out ?? '').trim();
+      if (t.isNotEmpty && !t.contains('%USERPROFILE%')) {
+        return t.replaceAll(r'\', '/');
+      }
+      // bash 环境（%USERPROFILE% 未展开）或为空：回退 cd 打印当前目录
+      final cd = await _execOn(client, 'cd && cd');
+      final c = (cd ?? '').trim();
+      return c.isNotEmpty ? c.replaceAll(r'\', '/') : null;
+    }
+    final out = await _execOn(client, 'cd ~ && pwd');
+    final t = (out ?? '').trim();
+    return t.isNotEmpty ? t : null;
+  }
+
+  /// 确保服务器上传临时目录存在，返回可用目录路径（正斜杠，不带结尾分隔符）；
+  /// 失败返回 null。
+  ///
+  /// 目录策略：优先 `<home>/dsh_phone_uploads/`；home 探测失败时回退
+  /// `/tmp/dsh_phone_uploads/`（Linux）或 `C:/Users/<用户名>/dsh_phone_uploads/`
+  /// （Windows）。
+  Future<String?> ensureUploadDir() async {
+    final client = _client;
+    if (client == null) return null;
+    final candidates = <String>[];
+    final home = await _detectHomeDir(client);
+    if (home != null && home.isNotEmpty) {
+      candidates.add('$home/$uploadDirName');
+    }
+    final type = await _detectHostType(client);
+    if (type == HostType.windows) {
+      final u = _activeConfig?.username;
+      if (u != null && u.isNotEmpty) {
+        candidates.add('C:/Users/$u/$uploadDirName');
+      }
+    } else {
+      candidates.add('/tmp/$uploadDirName');
+    }
+    for (final dir in candidates) {
+      SftpClient? sftp;
+      try {
+        sftp = await client.sftp();
+        try {
+          await sftp.mkdir(dir);
+        } catch (e) {
+          // 目录可能已存在（SFTP mkdir 对已存在目录返回 failure）：
+          // stat 确认可访问，失败则换下一个候选。
+          await sftp.stat(dir);
+        }
+        debugPrint('[DSH] upload dir ready: $dir');
+        return dir;
+      } catch (e) {
+        debugPrint('[DSH] ensureUploadDir failed for "$dir": $e');
+        sftp?.close();
+      }
+    }
+    return null;
+  }
+
+  /// 清理文件名中的不安全字符（路径分隔符 / 控制字符），避免注入路径混淆。
+  static String _sanitizeFilename(String name) {
+    final base = name.replaceAll(RegExp(r'[\\/:\*\?"<>\|]'), '_');
+    return base.isEmpty ? 'upload.dat' : base;
+  }
+
+  /// 把本地文件字节上传到服务器临时目录，返回完整远程路径（正斜杠）；
+  /// 隧道未连接 / 上传失败返回 null。
+  ///
+  /// 文件名自动加时间戳防冲突并保留扩展名；SFTP 以 `write|create|truncate`
+  /// 打开后分块写入（fork 的 dartssh2 按 16KB 分块）。
+  Future<String?> uploadRemoteFile(
+    Uint8List bytes,
+    String filename, {
+    void Function(int sent, int total)? onProgress,
+  }) async {
+    final client = _client;
+    if (client == null || bytes.isEmpty) return null;
+    final dir = await ensureUploadDir();
+    if (dir == null) return null;
+
+    final safe = _sanitizeFilename(filename);
+    final dot = safe.lastIndexOf('.');
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final remoteName = dot > 0
+        ? '${safe.substring(0, dot)}.$stamp.${safe.substring(dot + 1)}'
+        : '$safe.$stamp';
+    final remotePath = '$dir/$remoteName';
+
+    try {
+      final sftp = await client.sftp();
+      try {
+        final file = await sftp.open(
+          remotePath,
+          mode: SftpFileOpenMode.write |
+              SftpFileOpenMode.create |
+              SftpFileOpenMode.truncate,
+        );
+        try {
+          // 流式分块写入（16KB 分块 + ack 流控），带真实进度回调；
+          // 大文件不一次性入 SFTP 包，避免慢网络下大包悬挂。
+          const chunk = 16 * 1024;
+          final chunks = <Uint8List>[];
+          for (var i = 0; i < bytes.length; i += chunk) {
+            chunks.add(Uint8List.sublistView(
+                bytes, i, i + chunk > bytes.length ? bytes.length : i + chunk));
+          }
+          final writer = file.write(
+            Stream.fromIterable(chunks),
+            onProgress: (total) =>
+                onProgress?.call(total, bytes.length),
+          );
+          await writer.done.timeout(
+            const Duration(minutes: 2),
+            onTimeout: () => throw TimeoutException('upload timeout'),
+          );
+          onProgress?.call(bytes.length, bytes.length);
+          debugPrint('[DSH] uploaded ${bytes.length} bytes -> $remotePath');
+        } finally {
+          await file.close(); // 顺带关闭所属 SFTP 会话
+        }
+      } finally {
+        sftp.close(); // 打开失败分支：释放会话通道，避免泄漏
+      }
+      return remotePath;
+    } catch (e) {
+      debugPrint('[DSH] uploadRemoteFile failed: $e');
+      return null;
     }
   }
 
@@ -781,6 +929,7 @@ class TunnelService {
     final client = _client;
     _client = null;
     _activeProfileIndex = null;
+    _activeConfig = null;
     if (client != null) {
       client.close();
     }

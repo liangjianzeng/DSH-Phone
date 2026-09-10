@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 0.1.8+14
+version: 0.1.9+15
 
 environment:
   sdk: ^3.6.0
@@ -54,6 +54,9 @@ dependencies:
   flutter_local_notifications: ^17.2.2
   # 观测者位置：月相按钮按真实纬度/经度计算盘面朝向（月出月落旋转）。
   geolocator: ^11.1.0
+  # 关于页版本号：运行时从构建产物读取（versionName/versionCode），
+  # 单一来源 = pubspec.yaml 的 version，避免手工维护多处版本号遗漏。
+  package_info_plus: ^8.0.0
 
 dependency_overrides:
   # 本地 fork 的 dartssh2：优化解密（processAll 批处理）+ 启用 zlib 压缩，

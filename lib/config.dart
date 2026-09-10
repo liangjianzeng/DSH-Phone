@@ -1,4 +1,5 @@
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// SSH 连接配置（单个实例）+ 持久化。
@@ -12,8 +13,25 @@ class SSHConfig {
   // ============ 常量 ============
 
   /// 应用显示版本号（用于"关于"对话框等界面展示）。
-  /// 发版时与 pubspec.yaml 的 version 同步更新。
-  static const String appVersion = 'v0.1.8';
+  ///
+  /// **单一来源 = `pubspec.yaml` 的 `version`**：运行时经 package_info_plus
+  /// 读取构建产物的 versionName/versionCode（如 `v0.1.9 (build 15)`），
+  /// 不再手工维护常量，避免发版时多处版本号漏改。
+  /// 读取失败时回退 [fallbackAppVersion]（发版时与该兜底值同步一次即可）。
+  static const String fallbackAppVersion = 'v0.1.9';
+
+  /// 异步读取当前构建的显示版本号（含 build 号）；失败回退常量。
+  static Future<String> appVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      final v = info.version.trim();
+      final b = info.buildNumber.trim();
+      if (v.isEmpty) return fallbackAppVersion;
+      return b.isNotEmpty ? 'v$v (build $b)' : 'v$v';
+    } catch (_) {
+      return fallbackAppVersion;
+    }
+  }
 
   /// 最多支持的 SSH 实例数量。
   static const int maxProfiles = 3;
@@ -30,6 +48,15 @@ class SSHConfig {
   /// Unsloth Studio 连接端口默认值。
   static const int defaultUnslothPort = 8888;
 
+  /// 文件上传大小上限（MB）默认值。
+  static const int defaultUploadMaxMb = 10;
+
+  /// 文件上传大小上限（MB）最大值。
+  static const int maxUploadMaxMb = 30;
+
+  /// 文件上传大小上限（MB）最小值。
+  static const int minUploadMaxMb = 1;
+
   // shared_preferences keys（旧单实例键名，用于迁移）
   static const String keyHost = 'host';
   static const String keySshPort = 'ssh_port';
@@ -41,6 +68,9 @@ class SSHConfig {
   // 激活实例 / 超时
   static const String keyActiveProfile = 'active_profile';
   static const String keyLoadTimeout = 'load_timeout_seconds';
+
+  // 文件上传大小上限（MB）
+  static const String keyUploadMaxMb = 'upload_file_max_mb';
 
   // 工具类功能开关
   static const String keyHostMonitor = 'host_monitor_enabled';
@@ -284,6 +314,23 @@ class SSHConfig {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(keyLoadTimeout,
         seconds.clamp(minTimeoutSeconds, maxTimeoutSeconds));
+  }
+
+  // ============ 文件上传大小上限 ============
+
+  /// 读取文件上传大小上限（MB），默认 [defaultUploadMaxMb]（10）。
+  static Future<int> loadUploadMaxMb() async {
+    final prefs = await SharedPreferences.getInstance();
+    final v = prefs.getInt(keyUploadMaxMb);
+    return (v == null || v < minUploadMaxMb) ? defaultUploadMaxMb : v;
+  }
+
+  /// 保存文件上传大小上限（MB），自动夹取在
+  /// [minUploadMaxMb]~[maxUploadMaxMb]。
+  static Future<void> saveUploadMaxMb(int mb) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(keyUploadMaxMb,
+        mb.clamp(minUploadMaxMb, maxUploadMaxMb));
   }
 
   // ============ 工具类功能开关 ============

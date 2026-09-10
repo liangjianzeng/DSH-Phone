@@ -394,4 +394,82 @@ const String photoBridgeJs = r'''
     }
   };
 })();
+''';
+
+/// 消息输入框文本注入桥：把文本（如上传后的远程文件路径）写入 DSH 消息输入框。
+///
+/// DSH 消息输入框可能是原生 textarea/input，也可能是 contenteditable 富文本
+/// 编辑器（ProseMirror/TipTap 类）。本桥多策略探测：
+/// 1. 可见的 textarea / input[type=text]：直接赋值 + 派发 input/change；
+/// 2. contenteditable：focus + `execCommand('insertText')`（保留编辑器内部
+///    结构与 undo 栈，框架监听 input 事件同步模型）；
+/// 3. 兜底：直接追加 textContent + 派发 input。
+/// 返回 `{ok, error}` 供 Flutter 侧提示。
+const String composerBridgeJs = r'''
+(function() {
+  function findComposer() {
+    // 策略 1：可见的 textarea / 文本类 input
+    var inputs = document.querySelectorAll(
+        'textarea, input[type="text"], input[type="search"], input[type="url"], input[type="email"]');
+    for (var i = 0; i < inputs.length; i++) {
+      var el = inputs[i];
+      if (el.offsetParent !== null) return el;
+    }
+    // 策略 2：contenteditable 富文本编辑器（含 contenteditable="plaintext-only"）
+    var editors = document.querySelectorAll('[contenteditable], [contenteditable="true"], [contenteditable="plaintext-only"]');
+    for (var j = 0; j < editors.length; j++) {
+      var ed = editors[j];
+      if (ed.offsetParent !== null) return ed;
+    }
+    return null;
+  }
+
+  function insertInto(el, text) {
+    try { el.focus(); } catch (e) {}
+    var tag = el.tagName ? el.tagName.toUpperCase() : '';
+
+    if (tag === 'TEXTAREA' || tag === 'INPUT') {
+      var start = el.selectionStart;
+      var end = el.selectionEnd;
+      var value = el.value || '';
+      el.value = value.substring(0, start) + text + value.substring(end);
+      // 光标移到插入文本末尾，便于用户继续补充指令
+      var pos = start + text.length;
+      try {
+        el.setSelectionRange(pos, pos);
+      } catch (e) {}
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true };
+    }
+
+    // contenteditable：execCommand 插入（保留编辑器状态与 undo）
+    var done = false;
+    try {
+      done = document.execCommand('insertText', false, text);
+    } catch (e) { done = false; }
+    if (done) {
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      return { ok: true };
+    }
+
+    // 兜底：直接追加文本
+    el.textContent = (el.textContent || '') + text;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    return { ok: true };
+  }
+
+  // 每次注入都重置桥对象（页面导航/DOM 重建后保持可用）
+  window.__dshComposerBridge = {
+    insertText: function(text) {
+      try {
+        var el = findComposer();
+        if (!el) return { ok: false, error: '未找到消息输入框' };
+        return insertInto(el, String(text));
+      } catch (e) {
+        return { ok: false, error: String(e) };
+      }
+    }
+  };
+})();
 ''';

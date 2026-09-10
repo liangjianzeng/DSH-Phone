@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:image_picker/image_picker.dart';
@@ -48,6 +49,9 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   // ---- 页面加载超时（秒），可配置，默认 60，最大 180 ----
   int _timeoutSeconds = SSHConfig.defaultTimeoutSeconds;
+
+  // ---- 文件上传大小上限（MB），可配置，默认 10，范围 1~30 ----
+  int _uploadMaxMb = SSHConfig.defaultUploadMaxMb;
 
   TunnelStatus _tunnelStatus = TunnelStatus.idle;
   String? _error;
@@ -391,12 +395,14 @@ class _WebViewScreenState extends State<WebViewScreen>
     final profiles = await SSHConfig.loadAllProfiles();
     final activeIndex = await SSHConfig.loadActiveIndex();
     final timeoutSeconds = await SSHConfig.loadTimeoutSeconds();
+    final uploadMaxMb = await SSHConfig.loadUploadMaxMb();
     if (!mounted) return;
     setState(() {
       _profiles = profiles;
       _activeIndex = activeIndex;
       _config = profiles[activeIndex];
       _timeoutSeconds = timeoutSeconds;
+      _uploadMaxMb = uploadMaxMb;
     });
     _setupMonitorProfile();
     _manualConnect();
@@ -710,6 +716,18 @@ class _WebViewScreenState extends State<WebViewScreen>
     c.evaluateJavascript(source: photoBridgeJs);
   }
 
+  /// 消息输入框文本注入桥：注入桥脚本（页面导航 DOM 重建后需重新注入）。
+  void _setupComposerBridge(InAppWebViewController controller) {
+    controller.evaluateJavascript(source: composerBridgeJs);
+  }
+
+  /// 页面导航后重新注入文本注入桥（每次导航 DOM 重建）。
+  void _injectComposerBridge() {
+    final c = _controller;
+    if (c == null) return;
+    c.evaluateJavascript(source: composerBridgeJs);
+  }
+
   // ================= 任务状态桥（熄屏通知）=================
 
   /// 注册任务状态 handler 并注入监听脚本。
@@ -744,12 +762,13 @@ class _WebViewScreenState extends State<WebViewScreen>
     c.evaluateJavascript(source: taskBridgeJs);
   }
 
-  /// 相机/相册选图 → base64 → 注入 DSH 消息输入窗口（附件槽）。
+  /// 相机/相册选图 → base64 → 注入 DSH 消息输入窗口（附件槽）；
+  /// 或选择本地文件 → SFTP 上传 → 注入远程路径文本。
   Future<void> _pickAndSendImage() async {
     final c = _controller;
     if (c == null) return;
-    // 选择来源：相册 / 拍照
-    final source = await showModalBottomSheet<ImageSource>(
+    // 选择来源：相册 / 拍照 / 选择文件上传
+    final source = await showModalBottomSheet<String>(
       context: context,
       builder: (_) => SafeArea(
         child: Column(
@@ -758,22 +777,32 @@ class _WebViewScreenState extends State<WebViewScreen>
             ListTile(
               leading: const Icon(Icons.photo_library_outlined),
               title: const Text('从相册选择'),
-              onTap: () => Navigator.pop(context, ImageSource.gallery),
+              onTap: () => Navigator.pop(context, 'gallery'),
             ),
             ListTile(
               leading: const Icon(Icons.camera_alt_outlined),
               title: const Text('拍照'),
-              onTap: () => Navigator.pop(context, ImageSource.camera),
+              onTap: () => Navigator.pop(context, 'camera'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.folder_open_outlined),
+              title: const Text('选择文件上传'),
+              subtitle: const Text('上传到服务器临时目录，路径注入消息框后补充指令'),
+              onTap: () => Navigator.pop(context, 'file'),
             ),
           ],
         ),
       ),
     );
     if (source == null) return;
+    if (source == 'file') {
+      await _pickAndSendFile();
+      return;
+    }
     final picker = ImagePicker();
     // 限制尺寸与质量：手机照片通常远小于 DSH 单图 20MB 上限，这里再压缩
     final file = await picker.pickImage(
-      source: source,
+      source: source == 'camera' ? ImageSource.camera : ImageSource.gallery,
       maxWidth: 4096,
       maxHeight: 4096,
       imageQuality: 90,
@@ -816,6 +845,102 @@ class _WebViewScreenState extends State<WebViewScreen>
     if (lower.endsWith('.webp')) return 'image/webp';
     if (lower.endsWith('.gif')) return 'image/gif';
     return null;
+  }
+
+  /// 提示 SnackBar（自动清空旧提示，避免叠加）。
+  void _snack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..clearSnackBars()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// 选择本地文件 → SFTP 上传到服务器临时目录 → 注入远程路径文本到消息框。
+  ///
+  /// 大小上限由设置页配置（默认 10M，1~30M）；上传期间显示进度框；
+  /// 成功后把服务器本地绝对路径注入消息输入框，用户补充指令后手动发送。
+  Future<void> _pickAndSendFile() async {
+    final c = _controller;
+    if (c == null) return;
+    if (TunnelService.instance.status != TunnelStatus.connected) {
+      _snack('请先连接 SSH 隧道，再选择文件上传');
+      return;
+    }
+    final result = await FilePicker.platform.pickFiles(withData: true);
+    if (result == null || result.files.isEmpty) return;
+    if (!mounted) return;
+    final picked = result.files.single;
+    final bytes = picked.bytes;
+    final name = picked.name.isNotEmpty ? picked.name : 'upload.dat';
+    if (bytes == null || bytes.isEmpty) {
+      _snack('无法读取所选文件（可能为空或不可读）');
+      return;
+    }
+    final maxBytes = _uploadMaxMb * 1024 * 1024;
+    if (bytes.length > maxBytes) {
+      _snack('文件 ${bytes.length ~/ (1024 * 1024)}MB 超过上传上限 '
+          '$_uploadMaxMb MB（可在设置 → 工具中调大）');
+      return;
+    }
+
+    // 上传进度：模态进度框（上传中不可关闭）
+    final progress = ValueNotifier<double>(0.0);
+    final progressText = ValueNotifier<String>('准备上传…');
+    final navigator = Navigator.of(context);
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => ValueListenableBuilder<double>(
+        valueListenable: progress,
+        builder: (_, value, __) => AlertDialog(
+          title: const Text('上传中…'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              LinearProgressIndicator(value: value),
+              const SizedBox(height: 12),
+              ValueListenableBuilder<String>(
+                valueListenable: progressText,
+                builder: (_, text, __) => Text(
+                  text,
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    String? remotePath;
+    try {
+      remotePath = await TunnelService.instance.uploadRemoteFile(
+        bytes,
+        name,
+        onProgress: (sent, total) {
+          progress.value = total > 0 ? sent / total : 0.0;
+          progressText.value = '$sent / $total 字节';
+        },
+      );
+    } finally {
+      navigator.pop(); // 关闭进度框
+    }
+
+    if (!mounted) return;
+    if (remotePath == null || remotePath.isEmpty) {
+      _snack('上传失败：隧道可能已断开或服务器拒绝写入');
+      return;
+    }
+
+    // 注入远程路径文本到消息输入框，用户补充指令后发送
+    final js = "window.__dshComposerBridge.insertText(${jsonEncode(remotePath)})";
+    final inject = await c.evaluateJavascript(source: js) as Object?;
+    if (!mounted) return;
+    if (inject is Map && inject['ok'] == false) {
+      _snack('路径注入失败：${inject['error'] ?? '未知错误'}');
+      return;
+    }
+    _snack('已上传：$remotePath\n路径已注入消息框，请补充指令后发送');
   }
 
   /// 页面加载完成后注入成果监听脚本（每次导航 DOM 重建后重新绑定）。
@@ -1172,6 +1297,7 @@ class _WebViewScreenState extends State<WebViewScreen>
                     _controller = controller;
                     _setupArtifactBridge(controller);
                     _setupPhotoBridge(controller);
+                    _setupComposerBridge(controller);
                     _setupTaskBridge(controller);
                   },
                   onLoadStart: (controller, url) => _onPageLoadStart(),
@@ -1185,6 +1311,8 @@ class _WebViewScreenState extends State<WebViewScreen>
                     _injectArtifactBridge();
                     // 每次页面导航后重新注入图片直传桥
                     _injectPhotoBridge();
+                    // 每次页面导航后重新注入文本注入桥
+                    _injectComposerBridge();
                     // 每次页面导航后重新注入任务状态桥，并复位可能残留的
                     // 「任务进行中」通知（桥会对齐当前状态，运行中会重新上报）。
                     _injectTaskBridge();
