@@ -37,6 +37,10 @@ class _VoiceInputDialogState extends State<VoiceInputDialog> {
   String? _error;
   String? _localeId; // zh 系识别区域，取系统第一个 zh_*；无则用默认
 
+  /// 本次 listen 的开始时刻：用于识别「启动即被拒」（ROM 侧识别服务
+  /// 麦克风授权不通，如 MIUI 小爱大脑 ASR）与「正常识别中途出错」。
+  DateTime? _listenStartedAt;
+
   @override
   void initState() {
     super.initState();
@@ -52,10 +56,24 @@ class _VoiceInputDialogState extends State<VoiceInputDialog> {
       ok = await _stt.initialize(
         onError: (e) {
           debugPrint('[DSH][voice] onError: ${e.errorMsg}');
-          // MIUI 等国产 ROM 的识别器怪癖：结果正常送达前后仍会补发
-          // error_permission/error_client 事件（服务自检误报）。
-          // 延迟判定：短期内若有转写文本到达则忽略该错误；只有始终
-          // 无文本才作为失败展示（并给出页面内语音的降级入口）。
+          // 「启动即被拒」：监听开始后极短时间内报权限/服务类错误且无任何
+          // 转写，说明 ROM 识别服务本身不可用（MIUI 小爱大脑 ASR 自身
+          // 麦克风授权不通等，应用层无法修复）。直接自动降级到页面内
+          // 语音输入，不让用户面对无解的错误界面。
+          final startedAt = _listenStartedAt;
+          final startupRejected = startedAt != null &&
+              DateTime.now().difference(startedAt) <
+                  const Duration(milliseconds: 2500) &&
+              _text.trim().isEmpty &&
+              (e.errorMsg == 'error_permission' ||
+                  e.errorMsg == 'error_client');
+          if (startupRejected) {
+            debugPrint('[DSH][voice] startup rejected → fallback to page mic');
+            Navigator.of(context).pop(VoiceInputDialog.pageMicFallback);
+            return;
+          }
+          // 其余错误（含 MIUI 在结果送达前后补发的误报事件）：延迟判定，
+          // 期间有转写文本到达则忽略；始终无文本才展示错误 + 手动降级入口。
           Future<void>.delayed(const Duration(milliseconds: 600), () {
             if (!mounted || _text.trim().isNotEmpty || _error != null) return;
             setState(() => _error = switch (e.errorMsg) {
@@ -121,7 +139,10 @@ class _VoiceInputDialogState extends State<VoiceInputDialog> {
   Future<void> _start() async {
     if (!_ready || _listening) return;
     debugPrint('[DSH][voice] listen start (localeId=$_localeId)');
-    setState(() => _error = null);
+    setState(() {
+      _error = null;
+      _listenStartedAt = DateTime.now();
+    });
     await _stt.listen(
       onResult: (r) {
         if (!mounted) return;
