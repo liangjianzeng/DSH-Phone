@@ -60,6 +60,9 @@ dependencies:
   # 系统分享入口（Share Target）：其它 App 分享图片/文本拉起本应用，
   # 图片注入 DSH 附件槽、文本注入消息输入框。
   receive_sharing_intent: ^1.8.1
+  # 语音输入：端侧系统语音识别（zh-CN 实时转写）→ 文本注入消息输入框。
+  # 绕开 dsh 的浏览器麦克风 STT（WebView 内权限/模型下载体验差）。
+  speech_to_text: ^7.0.0
 
 dependency_overrides:
   # 本地 fork 的 dartssh2：优化解密（processAll 批处理）+ 启用 zlib 压缩，

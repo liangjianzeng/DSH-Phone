@@ -13,6 +13,8 @@
     <!-- 月相按钮：观测者真实位置（纬度/经度），用于盘面朝向计算 -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <!-- 语音输入：系统语音识别需要麦克风 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
     <application
         android:label="DSH-Phone"
         android:name="${applicationName}"
@@ -80,6 +82,10 @@
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- 语音输入：Android 11+ 需声明要查询的识别服务 -->
+        <intent>
+            <action android:name="android.speech.RecognitionService"/>
         </intent>
     </queries>
 </manifest>

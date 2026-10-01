@@ -23,6 +23,7 @@ import 'setup_screen.dart';
 import 'task_notifier.dart';
 import 'tunnel_service.dart';
 import 'unsloth_screen.dart';
+import 'voice_input.dart';
 import 'webview_bridges.dart';
 
 /// 主界面：SSH 隧道就绪后，用 WebView 加载 DSH Web UI，并带缓存加速与设置入口。
@@ -970,11 +971,12 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   /// 相机/相册选图 → base64 → 注入 DSH 消息输入窗口（附件槽）；
-  /// 或选择本地文件 → SFTP 上传 → 注入远程路径文本。
+  /// 或选择本地文件 → SFTP 上传 → 注入远程路径文本；
+  /// 或语音输入 → 端侧识别 → 注入转写文本。
   Future<void> _pickAndSendImage() async {
     final c = _controller;
     if (c == null) return;
-    // 选择来源：相册 / 拍照 / 选择文件上传
+    // 选择来源：相册 / 拍照 / 选择文件上传 / 语音输入
     final source = await showModalBottomSheet<String>(
       context: context,
       builder: (_) => SafeArea(
@@ -997,11 +999,21 @@ class _WebViewScreenState extends State<WebViewScreen>
               subtitle: const Text('上传到服务器临时目录，路径注入消息框后补充指令'),
               onTap: () => Navigator.pop(context, 'file'),
             ),
+            ListTile(
+              leading: const Icon(Icons.mic_none_outlined),
+              title: const Text('语音输入'),
+              subtitle: const Text('端侧语音识别，转写文本注入消息框'),
+              onTap: () => Navigator.pop(context, 'voice'),
+            ),
           ],
         ),
       ),
     );
     if (source == null) return;
+    if (source == 'voice') {
+      await _startVoiceInput();
+      return;
+    }
     if (source == 'file') {
       await _pickAndSendFile();
       return;
@@ -1041,6 +1053,21 @@ class _WebViewScreenState extends State<WebViewScreen>
         ..clearSnackBars()
         ..showSnackBar(
             SnackBar(content: Text('图片注入失败：${result['error'] ?? '未知错误'}')));
+    }
+  }
+
+  /// 语音输入：端侧系统识别 → 转写文本注入消息输入框（不自动发送）。
+  Future<void> _startVoiceInput() async {
+    final c = _controller;
+    if (c == null) return;
+    final text = await VoiceInputDialog.show(context);
+    if (text == null || text.isEmpty || !mounted) return;
+    final js = "window.__dshComposerBridge.insertText(${jsonEncode(text)})";
+    final result = await c.evaluateJavascript(source: js) as Object?;
+    if (result is Map && result['ok'] == false) {
+      _snack('语音文本注入失败：${result['error'] ?? '未知错误'}');
+    } else {
+      debugPrint('[DSH] voice input injected: ${text.length} chars');
     }
   }
 
