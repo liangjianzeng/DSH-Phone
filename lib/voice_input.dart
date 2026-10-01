@@ -52,12 +52,19 @@ class _VoiceInputDialogState extends State<VoiceInputDialog> {
       ok = await _stt.initialize(
         onError: (e) {
           debugPrint('[DSH][voice] onError: ${e.errorMsg}');
-          // error_client 多为机型没有系统识别服务（小米/无谷歌服务 ROM）
-          if (mounted) {
-            setState(() => _error = e.errorMsg == 'error_client'
-                ? '本机没有可用的系统语音识别服务'
-                : '识别错误：${e.errorMsg}');
-          }
+          // MIUI 等国产 ROM 的识别器怪癖：结果正常送达前后仍会补发
+          // error_permission/error_client 事件（服务自检误报）。
+          // 延迟判定：短期内若有转写文本到达则忽略该错误；只有始终
+          // 无文本才作为失败展示（并给出页面内语音的降级入口）。
+          Future<void>.delayed(const Duration(milliseconds: 600), () {
+            if (!mounted || _text.trim().isNotEmpty || _error != null) return;
+            setState(() => _error = switch (e.errorMsg) {
+                  'error_client' => '本机没有可用的系统语音识别服务',
+                  'error_permission' => '识别服务报权限错误：请确认已允许麦克风，'
+                      '仍失败多为 ROM 兼容问题，可改用页面内语音',
+                  _ => '识别错误：${e.errorMsg}',
+                });
+          });
         },
         onStatus: (status) {
           debugPrint('[DSH][voice] status: $status');
@@ -160,12 +167,13 @@ class _VoiceInputDialogState extends State<VoiceInputDialog> {
             constraints: const BoxConstraints(minHeight: 72, maxWidth: 280),
             child: Align(
               alignment: Alignment.topLeft,
-              child: _error != null
-                  ? Text(_error!, style: const TextStyle(color: Colors.red, fontSize: 13))
-                  : Text(
-                      _text.isEmpty ? '请说话…' : _text,
-                      style: theme.textTheme.bodyMedium,
-                    ),
+              child: _text.isNotEmpty
+                  // 有转写文本优先展示（ROM 误报的错误不遮盖实时结果）
+                  ? Text(_text, style: theme.textTheme.bodyMedium)
+                  : _error != null
+                      ? Text(_error!,
+                          style: const TextStyle(color: Colors.red, fontSize: 13))
+                      : const Text('请说话…'),
             ),
           ),
         ],
