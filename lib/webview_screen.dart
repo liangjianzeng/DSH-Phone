@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:lunar/lunar.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -996,7 +997,7 @@ class _WebViewScreenState extends State<WebViewScreen>
             ListTile(
               leading: const Icon(Icons.folder_open_outlined),
               title: const Text('选择文件上传'),
-              subtitle: const Text('上传到服务器临时目录，路径注入消息框后补充指令'),
+              subtitle: const Text('上传到服务器，路径注入消息框'),
               onTap: () => Navigator.pop(context, 'file'),
             ),
             ListTile(
@@ -1056,12 +1057,30 @@ class _WebViewScreenState extends State<WebViewScreen>
     }
   }
 
-  /// 语音输入：端侧系统识别 → 转写文本注入消息输入框（不自动发送）。
+  /// 语音输入：先确保麦克风权限，再走端侧系统识别；机型无识别服务时
+  /// 降级为页面内语音输入（dsh 自带 mic 按钮，音频经 WebView 采集、
+  /// 转写模型跑在 host 端），转写文本注入消息输入框（不自动发送）。
   Future<void> _startVoiceInput() async {
     final c = _controller;
     if (c == null) return;
+    debugPrint('[DSH][voice] dialog open');
+    // 麦克风运行时权限：原生识别与页面内 getUserMedia 共用
+    final mic = await Permission.microphone.request();
+    if (!mounted) return;
+    if (!mic.isGranted) {
+      _snack('未授权麦克风，语音输入不可用');
+      return;
+    }
     final text = await VoiceInputDialog.show(context);
-    if (text == null || text.isEmpty || !mounted) return;
+    debugPrint('[DSH][voice] dialog result: ${text?.length ?? 'null'} chars');
+    if (text == null || !mounted) return;
+    // 哨兵：本机无系统识别服务 → 改用页面内语音输入
+    if (text == VoiceInputDialog.pageMicFallback) {
+      _snack('已授权麦克风：请点击页面中的麦克风按钮使用语音输入'
+          '（首次使用 dsh 会在服务器准备识别模型）');
+      return;
+    }
+    if (text.isEmpty) return;
     final js = "window.__dshComposerBridge.insertText(${jsonEncode(text)})";
     final result = await c.evaluateJavascript(source: js) as Object?;
     if (result is Map && result['ok'] == false) {
@@ -1562,7 +1581,21 @@ class _WebViewScreenState extends State<WebViewScreen>
                     // 左侧中央竖排浮动控件（_buildZoomControls）。
                     supportZoom: true,
                     displayZoomControls: false,
+                    // 页面内语音输入（dsh 自带 mic 按钮，getUserMedia 采集
+                    // 音频 → host 端 SenseVoice 转写）：自动播放策略放宽，
+                    // 权限授予见 onPermissionRequest。
+                    mediaPlaybackRequiresUserGesture: false,
                   ),
+                  // 页面申请麦克风/摄像头（getUserMedia）时直接授予：
+                  // 应用层的 RECORD_AUDIO 运行时权限在语音入口先申请。
+                  onPermissionRequest: (controller, request) async {
+                    debugPrint('[DSH] webview permission: '
+                        '${request.resources}');
+                    return PermissionResponse(
+                      resources: request.resources,
+                      action: PermissionResponseAction.GRANT,
+                    );
+                  },
                   onWebViewCreated: (controller) {
                     _controller = controller;
                     _setupArtifactBridge(controller);
