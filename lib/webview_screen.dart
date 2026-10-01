@@ -37,6 +37,9 @@ import 'webview_bridges.dart';
 class WebViewScreen extends StatefulWidget {
   const WebViewScreen({super.key});
 
+  /// 语音输入功能开关：暂挂起（入口隐藏），代码保留待更优方案。
+  static const bool voiceInputEnabled = false;
+
   @override
   State<WebViewScreen> createState() => _WebViewScreenState();
 }
@@ -1000,12 +1003,15 @@ class _WebViewScreenState extends State<WebViewScreen>
               subtitle: const Text('上传到服务器，路径注入消息框'),
               onTap: () => Navigator.pop(context, 'file'),
             ),
-            ListTile(
-              leading: const Icon(Icons.mic_none_outlined),
-              title: const Text('语音输入'),
-              subtitle: const Text('端侧语音识别，转写文本注入消息框'),
-              onTap: () => Navigator.pop(context, 'voice'),
-            ),
+            // 语音输入暂时挂起：端侧系统识别在小米系 ROM 上不可用，
+            // 离线小模型识别质量不佳（2026-10-01 决策，待更优方案再启用）。
+            if (WebViewScreen.voiceInputEnabled)
+              ListTile(
+                leading: const Icon(Icons.mic_none_outlined),
+                title: const Text('语音输入'),
+                subtitle: const Text('端侧语音识别，转写文本注入消息框'),
+                onTap: () => Navigator.pop(context, 'voice'),
+              ),
           ],
         ),
       ),
