@@ -116,6 +116,11 @@ class _WebViewScreenState extends State<WebViewScreen>
   String? _pageError; // 页面加载错误（区别于隧道错误 _error）
   Timer? _loadTimeoutTimer;
 
+  /// 鉴权错误（HTTP 401/403）：服务端 Token 鉴权未通过。此时不再自动重试，
+  /// 错误页内嵌 Token 输入框，填完保存即重载（_targetUrl 会带上新 Token）。
+  bool _authError = false;
+  final TextEditingController _tokenCtrl = TextEditingController();
+
   /// VPN 组网 UDP QoS 友好提示：跨运营商 UDP 可能被限速/丢包导致请求缓慢超时，
   /// 建议端侧与云端联网在同一网络运营商下使用。
   static const String _qosHint =
@@ -436,6 +441,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     setState(() {
       _error = null;
       _tunnelStatus = TunnelStatus.connecting;
+      _authError = false;
       _pageError = null;
       _pageLoading = false;
     });
@@ -486,6 +492,7 @@ class _WebViewScreenState extends State<WebViewScreen>
       _activeIndex = index;
       _config = _profiles[index];
       _switching = true;
+      _authError = false;
       _pageError = null;
       _pageLoading = false;
     });
@@ -501,6 +508,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     WidgetsBinding.instance.removeObserver(this);
     _loadTimeoutTimer?.cancel();
     _tunnelSub?.cancel();
+    _tokenCtrl.dispose();
     _zoomScaleNotifier.dispose();
     MoonLocation.observer.removeListener(_onMoonLocationChanged);
     HostMonitor.instance.stop();
@@ -748,6 +756,10 @@ class _WebViewScreenState extends State<WebViewScreen>
             await TaskNotifier.instance.showRunning();
           case 'settled':
             await TaskNotifier.instance.showCompleted();
+          case 'approval':
+            await TaskNotifier.instance.showApproval();
+          case 'approval_clear':
+            await TaskNotifier.instance.cancelApproval();
         }
         return null;
       },
@@ -1050,6 +1062,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     if (!mounted) return;
     setState(() {
       _pageLoading = true;
+      _authError = false;
       _pageError = null;
       _loadProgress = 0;
     });
@@ -1087,10 +1100,44 @@ class _WebViewScreenState extends State<WebViewScreen>
     if (!mounted) return;
     setState(() {
       _pageLoading = false;
+      _authError = false;
       _pageError = _appendQosHintIfTimeout(message);
     });
     // 有限次自动重试：隧道若刚断连会自动重连，页面重载后自愈
     _schedulePageRetry();
+  }
+
+  /// Token 鉴权失败（HTTP 401/403）：不走自动重试（填完 Token 前重试必然
+  /// 还是 401），错误页展示内嵌 Token 输入框，保存后立即重载。
+  void _onAuthError(int statusCode) {
+    _loadTimeoutTimer?.cancel();
+    if (!mounted) return;
+    setState(() {
+      _pageLoading = false;
+      _authError = true;
+      _pageError = '访问被拒绝（HTTP $statusCode）：远程 DSH 已启用 Token 鉴权，'
+          '当前保存的 Token 已失效（服务端重启后会轮换）。\n'
+          '请在下方填入最新的「DSH 访问 Token」，保存后自动重连。';
+    });
+  }
+
+  /// 保存内嵌输入的新 Token 到当前实例配置，并带新 Token 重载页面。
+  Future<void> _saveTokenAndReload() async {
+    final token = _tokenCtrl.text.trim();
+    if (token.isEmpty) return;
+    final updated = _config.copyWith(accessToken: token);
+    await SSHConfig.saveProfile(_activeIndex, updated);
+    if (!mounted) return;
+    setState(() {
+      _profiles[_activeIndex] = updated;
+      _config = updated;
+      _authError = false;
+      _pageError = null;
+      _pageLoading = true;
+      _loadProgress = 0;
+    });
+    await _loadTargetUrl();
+    _onPageLoadStart();
   }
 
   /// 页面加载失败后的有限自动重试（最多 3 次）。
@@ -1104,6 +1151,7 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   Future<void> _retryLoad() async {
     setState(() {
+      _authError = false;
       _pageError = null;
       _pageLoading = true;
       _loadProgress = 0;
@@ -1322,17 +1370,18 @@ class _WebViewScreenState extends State<WebViewScreen>
                     '加载失败：${error.description}\n'
                     '（${error.type}）',
                   ),
-                  onReceivedHttpError: (controller, request, errorResponse) =>
-                      _onPageError(
-                    // 401/403：新版 DSH 已启用 token 鉴权，明确提示填 Token
-                    errorResponse.statusCode == 401 ||
-                            errorResponse.statusCode == 403
-                        ? '访问被拒绝（HTTP ${errorResponse.statusCode}）：远程 '
-                            'DSH 已启用 Token 鉴权。\n请在设置中填入正确的'
-                            '「DSH 访问 Token」（或确认服务端未更换鉴权密钥）。'
-                        : '服务器返回错误（HTTP ${errorResponse.statusCode}），'
-                            '请确认远程服务正常运行后重试。',
-                  ),
+                  onReceivedHttpError: (controller, request, errorResponse) {
+                    // 只处理主文档响应；子资源（图标等）的 401/404 不打扰页面
+                    if (request.isForMainFrame != true) return;
+                    final code = errorResponse.statusCode ?? 0;
+                    if (code == 401 || code == 403) {
+                      // Token 鉴权未通过：停掉自动重试，错误页内嵌 Token 输入
+                      _onAuthError(code);
+                    } else if (code >= 400) {
+                      _onPageError('服务器返回错误（HTTP $code），'
+                          '请确认远程服务正常运行后重试。');
+                    }
+                  },
                 ),
                 // 页面加载中：进度遮罩（不透明白底，避免黑屏观感）
                 if (_pageLoading && _pageError == null)
@@ -1403,19 +1452,24 @@ class _WebViewScreenState extends State<WebViewScreen>
     );
   }
 
-  /// WebView 加载失败/超时界面。
+  /// WebView 加载失败/超时界面。鉴权失败（401/403）时额外内嵌 Token 输入框，
+  /// 保存后立即重载，免去跳转设置页再返回的流程。
   Widget _buildPageError(BuildContext context) {
+    final theme = Theme.of(context);
     return ColoredBox(
-      color: Theme.of(context).colorScheme.surface,
+      color: theme.colorScheme.surface,
       child: Center(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.cloud_off, size: 56, color: Colors.red),
+              Icon(_authError ? Icons.lock_outline : Icons.cloud_off,
+                  size: 56, color: _authError ? Colors.orange : Colors.red),
               const SizedBox(height: 16),
-              Text('无法加载远程界面', style: Theme.of(context).textTheme.titleMedium),
+              Text(
+                  _authError ? '需要更新 DSH 访问 Token' : '无法加载远程界面',
+                  style: theme.textTheme.titleMedium),
               const SizedBox(height: 12),
               ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 320),
@@ -1425,6 +1479,29 @@ class _WebViewScreenState extends State<WebViewScreen>
                   style: const TextStyle(color: Colors.grey, fontSize: 13),
                 ),
               ),
+              if (_authError) ...[
+                const SizedBox(height: 16),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 320),
+                  child: TextField(
+                    controller: _tokenCtrl,
+                    obscureText: true,
+                    autofillHints: null,
+                    decoration: const InputDecoration(
+                      labelText: 'DSH 访问 Token',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    onSubmitted: (_) => _saveTokenAndReload(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  onPressed: _saveTokenAndReload,
+                  icon: const Icon(Icons.key),
+                  label: const Text('保存 Token 并重连'),
+                ),
+              ],
               const SizedBox(height: 20),
               FilledButton.icon(
                 onPressed: _retryLoad,

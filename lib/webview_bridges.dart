@@ -278,19 +278,42 @@ const String artifactBridgeJs = r'''
 ///
 /// 状态机：仅上报「运行 ↔ 结束」的切换；页面加载时若已在运行则直接上报
 /// 运行态，否则只对齐基准不上报（避免每次导航误报"已完成"）。
+///
+/// 审批/提问检测：智能体请求人工审批（或异步提问等待回答）时，页面会出现
+/// 带「批准/允许/拒绝/Approve/Deny…」按钮的操作卡片。手机端用户不在电脑前
+/// 时任务会一直干等，因此把「无 ↔ 出现」的切换单独上报（'approval' /
+/// 'approval_clear'），供锁屏高优先级通知。按钮文案匹配是启发式：限定
+/// 短文本（≤12 字符）+ 可见 button，避开设置页开关等长文案误报。
 const String taskBridgeJs = r'''
 (function() {
   if (window.__dshTaskBridge) return;
   window.__dshTaskBridge = true;
 
   var SENTINEL = 'Deep diving';
+  var APPROVAL_RE = /(批准|允许|拒绝|授权|同意|Approve|Deny|Reject|Allow)/;
   var state = null; // 上次上报的运行态；null = 尚未对齐
+  var approvalOn = false; // 上次上报的审批卡片在位态
   var timer = null;
 
   function report(next) {
     try {
       window.flutter_inappwebview.callHandler('onTaskState', { state: next });
     } catch (e) {}
+  }
+
+  function scanApproval() {
+    var found = false;
+    var btns = document.querySelectorAll('button');
+    for (var i = 0; i < btns.length; i++) {
+      var b = btns[i];
+      if (!b.offsetParent) continue; // 不可见（display:none / 脱离文档）
+      var t = (b.textContent || '').trim();
+      if (t && t.length <= 12 && APPROVAL_RE.test(t)) { found = true; break; }
+    }
+    if (found !== approvalOn) {
+      approvalOn = found;
+      report(found ? 'approval' : 'approval_clear');
+    }
   }
 
   function scan() {
@@ -307,12 +330,11 @@ const String taskBridgeJs = r'''
       // 首次对齐：已在运行则上报，否则只记基准（不误报已完成）
       state = next;
       if (running) report('running');
-      return;
-    }
-    if (next !== state) {
+    } else if (next !== state) {
       state = next;
       report(next);
     }
+    scanApproval();
   }
 
   // 运行指示器随元素增删出现/消失：只监听 childList（子树增删），

@@ -160,6 +160,26 @@ class SSHConfig {
   bool get isConfigured =>
       host.isNotEmpty && username.isNotEmpty && sshPort > 0 && localPort > 0;
 
+  /// 复制并覆盖指定字段（其余字段原样保留）。
+  @pragma('vm:prefer-inline')
+  SSHConfig copyWith({String? accessToken}) => SSHConfig(
+        host: host,
+        sshPort: sshPort,
+        username: username,
+        localPort: localPort,
+        authType: authType,
+        password: password,
+        privateKeyPem: privateKeyPem,
+        keyPassphrase: keyPassphrase,
+        alias: alias,
+        hostMonitorEnabled: hostMonitorEnabled,
+        unslothEnabled: unslothEnabled,
+        unslothPort: unslothPort,
+        unslothUseSsh: unslothUseSsh,
+        unslothPassword: unslothPassword,
+        accessToken: accessToken ?? this.accessToken,
+      );
+
   bool get useKey => authType == authTypeKey;
 
   /// 展示名：优先别名；无别名时回退为地址（IP），未配置时显示"未配置"。

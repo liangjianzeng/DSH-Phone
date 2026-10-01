@@ -17,6 +17,7 @@ class TaskNotifier {
   static const String _channelName = 'DSH 任务通知';
   static const int _runningId = 1001;
   static const int _doneId = 1002;
+  static const int _approvalId = 1003;
 
   final FlutterLocalNotificationsPlugin _plugin =
       FlutterLocalNotificationsPlugin();
@@ -81,12 +82,32 @@ class TaskNotifier {
     );
   }
 
+  /// 智能体请求人工审批/提问：推送「等待你的确认」（响铃 + 震动，锁屏可见）。
+  /// 移动场景下这是任务干等的唯一信号，重要度等同完成通知。
+  Future<void> showApproval() async {
+    if (!_ready) return;
+    await _plugin.show(
+      _approvalId,
+      'DSH 等待你的确认',
+      '智能体请求审批或提问，需要你处理后才能继续',
+      _details(ongoing: false, playSound: true, enableVibration: true),
+    );
+  }
+
+  /// 审批卡片消失（已处理）：清除等待确认通知。
+  Future<void> cancelApproval() async {
+    if (!_ready) return;
+    await _plugin.cancel(_approvalId);
+  }
+
   /// 页面导航/重载时调用：取消可能残留的「进行中」通知并复位计时基准。
-  /// （导航后桥会重新对齐状态，若任务仍在运行会再次上报进行中。）
+  /// （导航后桥会重新对齐状态，若任务仍在运行会再次上报进行中；
+  /// 审批卡片若仍在位也会再次上报。）
   Future<void> reset() async {
     _runningSince = null;
     if (!_ready) return;
     await _plugin.cancel(_runningId);
+    await _plugin.cancel(_approvalId);
   }
 
   NotificationDetails _details({
