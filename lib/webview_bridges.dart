@@ -494,4 +494,78 @@ const String composerBridgeJs = r'''
     }
   };
 })();
+''';
+
+/// 终端按键桥：侧边栏终端（xterm.js）在手机上没有 Ctrl/Esc/方向键，
+/// 本桥做两件事：
+///
+/// 1. 状态上报：扫描可见的 `.xterm` 根节点（有 offsetParent 才算面板打开），
+///    「无 ↔ 出现」切换时经 onTerminalState 上报 { visible }，
+///    Flutter 侧据此显示/隐藏底部按键条；
+/// 2. 按键注入：`__dshTerminalBridge.sendKey(key, keyCode, ctrl, shift, alt)`
+///    聚焦当前可见终端的 helper textarea 并派发合成 KeyboardEvent。
+///    xterm.js 的 keydown 处理只读 keyCode/修饰键、不校验 isTrusted，
+///    合成事件可正常驱动（Esc=27 Tab=9 Enter=13 ↑38 ↓40 ←37 →39，字母=大写 ASCII）。
+const String terminalBridgeJs = r'''
+(function() {
+  var visible = false;
+
+  function report(next) {
+    try {
+      window.flutter_inappwebview.callHandler('onTerminalState', { visible: next });
+    } catch (e) {}
+  }
+
+  function scan() {
+    var terms = document.querySelectorAll('.xterm');
+    var on = false;
+    for (var i = 0; i < terms.length; i++) {
+      if (terms[i].offsetParent !== null) { on = true; break; }
+    }
+    if (on !== visible) {
+      visible = on;
+      report(on);
+    }
+  }
+
+  function visibleHelper() {
+    var tas = document.querySelectorAll('.xterm-helper-textarea');
+    for (var i = 0; i < tas.length; i++) {
+      if (tas[i].offsetParent !== null) return tas[i];
+    }
+    // helper textarea 不可见（被 xterm 容器裁剪）时兜底取第一个
+    return tas.length ? tas[0] : null;
+  }
+
+  // 每次注入都重建桥对象（页面导航/DOM 重建后保持可用）
+  window.__dshTerminalBridge = {
+    sendKey: function(key, keyCode, ctrl, shift, alt) {
+      try {
+        var t = visibleHelper();
+        if (!t) return { ok: false, error: '未找到终端' };
+        var init = {
+          key: String(key), keyCode: keyCode, which: keyCode,
+          bubbles: true, cancelable: true,
+          ctrlKey: !!ctrl, shiftKey: !!shift, altKey: !!alt, metaKey: false
+        };
+        t.focus();
+        t.dispatchEvent(new KeyboardEvent('keydown', init));
+        t.dispatchEvent(new KeyboardEvent('keyup', init));
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: String(e) };
+      }
+    }
+  };
+
+  // 与任务桥共用 MutationObserver 时机：独立 observer，仅 childList。
+  var pending = false;
+  new MutationObserver(function(mutations) {
+    if (pending) return;
+    pending = true;
+    setTimeout(function() { pending = false; scan(); }, 300);
+  }).observe(document.documentElement, { childList: true, subtree: true });
+
+  scan();
+})();
 ''';

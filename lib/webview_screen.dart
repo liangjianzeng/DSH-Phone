@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:lunar/lunar.dart';
+import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'artifact_recognizer.dart';
@@ -121,6 +123,17 @@ class _WebViewScreenState extends State<WebViewScreen>
   bool _authError = false;
   final TextEditingController _tokenCtrl = TextEditingController();
 
+  // ---- 系统分享入口（Share Target）----
+  /// 页面未就绪（隧道连接中 / WebView 加载中 / 报错）时收到的分享先入队，
+  /// 页面加载完成后按序消费。
+  final List<SharedMediaFile> _pendingShares = [];
+  StreamSubscription<List<SharedMediaFile>>? _shareSub;
+
+  // ---- 侧边栏终端按键条 ----
+  /// 终端桥上报的 xterm 面板可见态：可见时在底部显示按键条
+  /// （Esc/Tab/方向键/Ctrl 组合），隐藏时完全不打扰对话界面。
+  bool _terminalVisible = false;
+
   /// VPN 组网 UDP QoS 友好提示：跨运营商 UDP 可能被限速/丢包导致请求缓慢超时，
   /// 建议端侧与云端联网在同一网络运营商下使用。
   static const String _qosHint =
@@ -168,6 +181,88 @@ class _WebViewScreenState extends State<WebViewScreen>
     // 月相按钮：读取观测位置设置（默认北京/手动/GPS）并监听生效位置变化。
     MoonLocation.observer.addListener(_onMoonLocationChanged);
     MoonLocation.init();
+    // 系统分享入口：冷启动分享 + 运行中分享统一入队处理。
+    ReceiveSharingIntent.instance.getInitialMedia().then(_enqueueShares);
+    _shareSub = ReceiveSharingIntent.instance
+        .getMediaStream()
+        .listen(_enqueueShares);
+  }
+
+  /// 分享内容入队：页面就绪前先缓存，就绪后立即消费。
+  void _enqueueShares(List<SharedMediaFile> items) {
+    if (items.isEmpty) return;
+    ReceiveSharingIntent.instance.reset(); // 已消费意图，清掉冷启动缓存
+    _pendingShares.addAll(items);
+    _processPendingShares();
+  }
+
+  /// 消费排队的分享：页面就绪（隧道通 + WebView 加载完成 + 无报错）才处理，
+  /// 否则留在队列，由 onLoadStop 再次触发。
+  Future<void> _processPendingShares() async {
+    if (_pendingShares.isEmpty) return;
+    if (TunnelService.instance.status != TunnelStatus.connected ||
+        _pageLoading ||
+        _pageError != null ||
+        _controller == null) {
+      return;
+    }
+    // 桥刚注入完，稍等 DOM/JS 就绪再注入，避免首次注入落到未挂载的页面
+    await Future<void>.delayed(const Duration(milliseconds: 1200));
+    while (_pendingShares.isNotEmpty && mounted) {
+      final item = _pendingShares.removeAt(0);
+      try {
+        if (item.type == SharedMediaType.text || item.type == SharedMediaType.url) {
+          await _injectSharedText(item.path);
+        } else if (item.type == SharedMediaType.image) {
+          await _injectSharedImage(item.path);
+        } else {
+          _snack('暂不支持分享该类型内容（${item.type.value}）');
+        }
+      } catch (e) {
+        _snack('分享内容注入失败：$e');
+      }
+    }
+  }
+
+  /// 分享的文本/链接 → 注入 DSH 消息输入框（不自动发送）。
+  Future<void> _injectSharedText(String text) async {
+    final c = _controller;
+    if (c == null || text.isEmpty) return;
+    final js =
+        "window.__dshComposerBridge.insertText(${jsonEncode(text)})";
+    final result = await c.evaluateJavascript(source: js) as Object?;
+    if (result is Map && result['ok'] == false) {
+      _snack('文本注入失败：${result['error'] ?? '未知错误'}');
+    } else {
+      _snack('已注入分享文本，请补充指令后发送');
+    }
+  }
+
+  /// 分享的图片 → base64 → 注入 DSH 附件槽（复用拍照直传通道）。
+  Future<void> _injectSharedImage(String path) async {
+    final c = _controller;
+    if (c == null) return;
+    final name = path.replaceAll(r'\', '/').split('/').last;
+    final mime = _imageMimeForName(name);
+    if (mime == null) {
+      _snack('不支持的图片格式（$name），仅支持 PNG / JPEG / WebP / GIF');
+      return;
+    }
+    final file = File(path);
+    if (!await file.exists()) {
+      _snack('分享图片不存在或已被清理');
+      return;
+    }
+    final bytes = await file.readAsBytes();
+    final base64 = base64Encode(bytes);
+    final js =
+        "window.__dshPhotoBridge.pickImage('$base64', ${jsonEncode(name)}, '$mime')";
+    final result = await c.evaluateJavascript(source: js) as Object?;
+    if (result is Map && result['ok'] == false) {
+      _snack('图片注入失败：${result['error'] ?? '未知错误'}');
+    } else {
+      _snack('已注入分享图片，请补充指令后发送');
+    }
   }
 
   /// 观测位置变化（GPS 到位/设置变更）→ 重绘月相盘面。
@@ -508,6 +603,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     WidgetsBinding.instance.removeObserver(this);
     _loadTimeoutTimer?.cancel();
     _tunnelSub?.cancel();
+    _shareSub?.cancel();
     _tokenCtrl.dispose();
     _zoomScaleNotifier.dispose();
     MoonLocation.observer.removeListener(_onMoonLocationChanged);
@@ -772,6 +868,105 @@ class _WebViewScreenState extends State<WebViewScreen>
     final c = _controller;
     if (c == null) return;
     c.evaluateJavascript(source: taskBridgeJs);
+  }
+
+  // ================= 终端按键桥（侧边栏终端按键条）=================
+
+  /// 注册终端可见态 handler 并注入检测/按键脚本。
+  void _setupTerminalBridge(InAppWebViewController controller) {
+    controller.addJavaScriptHandler(
+      handlerName: 'onTerminalState',
+      callback: (List<Object?> args) async {
+        if (args.isEmpty || args.first is! Map) return null;
+        final visible = (args.first as Map)['visible'] == true;
+        debugPrint('[DSH] terminal visible: $visible');
+        if (mounted && visible != _terminalVisible) {
+          setState(() => _terminalVisible = visible);
+        }
+        return null;
+      },
+    );
+    controller.evaluateJavascript(source: terminalBridgeJs);
+  }
+
+  /// 页面导航后重新注入终端按键桥（每次导航 DOM 重建）。
+  void _injectTerminalBridge() {
+    final c = _controller;
+    if (c == null) return;
+    c.evaluateJavascript(source: terminalBridgeJs);
+  }
+
+  /// 终端按键条：注入一个按键到当前可见的 xterm 终端。
+  Future<void> _sendTerminalKey(String key, int keyCode,
+      {bool ctrl = false}) async {
+    final c = _controller;
+    if (c == null) return;
+    final js = "window.__dshTerminalBridge.sendKey("
+        "${jsonEncode(key)}, $keyCode, ${ctrl ? 'true' : 'false'}, false, false)";
+    final result = await c.evaluateJavascript(source: js) as Object?;
+    if (result is Map && result['ok'] == false) {
+      _snack('按键注入失败：${result['error'] ?? '未知错误'}');
+    }
+    debugPrint('[DSH] terminal key: $key${ctrl ? ' (ctrl)' : ''} -> $result');
+  }
+
+  /// 侧边栏终端按键条：底部中央半透明胶囊，横向可滚动。
+  /// 按键为终端刚需：Esc / Tab / 方向键 / Enter / Ctrl+C / Ctrl+D。
+  Widget _buildTerminalKeyBar(BuildContext context) {
+    final theme = Theme.of(context);
+    final keyStyle = TextStyle(
+        fontSize: 12.5, color: theme.colorScheme.onSurface, height: 1.0);
+    Widget keyCap(String label, String key, int keyCode, {bool ctrl = false}) =>
+        Material(
+          color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.92),
+          borderRadius: BorderRadius.circular(6),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(6),
+            onTap: () => _sendTerminalKey(key, keyCode, ctrl: ctrl),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              child: Text(label, style: keyStyle),
+            ),
+          ),
+        );
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: 8,
+      child: Center(
+        child: Material(
+          color: theme.colorScheme.surface.withValues(alpha: 0.85),
+          borderRadius: BorderRadius.circular(12),
+          elevation: 3,
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                keyCap('Esc', 'Escape', 27),
+                const SizedBox(width: 4),
+                keyCap('Tab', 'Tab', 9),
+                const SizedBox(width: 4),
+                keyCap('↑', 'ArrowUp', 38),
+                const SizedBox(width: 4),
+                keyCap('↓', 'ArrowDown', 40),
+                const SizedBox(width: 4),
+                keyCap('←', 'ArrowLeft', 37),
+                const SizedBox(width: 4),
+                keyCap('→', 'ArrowRight', 39),
+                const SizedBox(width: 4),
+                keyCap('⏎', 'Enter', 13),
+                const SizedBox(width: 4),
+                keyCap('^C', 'c', 67, ctrl: true),
+                const SizedBox(width: 4),
+                keyCap('^D', 'd', 68, ctrl: true),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   /// 相机/相册选图 → base64 → 注入 DSH 消息输入窗口（附件槽）；
@@ -1347,6 +1542,7 @@ class _WebViewScreenState extends State<WebViewScreen>
                     _setupPhotoBridge(controller);
                     _setupComposerBridge(controller);
                     _setupTaskBridge(controller);
+                    _setupTerminalBridge(controller);
                   },
                   onLoadStart: (controller, url) => _onPageLoadStart(),
                   onProgressChanged: (controller, progress) =>
@@ -1365,6 +1561,10 @@ class _WebViewScreenState extends State<WebViewScreen>
                     // 「任务进行中」通知（桥会对齐当前状态，运行中会重新上报）。
                     _injectTaskBridge();
                     TaskNotifier.instance.reset();
+                    // 每次页面导航后重新注入终端按键桥
+                    _injectTerminalBridge();
+                    // 页面就绪：消费冷启动/排队中的分享内容
+                    _processPendingShares();
                   },
                   onReceivedError: (controller, request, error) => _onPageError(
                     '加载失败：${error.description}\n'
@@ -1397,6 +1597,10 @@ class _WebViewScreenState extends State<WebViewScreen>
                     !_pageLoading &&
                     _pageError == null)
                   _buildPhotoControls(context, stackHeight),
+                // 侧边栏终端按键条：xterm 面板可见时显示在底部中央
+                //（手机软键盘没有 Esc/Ctrl/方向键，这些是终端刚需）
+                if (_terminalVisible && !_pageLoading && _pageError == null)
+                  _buildTerminalKeyBar(context),
               ],
             );
           },

@@ -16,6 +16,24 @@ subprojects {
     project.evaluationDependsOn(":app")
 }
 
+// receive_sharing_intent 插件自带 Kotlin jvmTarget=17，但 Java 目标继承到 1.8，
+// 两者不一致导致 compileReleaseKotlin 失败。这里对该插件统一拉到 17。
+subprojects {
+    if (name == 'receive_sharing_intent') {
+        afterEvaluate { project ->
+            project.android {
+                compileOptions {
+                    sourceCompatibility JavaVersion.VERSION_17
+                    targetCompatibility JavaVersion.VERSION_17
+                }
+                kotlinOptions {
+                    jvmTarget = '17'
+                }
+            }
+        }
+    }
+}
+
 tasks.register("clean", Delete) {
     delete rootProject.buildDir
 }
