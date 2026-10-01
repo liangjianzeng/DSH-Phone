@@ -43,6 +43,12 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 - 本地有未提交 `pubspec.lock` 改动时，只要新提交不触碰该文件，`--ff-only` 可干净合并（快进）。
 - 拉取前可先 `git log --stat <old>..<new>` 确认受影響文件，预判是否可能与未提交冲突。
 
+## 天气能力（2026-10 新增）
+
+- **数据源：Open-Meteo**（`https://api.open-meteo.com/v1/forecast`）：免费、免 API Key、HTTPS、国内可直连（2026-10 实测 2s 返回）。返回 WMO 标准天气码 + 温度 + 降水量。若日后失效/被墙，替代品评估过 ghproxy 类镜像不可用于 API、和风天气需注册 Key。
+- 查询节奏：APP 启动一次 + 每小时定时（`WeatherService`）；观测位置变化去抖 3s 重查（坐标容差 0.01°）。HTTP 用 `dart:io` HttpClient（项目未引入 http/dio 依赖，保持零新增依赖）。
+- 相关文件：`lib/weather_service.dart`（数据）、`lib/weather_effects.dart`（动效）、`lib/sun_times.dart`（日出日落，NOAA 公式，纯本地计算）。开关键：`weather_effects_enabled`（默认开）、`moon_sun_switch_enabled`（日出日落联动，默认开）。
+
 ---
 
 ## 代码约定 (Coding Conventions)

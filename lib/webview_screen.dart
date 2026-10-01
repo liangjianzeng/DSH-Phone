@@ -21,9 +21,12 @@ import 'moon_location.dart';
 import 'moon_painter.dart';
 import 'setup_screen.dart';
 import 'asr/hold_to_talk.dart';
+import 'sun_times.dart';
 import 'task_notifier.dart';
 import 'tunnel_service.dart';
 import 'unsloth_screen.dart';
+import 'weather_effects.dart';
+import 'weather_service.dart';
 import 'webview_bridges.dart';
 
 /// 主界面：SSH 隧道就绪后，用 WebView 加载 DSH Web UI，并带缓存加速与设置入口。
@@ -81,6 +84,13 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 对话区左侧相机入口的开关键（持久化，默认开启）。
   static const String _photoControlsPrefKey = 'webview_photo_controls_enabled';
 
+  /// 天气动效开关（持久化，默认开启；WeatherService.enabled 同步启停查询）。
+  static const String _weatherEffectsPrefKey = 'weather_effects_enabled';
+
+  /// 日出日落联动开关（持久化，默认开启）：白天相机按钮显示全亮
+  /// （月相暂停），夜间恢复真实月相；关闭则始终显示真实月相。
+  static const String _sunSwitchPrefKey = 'moon_sun_switch_enabled';
+
   // ---- 工具类功能开关（设置页"工具"分类控制）----
   bool _hostMonitorEnabled = true; // 主机监控（默认开：采样并呈现曲线）
   bool _resourceViewEnabled = true; // 资源查看（默认开）
@@ -94,6 +104,12 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   /// 对话区左侧相机入口是否显示（默认开启，由设置页开关控制）。
   bool _photoControlsEnabled = true;
+
+  /// 天气动效是否显示（默认开启，由设置页开关控制）。
+  bool _weatherEffectsEnabled = true;
+
+  /// 日出日落联动是否开启（默认开启，由设置页开关控制）。
+  bool _sunSwitchEnabled = true;
 
   // ---- 浮动控件可拖拽上下移动 ----
   // 位置以“像素”记录（相对对话区 Stack 的 top），拖拽时控件顶边跟随手指，
@@ -185,6 +201,11 @@ class _WebViewScreenState extends State<WebViewScreen>
     // 月相按钮：读取观测位置设置（默认北京/手动/GPS）并监听生效位置变化。
     MoonLocation.observer.addListener(_onMoonLocationChanged);
     MoonLocation.init();
+    // 天气动效：按观测位置查询真实天气（启动一次 + 每小时刷新 + 位置变化
+    // 自动重查），驱动相机按钮周边的云/雨/雪等动效；设置页可整体开关。
+    WeatherService.init();
+    _loadWeatherEffects();
+    _loadSunSwitch();
     // 系统分享入口：冷启动分享 + 运行中分享统一入队处理。
     ReceiveSharingIntent.instance.getInitialMedia().then(_enqueueShares);
     _shareSub = ReceiveSharingIntent.instance
@@ -350,6 +371,38 @@ class _WebViewScreenState extends State<WebViewScreen>
     setState(() => _photoControlsEnabled = enabled);
     SharedPreferences.getInstance().then(
       (prefs) => prefs.setBool(_photoControlsPrefKey, enabled),
+    );
+  }
+
+  /// 读取天气动效开关（默认开启）。
+  Future<void> _loadWeatherEffects() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool(_weatherEffectsPrefKey) ?? true;
+    if (!mounted) return;
+    setState(() => _weatherEffectsEnabled = enabled);
+  }
+
+  /// 保存并应用天气动效开关：同步启停 WeatherService 查询（持久化默认开启）。
+  void _setWeatherEffectsEnabled(bool enabled) {
+    if (!mounted) return;
+    setState(() => _weatherEffectsEnabled = enabled);
+    WeatherService.setEnabled(enabled);
+  }
+
+  /// 读取日出日落联动开关（默认开启）。
+  Future<void> _loadSunSwitch() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool(_sunSwitchPrefKey) ?? true;
+    if (!mounted) return;
+    setState(() => _sunSwitchEnabled = enabled);
+  }
+
+  /// 保存并应用日出日落联动开关（默认开启）。
+  void _setSunSwitchEnabled(bool enabled) {
+    if (!mounted) return;
+    setState(() => _sunSwitchEnabled = enabled);
+    SharedPreferences.getInstance().then(
+      (prefs) => prefs.setBool(_sunSwitchPrefKey, enabled),
     );
   }
 
@@ -755,6 +808,10 @@ class _WebViewScreenState extends State<WebViewScreen>
           onZoomControlsChanged: _setZoomControlsEnabled,
           photoControlsEnabled: _photoControlsEnabled,
           onPhotoControlsChanged: _setPhotoControlsEnabled,
+          weatherEffectsEnabled: _weatherEffectsEnabled,
+          onWeatherEffectsChanged: _setWeatherEffectsEnabled,
+          sunSwitchEnabled: _sunSwitchEnabled,
+          onSunSwitchChanged: _setSunSwitchEnabled,
           moonLocationMode: MoonLocation.mode,
           moonManualLatitude: MoonLocation.manualLatitude,
           moonManualLongitude: MoonLocation.manualLongitude,
@@ -1697,6 +1754,13 @@ class _WebViewScreenState extends State<WebViewScreen>
                     !_pageLoading &&
                     _pageError == null)
                   _buildPhotoControls(context, stackHeight),
+                // 天气动效：云/雨/雪/雾/雷锚定相机按钮当前位置（拖拽跟随），
+                // 绘制在按钮上层、低不透明度且不拦截触摸；相机入口隐藏时一并隐藏。
+                if (_photoControlsEnabled &&
+                    _weatherEffectsEnabled &&
+                    !_pageLoading &&
+                    _pageError == null)
+                  _buildWeatherOverlay(context),
                 // 侧边栏终端按键条：xterm 面板可见时显示在底部中央
                 //（手机软键盘没有 Esc/Ctrl/方向键，这些是终端刚需）
                 if (_terminalVisible && !_pageLoading && _pageError == null)
@@ -1875,17 +1939,9 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   /// 相机入口浮动按钮：对话区左侧、屏幕底部往上约六分之一处（避开底部安全区与
-  /// 键盘、缩放控件）。按钮呈现为**真实观测的月相**——用太阳/月球实际位置计算：
-  /// 照明度（小时级连续的朔望周期 29.53 天）与盘面朝向（亮缘位置角 + 观测者
-  /// 纬度/经度/时角决定的旋转，月出月落可见亮面旋转），满月最亮、新月留微光，
-  /// 让用户一眼注意到视觉工具入口；默认开启，设置页可关。
+  /// 键盘、缩放控件）。按钮呈现为**真实观测的月相**（夜间）或**全亮日光模式**
+  /// （白天，日出日落联动开启时）——细节见 [_MoonCameraButton]。
   Widget _buildPhotoControls(BuildContext context, double stackHeight) {
-    final now = DateTime.now();
-    // 真实月球观测：绝对时间（UTC）+ 当前生效的观测位置（默认北京/手动/GPS，
-    // 设置页可改；observer 变化会触发本方法重建）。
-    final obs = MoonAstronomy.compute(now.toUtc(), MoonLocation.observer.value);
-    final lit = obs.illumination;
-    final borderColor = const Color(0xFF64B5F6);
     return Positioned(
       left: 6,
       top: _photoControlsTop,
@@ -1900,49 +1956,42 @@ class _WebViewScreenState extends State<WebViewScreen>
         onLongPressMoveUpdate: _onPhotoLongPressMoveUpdate,
         onLongPressEnd: (_) => _onPhotoLongPressEnd(),
         onLongPressCancel: () => _onPhotoLongPressEnd(cancelled: true),
-        child: SizedBox(
-          width: 48,
-          height: 48,
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              border: Border.all(color: borderColor, width: 2), // 圆形边框
-              boxShadow: [
-                // 发光随月相变化：满月最亮，新月留微光保持入口可见。
-                BoxShadow(
-                  color: borderColor.withValues(alpha: 0.12 + 0.55 * lit),
-                  blurRadius: 6 + 12 * lit,
-                  spreadRadius: 1 + 2 * lit,
-                ),
-                BoxShadow(
-                  color: const Color(0xFF81D4FA)
-                      .withValues(alpha: 0.08 + 0.35 * lit),
-                  blurRadius: 16 + 12 * lit,
-                  spreadRadius: 2 + 3 * lit,
-                ),
-              ],
-            ),
-            child: CustomPaint(
-              painter: MoonPhasePainter(obs.phase01, obs.tiltDeg),
-                child: Center(
-                  child: IconButton(
-                    // 注意：不能加 tooltip——tooltip 自带长按手势，会抢走
-                    // 外层的长按（按住说话）手势（2026-10-02 真机实测）。
-                    icon: Icon(
-                    Icons.camera_alt_outlined,
-                    color: lit >= 0.5
-                        ? const Color(0xFF1565C0) // 亮面：深蓝图标
-                        : Colors.white, // 暗面：白色图标
-                  ),
-                  iconSize: 22,
-                  visualDensity: VisualDensity.compact,
-                  onPressed: _pickAndSendImage,
-                ),
-              ),
-            ),
-          ),
+        child: _MoonCameraButton(
+          sunSwitchEnabled: _sunSwitchEnabled,
+          onPressed: _pickAndSendImage,
         ),
       ),
+    );
+  }
+
+  /// 天气动效层：锚定相机按钮当前位置（拖拽跟随移动），宽度约 120dp 的
+  /// 左侧窄条——不大面积遮挡对话区；整层 IgnorePointer 不拦截触摸。
+  /// 天气未知（未查到/已关闭）或晴朗时不绘制任何内容。
+  Widget _buildWeatherOverlay(BuildContext context) {
+    return ValueListenableBuilder<WeatherInfo?>(
+      valueListenable: WeatherService.current,
+      builder: (context, weather, _) {
+        if (weather == null || weather.kind == WeatherKind.clear) {
+          return const SizedBox.shrink();
+        }
+        const width = 120.0;
+        const height = 200.0;
+        // 垂直锚定：按钮中心对齐动效区约 45% 高度处（云在上、雨落到底部），
+        // 并 clamp 在对话区内，按钮拖到顶部/底部时动效区不滑出屏幕。
+        final maxTop =
+            (_bodyHeight - height).clamp(0.0, double.infinity);
+        final top = (_photoControlsTop + _photoControlHeight / 2 - height * 0.45)
+            .clamp(0.0, maxTop);
+        return Positioned(
+          left: 0,
+          top: top,
+          width: width,
+          height: height,
+          child: IgnorePointer(
+            child: WeatherOverlay(kind: weather.kind),
+          ),
+        );
+      },
     );
   }
 }
@@ -1975,6 +2024,108 @@ class _InstanceChip extends StatelessWidget {
         ),
         backgroundColor: color.withValues(alpha: 0.15),
         visualDensity: VisualDensity.compact,
+      ),
+    );
+  }
+}
+
+/// 月相相机按钮（48×48 圆形）：相机入口的视觉本体。
+///
+/// - **夜间**（默认）：呈现真实观测的月相——太阳/月球实际位置计算照明度
+///   （小时级连续的朔望周期 29.53 天）与盘面朝向（亮缘位置角 + 观测者
+///   纬度/经度/时角决定的旋转），满月最亮、新月留微光。
+/// - **白天**（日出日落联动开启时）：显示**全亮**月亮（日光模式，月相
+///   特效暂停），日出后全亮、日落后恢复真实月相；开关关闭则始终真实月相。
+///
+/// 独立 State 持有 30 秒时钟分粒度刷新（照明度/昼转夜切换），避免整屏
+/// setState 重建 WebView 子树。
+class _MoonCameraButton extends StatefulWidget {
+  const _MoonCameraButton({
+    required this.sunSwitchEnabled,
+    required this.onPressed,
+  });
+
+  /// 日出日落联动开关（设置页可关；关闭 = 始终真实月相）。
+  final bool sunSwitchEnabled;
+
+  final VoidCallback onPressed;
+
+  @override
+  State<_MoonCameraButton> createState() => _MoonCameraButtonState();
+}
+
+class _MoonCameraButtonState extends State<_MoonCameraButton> {
+  Timer? _tick;
+
+  @override
+  void initState() {
+    super.initState();
+    _tick = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final nowUtc = now.toUtc();
+    // 真实月球观测：绝对时间（UTC）+ 当前生效的观测位置（默认北京/手动/GPS，
+    // 设置页可改；observer 变化会触发重建）。
+    final obs = MoonAstronomy.compute(nowUtc, MoonLocation.observer.value);
+    // 日出日落联动：白天（太阳高度 > −0.833°，即日出~日落）显示全亮月亮
+    // （月相暂停），夜间恢复真实月相。
+    final dayMode =
+        widget.sunSwitchEnabled && SunTimes.isDaytimeAt(nowUtc, MoonLocation.observer.value);
+    final lit = dayMode ? 1.0 : obs.illumination;
+    final phase = dayMode ? 0.5 : obs.phase01;
+    final tilt = dayMode ? 0.0 : obs.tiltDeg;
+    final borderColor = const Color(0xFF64B5F6);
+    // 注意：IconButton 不能加 tooltip——tooltip 自带长按手势，会抢走外层
+    // GestureDetector 的长按（按住说话）手势（2026-10-02 真机实测）。
+    return SizedBox(
+      width: 48,
+      height: 48,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          border: Border.all(color: borderColor, width: 2), // 圆形边框
+          boxShadow: [
+            // 发光随月相变化：满月/白天最亮，新月留微光保持入口可见。
+            BoxShadow(
+              color: borderColor.withValues(alpha: 0.12 + 0.55 * lit),
+              blurRadius: 6 + 12 * lit,
+              spreadRadius: 1 + 2 * lit,
+            ),
+            BoxShadow(
+              color: const Color(0xFF81D4FA)
+                  .withValues(alpha: 0.08 + 0.35 * lit),
+              blurRadius: 16 + 12 * lit,
+              spreadRadius: 2 + 3 * lit,
+            ),
+          ],
+        ),
+        child: CustomPaint(
+          painter: MoonPhasePainter(phase, tilt),
+          child: Center(
+            child: IconButton(
+              icon: Icon(
+                Icons.camera_alt_outlined,
+                color: lit >= 0.5
+                    ? const Color(0xFF1565C0) // 亮面：深蓝图标
+                    : Colors.white, // 暗面：白色图标
+              ),
+              iconSize: 22,
+              visualDensity: VisualDensity.compact,
+              onPressed: widget.onPressed,
+            ),
+          ),
+        ),
       ),
     );
   }

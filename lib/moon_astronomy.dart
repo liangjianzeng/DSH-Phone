@@ -102,6 +102,16 @@ class MoonAstronomy {
     );
   }
 
+  /// 太阳地平高度（度）：给定时刻与观测者位置。日出日落即高度跨过 −0.833°
+  /// （含大气折射与太阳视半径的标准昼夜界线），供昼夜判别/日出日落计算复用。
+  static double sunAltitudeDeg(DateTime nowUtc, ObserverLocation observer) {
+    final jd = _julianDate(nowUtc);
+    final t = (jd - 2451545.0) / 36525.0;
+    final sun = _sunEquatorial(t); // (ra, dec, λ)
+    final lstDeg = _localSiderealDeg(jd, observer.longitude);
+    return _altAzimuth(lstDeg, sun.$1, sun.$2, observer.latitude).$1;
+  }
+
   // ---------- 儒略日 / 恒星时 ----------
 
   static double _julianDate(DateTime utc) {

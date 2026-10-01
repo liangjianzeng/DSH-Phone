@@ -6,6 +6,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'config.dart';
 import 'moon_location.dart';
 import 'tunnel_service.dart';
+import 'weather_service.dart';
 
 /// 首次启动 / 设置页：配置 SSH 地址、用户名、认证方式（密钥或密码）、本地端口，
 /// 页面加载超时，以及（已连接时）界面缩放与缓存刷新控制。
@@ -28,6 +29,10 @@ class SetupScreen extends StatefulWidget {
     this.onZoomControlsChanged,
     this.photoControlsEnabled = true,
     this.onPhotoControlsChanged,
+    this.weatherEffectsEnabled = true,
+    this.onWeatherEffectsChanged,
+    this.sunSwitchEnabled = true,
+    this.onSunSwitchChanged,
     this.moonLocationMode = MoonLocationMode.beijing,
     this.moonManualLatitude = 39.9042,
     this.moonManualLongitude = 116.4074,
@@ -79,6 +84,18 @@ class SetupScreen extends StatefulWidget {
 
   /// 切换对话区相机入口显示（默认开启）。
   final ValueChanged<bool>? onPhotoControlsChanged;
+
+  /// 天气动效开关（默认开启；关闭则停止天气查询并隐藏动效）。
+  final bool weatherEffectsEnabled;
+
+  /// 切换天气动效（默认开启）。
+  final ValueChanged<bool>? onWeatherEffectsChanged;
+
+  /// 日出日落联动开关（默认开启；关闭则始终显示真实月相）。
+  final bool sunSwitchEnabled;
+
+  /// 切换日出日落联动（默认开启）。
+  final ValueChanged<bool>? onSunSwitchChanged;
 
   /// 月相观测位置模式（默认北京 / 手动经纬度 / 定位获取）。
   final MoonLocationMode moonLocationMode;
@@ -160,6 +177,12 @@ class _SetupScreenState extends State<SetupScreen> {
   /// 对话区相机入口开关的本地状态（同上）。
   late bool _photoControlsEnabled;
 
+  /// 天气动效开关的本地状态（同上）。
+  late bool _weatherEffectsEnabled;
+
+  /// 日出日落联动开关的本地状态（同上）。
+  late bool _sunSwitchEnabled;
+
   /// 月相观测位置模式的本地状态（独立路由，本地持有即时反映选择）。
   late MoonLocationMode _moonMode;
 
@@ -185,6 +208,8 @@ class _SetupScreenState extends State<SetupScreen> {
     _timeoutSeconds = widget.timeoutSeconds;
     _zoomControlsEnabled = widget.zoomControlsEnabled;
     _photoControlsEnabled = widget.photoControlsEnabled;
+    _weatherEffectsEnabled = widget.weatherEffectsEnabled;
+    _sunSwitchEnabled = widget.sunSwitchEnabled;
     _moonMode = widget.moonLocationMode;
     _moonLatCtrl =
         TextEditingController(text: '${widget.moonManualLatitude}');
@@ -996,6 +1021,37 @@ class _SetupScreenState extends State<SetupScreen> {
               widget.onPhotoControlsChanged?.call(v);
             },
           ),
+          SwitchListTile(
+            title: const Text('天气动效'),
+            subtitle: const Text(
+              '默认开启；按观测位置（经纬度）查询真实天气，在相机按钮周边显示'
+              '云/雨/雪/雾/雷动效（雨越大动效越强），启动时查询一次、之后每小时'
+              '刷新；关闭后不再查询并隐藏动效',
+            ),
+            value: _weatherEffectsEnabled,
+            onChanged: (v) {
+              setState(() => _weatherEffectsEnabled = v);
+              widget.onWeatherEffectsChanged?.call(v);
+            },
+          ),
+          // 实时呈现最近一次天气查询结果/失败原因；可手动立即刷新。
+          ValueListenableBuilder<String>(
+            valueListenable: WeatherService.statusText,
+            builder: (context, text, _) => ListTile(
+              dense: true,
+              leading: const Icon(Icons.cloud_outlined, size: 20),
+              title: Text(
+                text.isEmpty ? '尚未查询天气' : text,
+                style: const TextStyle(fontSize: 13),
+              ),
+              trailing: _weatherEffectsEnabled
+                  ? TextButton(
+                      onPressed: WeatherService.refresh,
+                      child: const Text('立即刷新'),
+                    )
+                  : null,
+            ),
+          ),
           const Divider(height: 24),
           const Text(
             '月相观测位置',
@@ -1096,6 +1152,18 @@ class _SetupScreenState extends State<SetupScreen> {
                     )
                   : null,
             ),
+          ),
+          SwitchListTile(
+            title: const Text('日出日落联动'),
+            subtitle: const Text(
+              '默认开启；按观测位置的日出日落时刻，白天相机按钮显示全亮'
+              '（月相暂停），夜间恢复真实月相；关闭后始终显示真实月相',
+            ),
+            value: _sunSwitchEnabled,
+            onChanged: (v) {
+              setState(() => _sunSwitchEnabled = v);
+              widget.onSunSwitchChanged?.call(v);
+            },
           ),
           const SizedBox(height: 8),
           OutlinedButton.icon(

@@ -22,10 +22,11 @@ void main() {
       expect(obs.phase01 % 1.0, closeTo(0.0, 0.03));
     });
 
-    test('2024-04-08 满月：照明度接近 1', () {
-      // 2024-04-08 18:21 UTC 为满月
+    test('2024-04-23 满月：照明度接近 1', () {
+      // 2024-04-23 23:49 UTC 为满月（注意：2024-04-08 是新月——北美日全食当日，
+      // 旧用例误标为满月，已修正）。
       final obs =
-          MoonAstronomy.compute(DateTime.utc(2024, 4, 8, 18, 21), beijing);
+          MoonAstronomy.compute(DateTime.utc(2024, 4, 23, 23, 49), beijing);
       expect(obs.illumination, closeTo(1.0, 0.02));
     });
   });
@@ -56,10 +57,10 @@ void main() {
       }
     });
 
-    test('倾角归一化到 -180..180 度', () {
+    test('倾角归一化到 0..360 度（_normDeg 约定）', () {
       final obs =
           MoonAstronomy.compute(DateTime.utc(2024, 3, 15, 12, 0), beijing);
-      expect(obs.tiltDeg, inInclusiveRange(-180.0, 180.0));
+      expect(obs.tiltDeg, inInclusiveRange(0.0, 360.0));
     });
 
     test('南半球观测不崩溃（悉尼）', () {

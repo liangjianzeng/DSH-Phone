@@ -67,7 +67,7 @@ dependencies:
   sherpa_onnx: ^1.13.8
   record: ^6.2.1
   background_downloader: 8.9.5
-  path: ^1.9.1
+  path: ^1.9.0
   # 查看器一键分享：调系统分享面板分享成果内容全文。
   share_plus: ^11.0.0
   # 下载保存文件名：当前时间 MD5 后 6 位指纹（避免同名覆盖）。

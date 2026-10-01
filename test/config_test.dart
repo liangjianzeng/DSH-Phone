@@ -3,9 +3,9 @@ import 'package:dsh_phone/config.dart';
 
 void main() {
   group('SSHConfig 纯逻辑', () {
-    test('appVersion 常量存在且为 v 前缀', () {
-      expect(SSHConfig.appVersion, startsWith('v'));
-      expect(SSHConfig.appVersion, isNotEmpty);
+    test('fallbackAppVersion 常量存在且为 v 前缀（运行时版本单一来源为 pubspec）', () {
+      expect(SSHConfig.fallbackAppVersion, startsWith('v'));
+      expect(SSHConfig.fallbackAppVersion, isNotEmpty);
     });
 
     test('isConfigured：主机/用户名/端口齐全才为已配置', () {
