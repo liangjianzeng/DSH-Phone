@@ -520,7 +520,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     // 先登记会话再启动：首次引擎加载需数秒，期间松手要能被正确收尾
     // （否则会话孤儿化：浮层滞留 + 麦克风常开，真机实测踩坑）。
     final session = HoldToTalkSession();
-    _holdSession = session;
+    if (mounted) setState(() => _holdSession = session); // 麦克风图标切录音动效
     final ok = await session.start(context);
     if (!identical(_holdSession, session)) {
       // 期间会话已被替换/清理（异常路径），兜底收尾
@@ -531,8 +531,7 @@ class _WebViewScreenState extends State<WebViewScreen>
       setState(() => _holdSession = null);
       _snack('端侧语音识别启动失败，请重试');
       return;
-    }
-    if (session.cancelRequested || !mounted) {
+    }    if (session.cancelRequested || !mounted) {
       // 引擎加载期间已松手：按取消丢弃
       await session.end(cancelled: true);
       if (mounted) setState(() => _holdSession = null);
@@ -2032,7 +2031,9 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 文本注入消息输入框；点击无动作（拖拽/长按两个手势，避免与注入动作误触）。
   ///
   /// 视觉上**只画麦克风图标本身**（无圆圈底/边框，用户要求：小一点也知道是
-  /// 干什么）；命中区域仍占满 48×48，保证拖拽与长按好按。
+  /// 干什么）；命中区域仍占满 48×48，保证拖拽与长按好按。按住说话期间图标
+  /// 播放声纹扩散动效（[_VoiceMicButton]），上滑取消时变红——让用户一眼
+  /// 知道正在监听。
   Widget _buildVoiceControls(BuildContext context, double stackHeight) {
     return Positioned(
       right: 8,
@@ -2047,13 +2048,7 @@ class _WebViewScreenState extends State<WebViewScreen>
         onLongPressMoveUpdate: _onVoiceLongPressMoveUpdate,
         onLongPressEnd: (_) => _onVoiceLongPressEnd(),
         onLongPressCancel: () => _onVoiceLongPressEnd(cancelled: true),
-        child: const SizedBox(
-          width: 48,
-          height: 48,
-          child: Center(
-            child: Icon(Icons.mic, size: 24),
-          ),
-        ),
+        child: _VoiceMicButton(session: _holdSession),
       ),
     );
   }
@@ -2256,4 +2251,119 @@ int _lunarDayOf(DateTime date) {
   } catch (_) {
     return 15;
   }
+}
+
+/// 麦克风语音按钮（右侧语音入口的视觉本体）：平时只是图标本身，按住说话
+/// 期间播放**声纹扩散动效**——三层声波环从麦克风向外扩散、图标随呼吸微
+/// 放大，上滑取消时整体变红——让用户一眼知道正在监听说话。
+///
+/// 无圆圈底/边框（用户要求）；48×48 命中区由外层 GestureDetector 提供。
+class _VoiceMicButton extends StatefulWidget {
+  const _VoiceMicButton({required this.session});
+
+  /// 按住说话会话；null = 空闲（静态图标），非 null = 录音中（播放动效）。
+  final HoldToTalkSession? session;
+
+  @override
+  State<_VoiceMicButton> createState() => _VoiceMicButtonState();
+}
+
+class _VoiceMicButtonState extends State<_VoiceMicButton>
+    with SingleTickerProviderStateMixin {
+  /// 声纹扩散周期：三层环相位各差 1/3，视觉上连续向外推出。
+  late final AnimationController _ctrl = AnimationController(
+      vsync: this, duration: const Duration(milliseconds: 1400));
+
+  /// 空闲时 cancelMode 的占位监听对象（避免可空 listenable 分支）。
+  static final ValueNotifier<bool> _notCancelling = ValueNotifier(false);
+
+  @override
+  void initState() {
+    super.initState();
+    _syncAnimation();
+  }
+
+  @override
+  void didUpdateWidget(_VoiceMicButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _syncAnimation();
+  }
+
+  /// 会话开始 → 循环播放；结束 → 停止并复位。
+  void _syncAnimation() {
+    if (widget.session != null) {
+      if (!_ctrl.isAnimating) _ctrl.repeat();
+    } else {
+      _ctrl.stop();
+      _ctrl.value = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final session = widget.session;
+    final idleColor = Theme.of(context).colorScheme.onSurfaceVariant;
+    return ValueListenableBuilder<bool>(
+      valueListenable: session?.cancelMode ?? _notCancelling,
+      builder: (context, cancelling, _) {
+        final active = session != null;
+        final color = active
+            ? (cancelling
+                ? Colors.redAccent
+                : Theme.of(context).colorScheme.primary)
+            : idleColor;
+        return AnimatedBuilder(
+          animation: _ctrl,
+          builder: (context, _) {
+            final t = active ? _ctrl.value : 0.0;
+            // 图标呼吸：0.9→1.12 缓放，随取消态直接切色即可（动效短暂）。
+            final scale = active ? 0.9 + 0.22 * (1 - (2 * t - 1).abs()) : 1.0;
+            return CustomPaint(
+              painter: _MicWavePainter(t: t, color: color),
+              child: Center(
+                child: Transform.scale(
+                  scale: scale,
+                  child: Icon(Icons.mic, size: 24, color: color),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+/// 声纹扩散环画笔：三层圆环从麦克风（中心）向外扩散并渐隐。
+class _MicWavePainter extends CustomPainter {
+  const _MicWavePainter({required this.t, required this.color});
+
+  /// 动画相位 0..1。
+  final double t;
+
+  /// 声波颜色（随取消态切换）。
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = size.center(Offset.zero);
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2;
+    for (var i = 0; i < 3; i++) {
+      final p = (t + i / 3) % 1.0;
+      paint.color = color.withValues(alpha: (1 - p) * 0.45);
+      canvas.drawCircle(center, 13 + 15 * p, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_MicWavePainter oldDelegate) =>
+      oldDelegate.t != t || oldDelegate.color != color;
 }
