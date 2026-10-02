@@ -51,6 +51,10 @@ class HoldToTalkSession {
     _overlay = OverlayEntry(builder: (_) => _HoldOverlay(session: this));
     overlay.insert(_overlay!);
     bool recording = false;
+    // 成功标记必须在 try 内置位：finally 不能用 [_engineStarted] 判断——
+    // 它在 finally 之后才置 true，恒为 false 会把成功路径也当成失败清理
+    // （引擎刚启动即被 stop/dispose，随后 _engine! 空指针崩溃，真机实测）。
+    bool success = false;
     try {
       _engine = await SherpaStreamingAsr.create(
           await AsrModelManager.modelDir());
@@ -58,11 +62,12 @@ class HoldToTalkSession {
       await _engine!.start();
       recording = true;
       if (_aborted) return false;
+      success = true;
     } catch (e) {
       debugPrint('[DSH][asr] session start failed: $e');
       return false;
     } finally {
-      if (!_engineStarted) {
+      if (!success) {
         // 失败或加载期间被中止：清理浮层与引擎
         _removeOverlay();
         final engine = _engine;

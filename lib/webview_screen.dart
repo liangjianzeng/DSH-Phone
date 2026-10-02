@@ -443,6 +443,12 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   // ---- 按住说话（长按月相按钮 → 端侧流式识别） ----
 
+  /// 长按手势是否仍在进行（手指未松开）。用于权限/模型弹窗这类「长按过程中
+  /// 弹出的系统/应用对话框」场景：弹窗期间用户必然松手去点弹窗，手势已结束，
+  /// 此时不应再启动会话——否则浮层无人收尾（孤儿会话）且后续长按被
+  /// `_holdSession != null` 拦截永久失效（真机实测踩坑）。
+  bool _photoLongPressActive = false;
+
   /// 长按开始：授权麦克风 → 确保模型就绪（未就绪弹断点续传下载引导）→
   /// 启动会话与浮层。系统识别（speech_to_text）已移除：ROM 权限问题
   /// 导致部分机型（小米系）一用即崩，2026-10-02 决策只保留端侧方案。
@@ -450,14 +456,19 @@ class _WebViewScreenState extends State<WebViewScreen>
     if (_holdSession != null) return;
     final c = _controller;
     if (c == null) return;
+    _photoLongPressActive = true;
     final mic = await Permission.microphone.request();
-    if (!mounted) return;
+    if (!mounted || !_photoLongPressActive) return;
     if (!mic.isGranted) {
       _snack('未授权麦克风，语音输入不可用');
       return;
     }
     final modelReady = await AsrModelGate.ensureModelReady(context);
-    if (!mounted) return;
+    if (!mounted || !_photoLongPressActive) {
+      // 弹窗期间已松手：模型可能刚就绪，提示用户重新长按。
+      if (mounted && modelReady) _snack('语音已就绪，请再次长按月相按钮说话');
+      return;
+    }
     if (!modelReady) {
       _snack('语音模型未下载完成，稍后再长按月相按钮');
       return;
@@ -494,6 +505,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 长按结束（松手/系统取消）：取终稿注入消息输入框（不自动发送）。
   /// 引擎尚未就绪（加载中松手）→ 标记取消，由 start 完成侧收尾。
   Future<void> _onPhotoLongPressEnd({bool cancelled = false}) async {
+    _photoLongPressActive = false; // 弹窗期间的收尾判断依赖此标记
     final session = _holdSession;
     if (session == null) return;
     if (!session.isStarted) {
