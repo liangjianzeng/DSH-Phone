@@ -35,6 +35,21 @@ class AsrModelManager {
 
   static final FileDownloader _downloader = FileDownloader();
 
+  /// 全局更新流的常驻单订阅 → 广播分发。`FileDownloader().updates` 是
+  /// 单订阅流，直接在每个下载任务里 listen 第二次会抛
+  /// "Stream has already been listened to"（真机实测）。
+  static StreamController<TaskUpdate>? _updateHub;
+
+  static Stream<TaskUpdate> get _updates {
+    _updateHub ??= () {
+      final hub = StreamController<TaskUpdate>.broadcast();
+      _downloader.updates.listen(hub.add, onError: hub.addError,
+          onDone: hub.close, cancelOnError: false);
+      return hub;
+    }();
+    return _updateHub!.stream;
+  }
+
   /// 模型目录：`<app documents>/models/asr/<modelId>`。
   static Future<String> modelDir() async {
     final docs = await getApplicationDocumentsDirectory();
@@ -134,14 +149,14 @@ class AsrModelManager {
     throw AsrDownloadException('$file 下载失败: $lastError');
   }
 
-  /// 订阅全局 updates 流直到该任务完结，透传字节进度。
+  /// 订阅更新流直到该任务完结，透传字节进度。
   static Future<TaskStatus> _downloadWithProgress(
     DownloadTask task,
     void Function(int bytes) onFileProgress,
   ) async {
     final completer = Completer<TaskStatus>();
     late final StreamSubscription<TaskUpdate> sub;
-    sub = _downloader.updates.listen((update) {
+    sub = _updates.listen((update) {
       if (update.task.taskId != task.taskId) return;
       switch (update) {
         case TaskProgressUpdate():
