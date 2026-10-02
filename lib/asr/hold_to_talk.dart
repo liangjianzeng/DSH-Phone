@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 import 'asr_model_manager.dart';
 import 'sherpa_streaming_asr.dart';
 
-/// 按住说话会话：长按月相按钮期间的浮层 UI + 引擎生命周期。
+/// 按住说话会话：长按语音按钮期间的浮层 UI + 引擎生命周期。
 ///
 /// 交互（微信式）：
 /// - `start`：先插浮层（「准备中」），引擎就绪后切换实时回显；
@@ -118,7 +118,7 @@ class _HoldOverlay extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Positioned.fill(
-      // 浮层只做展示：手指仍按在月相按钮上，事件路由不能被打断
+      // 浮层只做展示：手指仍按在语音按钮上，事件路由不能被打断
       child: IgnorePointer(
         child: Material(
           type: MaterialType.transparency,
@@ -307,7 +307,7 @@ class _AsrDownloadDialogState extends State<_AsrDownloadDialog> {
           const SizedBox(height: 8),
           const Text('· 下载到应用私有目录，不打包也无需重复下载\n'
               '· 中断（断网/杀 App）后自动断点续传\n'
-              '· 下载完成后长按月相按钮即可按住说话'),
+              '· 下载完成后长按右侧语音按钮即可按住说话'),
           const SizedBox(height: 14),
           ValueListenableBuilder<double>(
             valueListenable: _progress,

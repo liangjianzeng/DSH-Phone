@@ -29,6 +29,8 @@ class SetupScreen extends StatefulWidget {
     this.onZoomControlsChanged,
     this.photoControlsEnabled = true,
     this.onPhotoControlsChanged,
+    this.voiceControlsEnabled = true,
+    this.onVoiceControlsChanged,
     this.weatherEffectsEnabled = true,
     this.onWeatherEffectsChanged,
     this.sunSwitchEnabled = true,
@@ -84,6 +86,12 @@ class SetupScreen extends StatefulWidget {
 
   /// 切换对话区相机入口显示（默认开启）。
   final ValueChanged<bool>? onPhotoControlsChanged;
+
+  /// 对话区右侧语音输入入口是否显示（默认开启）。
+  final bool voiceControlsEnabled;
+
+  /// 切换对话区语音输入入口显示（默认开启）。
+  final ValueChanged<bool>? onVoiceControlsChanged;
 
   /// 天气动效开关（默认开启；关闭则停止天气查询并隐藏动效）。
   final bool weatherEffectsEnabled;
@@ -177,6 +185,9 @@ class _SetupScreenState extends State<SetupScreen> {
   /// 对话区相机入口开关的本地状态（同上）。
   late bool _photoControlsEnabled;
 
+  /// 对话区语音输入入口开关的本地状态（同上）。
+  late bool _voiceControlsEnabled;
+
   /// 天气动效开关的本地状态（同上）。
   late bool _weatherEffectsEnabled;
 
@@ -208,6 +219,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _timeoutSeconds = widget.timeoutSeconds;
     _zoomControlsEnabled = widget.zoomControlsEnabled;
     _photoControlsEnabled = widget.photoControlsEnabled;
+    _voiceControlsEnabled = widget.voiceControlsEnabled;
     _weatherEffectsEnabled = widget.weatherEffectsEnabled;
     _sunSwitchEnabled = widget.sunSwitchEnabled;
     _moonMode = widget.moonLocationMode;
@@ -1019,6 +1031,18 @@ class _SetupScreenState extends State<SetupScreen> {
             onChanged: (v) {
               setState(() => _photoControlsEnabled = v);
               widget.onPhotoControlsChanged?.call(v);
+            },
+          ),
+          SwitchListTile(
+            title: const Text('对话区显示语音输入入口'),
+            subtitle: const Text(
+              '默认开启；在对话区右侧显示麦克风浮动按钮，长按按住说话'
+              '（端侧识别），松手后转写文本注入消息输入框；可拖拽上下移动',
+            ),
+            value: _voiceControlsEnabled,
+            onChanged: (v) {
+              setState(() => _voiceControlsEnabled = v);
+              widget.onVoiceControlsChanged?.call(v);
             },
           ),
           SwitchListTile(

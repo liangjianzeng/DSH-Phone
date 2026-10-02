@@ -6,6 +6,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:lunar/lunar.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -65,7 +66,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   bool _reconnecting = false;
   bool _switching = false; // 手动切换实例时抑制自动重连
 
-  /// 按住说话会话（长按月相按钮期间非 null；结束后置回 null）。
+  /// 按住说话会话（长按语音按钮期间非 null；结束后置回 null）。
   HoldToTalkSession? _holdSession;
 
   /// 连续自动重连次数上限：防止"死循环连接"刷屏/耗尽资源。
@@ -83,6 +84,9 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   /// 对话区左侧相机入口的开关键（持久化，默认开启）。
   static const String _photoControlsPrefKey = 'webview_photo_controls_enabled';
+
+  /// 对话区右侧语音输入入口的开关键（持久化，默认开启）。
+  static const String _voiceControlsPrefKey = 'webview_voice_controls_enabled';
 
   /// 天气动效开关（持久化，默认开启；WeatherService.enabled 同步启停查询）。
   static const String _weatherEffectsPrefKey = 'weather_effects_enabled';
@@ -105,6 +109,9 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 对话区左侧相机入口是否显示（默认开启，由设置页开关控制）。
   bool _photoControlsEnabled = true;
 
+  /// 对话区右侧语音输入入口是否显示（默认开启，由设置页开关控制）。
+  bool _voiceControlsEnabled = true;
+
   /// 天气动效是否显示（默认开启，由设置页开关控制）。
   bool _weatherEffectsEnabled = true;
 
@@ -124,13 +131,18 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 相机入口顶边 Y（相对 Stack，px），默认底部往上约六分之一处。
   double _photoControlsTop = 0;
 
+  /// 语音入口顶边 Y（相对 Stack，px），默认与相机入口同高（右侧对称位置）。
+  double _voiceControlsTop = 0;
+
   /// 拖拽抓手偏移：pan 起始时“手指 Y − 控件顶边 Y”，使控件顶边始终跟随手指。
   double _zoomGripOffset = 0;
   double _photoGripOffset = 0;
+  double _voiceGripOffset = 0;
 
   /// 控件拖拽时顶边允许的最大值（Stack 高度 − 控件高度），保证不滑出屏外。
   static const double _zoomControlHeight = 120; // 3 图标 + 2 分隔，近似
   static const double _photoControlHeight = 48; // 圆形按钮 48×48
+  static const double _voiceControlHeight = 48; // 圆形麦克风按钮 48×48
 
   // ---- WebView 页面加载状态 ----
   bool _pageLoading = false; // 远程页面加载中（隧道已通，页面未就绪）
@@ -195,6 +207,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     _loadZoomScale();
     _loadZoomControls();
     _loadPhotoControls();
+    _loadVoiceControls();
     _loadToolSwitches();
     // 监控采样定时器常驻，内部仅在隧道 connected 时旁路采集。
     HostMonitor.instance.start();
@@ -374,6 +387,23 @@ class _WebViewScreenState extends State<WebViewScreen>
     );
   }
 
+  /// 读取持久化的对话区语音输入入口开关。
+  Future<void> _loadVoiceControls() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool(_voiceControlsPrefKey) ?? true;
+    if (!mounted) return;
+    setState(() => _voiceControlsEnabled = enabled);
+  }
+
+  /// 保存并应用对话区语音输入入口开关（默认开启）。
+  void _setVoiceControlsEnabled(bool enabled) {
+    if (!mounted) return;
+    setState(() => _voiceControlsEnabled = enabled);
+    SharedPreferences.getInstance().then(
+      (prefs) => prefs.setBool(_voiceControlsPrefKey, enabled),
+    );
+  }
+
   /// 读取天气动效开关（默认开启）。
   Future<void> _loadWeatherEffects() async {
     final prefs = await SharedPreferences.getInstance();
@@ -425,15 +455,12 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   /// 相机入口拖拽：更新归一化顶边（相对 Stack，px）。
-  /// 按住说话期间不拖拽（长按赢得手势竞技场后拖拽本就不会触发，此处双保险）。
   void _onPhotoControlsPanStart(DragStartDetails details, double stackHeight) {
-    if (_holdSession != null) return;
     _photoGripOffset = details.globalPosition.dy - _photoControlsTop;
   }
 
   void _onPhotoControlsPanUpdate(
       DragUpdateDetails details, double stackHeight) {
-    if (_holdSession != null) return;
     final newTop = (details.globalPosition.dy - _photoGripOffset)
         .clamp(0.0, stackHeight - _photoControlHeight);
     if ((newTop - _photoControlsTop).abs() > 1.0) {
@@ -441,36 +468,53 @@ class _WebViewScreenState extends State<WebViewScreen>
     }
   }
 
-  // ---- 按住说话（长按月相按钮 → 端侧流式识别） ----
+  /// 语音入口拖拽：更新顶边（相对 Stack，px）。
+  /// 按住说话期间不拖拽（长按赢得手势竞技场后拖拽本就不会触发，此处双保险）。
+  void _onVoiceControlsPanStart(DragStartDetails details, double stackHeight) {
+    if (_holdSession != null) return;
+    _voiceGripOffset = details.globalPosition.dy - _voiceControlsTop;
+  }
+
+  void _onVoiceControlsPanUpdate(
+      DragUpdateDetails details, double stackHeight) {
+    if (_holdSession != null) return;
+    final newTop = (details.globalPosition.dy - _voiceGripOffset)
+        .clamp(0.0, stackHeight - _voiceControlHeight);
+    if ((newTop - _voiceControlsTop).abs() > 1.0) {
+      setState(() => _voiceControlsTop = newTop);
+    }
+  }
+
+  // ---- 按住说话（长按右侧语音按钮 → 端侧流式识别） ----
 
   /// 长按手势是否仍在进行（手指未松开）。用于权限/模型弹窗这类「长按过程中
   /// 弹出的系统/应用对话框」场景：弹窗期间用户必然松手去点弹窗，手势已结束，
   /// 此时不应再启动会话——否则浮层无人收尾（孤儿会话）且后续长按被
   /// `_holdSession != null` 拦截永久失效（真机实测踩坑）。
-  bool _photoLongPressActive = false;
+  bool _voiceLongPressActive = false;
 
-  /// 长按开始：授权麦克风 → 确保模型就绪（未就绪弹断点续传下载引导）→
+  /// 语音按钮长按开始：授权麦克风 → 确保模型就绪（未就绪弹断点续传下载引导）→
   /// 启动会话与浮层。系统识别（speech_to_text）已移除：ROM 权限问题
   /// 导致部分机型（小米系）一用即崩，2026-10-02 决策只保留端侧方案。
-  Future<void> _onPhotoLongPressStart() async {
+  Future<void> _onVoiceLongPressStart() async {
     if (_holdSession != null) return;
     final c = _controller;
     if (c == null) return;
-    _photoLongPressActive = true;
+    _voiceLongPressActive = true;
     final mic = await Permission.microphone.request();
-    if (!mounted || !_photoLongPressActive) return;
+    if (!mounted || !_voiceLongPressActive) return;
     if (!mic.isGranted) {
       _snack('未授权麦克风，语音输入不可用');
       return;
     }
     final modelReady = await AsrModelGate.ensureModelReady(context);
-    if (!mounted || !_photoLongPressActive) {
+    if (!mounted || !_voiceLongPressActive) {
       // 弹窗期间已松手：模型可能刚就绪，提示用户重新长按。
-      if (mounted && modelReady) _snack('语音已就绪，请再次长按月相按钮说话');
+      if (mounted && modelReady) _snack('语音已就绪，请再次长按语音按钮说话');
       return;
     }
     if (!modelReady) {
-      _snack('语音模型未下载完成，稍后再长按月相按钮');
+      _snack('语音模型未下载完成，稍后再长按语音按钮');
       return;
     }
     // 先登记会话再启动：首次引擎加载需数秒，期间松手要能被正确收尾
@@ -497,15 +541,15 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   /// 长按移动：上滑超阈值 → 切换「松开取消」。
-  void _onPhotoLongPressMoveUpdate(LongPressMoveUpdateDetails details) {
+  void _onVoiceLongPressMoveUpdate(LongPressMoveUpdateDetails details) {
     _holdSession?.cancelMode.value =
         details.offsetFromOrigin.dy < -HoldToTalkSession.cancelSlop;
   }
 
   /// 长按结束（松手/系统取消）：取终稿注入消息输入框（不自动发送）。
   /// 引擎尚未就绪（加载中松手）→ 标记取消，由 start 完成侧收尾。
-  Future<void> _onPhotoLongPressEnd({bool cancelled = false}) async {
-    _photoLongPressActive = false; // 弹窗期间的收尾判断依赖此标记
+  Future<void> _onVoiceLongPressEnd({bool cancelled = false}) async {
+    _voiceLongPressActive = false; // 弹窗期间的收尾判断依赖此标记
     final session = _holdSession;
     if (session == null) return;
     if (!session.isStarted) {
@@ -820,6 +864,8 @@ class _WebViewScreenState extends State<WebViewScreen>
           onZoomControlsChanged: _setZoomControlsEnabled,
           photoControlsEnabled: _photoControlsEnabled,
           onPhotoControlsChanged: _setPhotoControlsEnabled,
+          voiceControlsEnabled: _voiceControlsEnabled,
+          onVoiceControlsChanged: _setVoiceControlsEnabled,
           weatherEffectsEnabled: _weatherEffectsEnabled,
           onWeatherEffectsChanged: _setWeatherEffectsEnabled,
           sunSwitchEnabled: _sunSwitchEnabled,
@@ -1670,6 +1716,7 @@ class _WebViewScreenState extends State<WebViewScreen>
               _bodyHeight = stackHeight;
               _zoomControlsTop = stackHeight * 0.5; // 默认屏幕中央
               _photoControlsTop = stackHeight * (1 - 1 / 6); // 底部往上约六分之一
+              _voiceControlsTop = _photoControlsTop; // 右侧与相机入口同高
             } else if ((stackHeight - _bodyHeight).abs() > 1) {
               // 容器高度变化（键盘/旋转等）时同步基准高度
               _bodyHeight = stackHeight;
@@ -1766,6 +1813,12 @@ class _WebViewScreenState extends State<WebViewScreen>
                     !_pageLoading &&
                     _pageError == null)
                   _buildPhotoControls(context, stackHeight),
+                // 语音输入浮动按钮：对话区右侧靠屏幕边（与相机入口对称），
+                // 可拖拽上下移动，长按按住说话，默认开启。
+                if (_voiceControlsEnabled &&
+                    !_pageLoading &&
+                    _pageError == null)
+                  _buildVoiceControls(context, stackHeight),
                 // 天气动效：云/雨/雪/雾/雷锚定相机按钮当前位置（拖拽跟随），
                 // 绘制在按钮上层、低不透明度且不拦截触摸；相机入口隐藏时一并隐藏。
                 if (_photoControlsEnabled &&
@@ -1957,20 +2010,64 @@ class _WebViewScreenState extends State<WebViewScreen>
     return Positioned(
       left: 6,
       top: _photoControlsTop,
-      // 可拖拽自由上下移动：占满命中区域捕获拖拽，点击透传给内部相机按钮，
-      // 长按启动按住说话（端侧流式识别，微信式交互）
+      // 可拖拽自由上下移动：占满命中区域捕获拖拽，点击透传给内部相机按钮
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onPanStart: (details) => _onPhotoControlsPanStart(details, stackHeight),
         onPanUpdate: (details) =>
             _onPhotoControlsPanUpdate(details, stackHeight),
-        onLongPressStart: (_) => _onPhotoLongPressStart(),
-        onLongPressMoveUpdate: _onPhotoLongPressMoveUpdate,
-        onLongPressEnd: (_) => _onPhotoLongPressEnd(),
-        onLongPressCancel: () => _onPhotoLongPressEnd(cancelled: true),
         child: _MoonCameraButton(
           sunSwitchEnabled: _sunSwitchEnabled,
           onPressed: _pickAndSendImage,
+        ),
+      ),
+    );
+  }
+
+  /// 语音输入浮动按钮：对话区**右侧**、默认与相机入口同高，可拖拽上下移动。
+  /// 长按按住说话（端侧流式识别，微信式交互）：上滑取消、松手把转写文本
+  /// 注入消息输入框；点击无动作（拖拽/长按两个手势，避免与注入动作误触）。
+  Widget _buildVoiceControls(BuildContext context, double stackHeight) {
+    return Positioned(
+      right: 6,
+      top: _voiceControlsTop,
+      // 占满命中区域捕获拖拽与长按；无内部按钮，点击不产生动作
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onPanStart: (details) => _onVoiceControlsPanStart(details, stackHeight),
+        onPanUpdate: (details) =>
+            _onVoiceControlsPanUpdate(details, stackHeight),
+        onLongPressStart: (_) => _onVoiceLongPressStart(),
+        onLongPressMoveUpdate: _onVoiceLongPressMoveUpdate,
+        onLongPressEnd: (_) => _onVoiceLongPressEnd(),
+        onLongPressCancel: () => _onVoiceLongPressEnd(cancelled: true),
+        child: SizedBox(
+          width: 48,
+          height: 48,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: Theme.of(context).colorScheme.surfaceContainerHighest
+                  .withValues(alpha: 0.85),
+              border: Border.all(
+                color: Theme.of(context).colorScheme.primary,
+                width: 2,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Theme.of(context)
+                      .colorScheme
+                      .primary
+                      .withValues(alpha: 0.25),
+                  blurRadius: 8,
+                  spreadRadius: 1,
+                ),
+              ],
+            ),
+            child: const Center(
+              child: Icon(Icons.mic, size: 24),
+            ),
+          ),
         ),
       ),
     );
@@ -2098,8 +2195,19 @@ class _MoonCameraButtonState extends State<_MoonCameraButton> {
     final phase = dayMode ? 0.5 : obs.phase01;
     final tilt = dayMode ? 0.0 : obs.tiltDeg;
     final borderColor = const Color(0xFF64B5F6);
-    // 注意：IconButton 不能加 tooltip——tooltip 自带长按手势，会抢走外层
-    // GestureDetector 的长按（按住说话）手势（2026-10-02 真机实测）。
+    // 有日出日落信息时在提示里展示今日时刻（极昼/极夜无事件则省略）。
+    final sun = widget.sunSwitchEnabled
+        ? SunTimes.compute(nowUtc, MoonLocation.observer.value)
+        : null;
+    final tooltip = dayMode
+        ? '添加图片/拍照（视觉工具）·白天·日光模式'
+            '${_hm(sun?.sunriseUtc)}~${_hm(sun?.sunsetUtc)}'
+            '·观测${MoonLocation.observerLabel}'
+        : '添加图片/拍照（视觉工具）·${obs.name}'
+            '·照明 ${(obs.illumination * 100).round()}%'
+            '·农历${_lunarDayOf(now)}'
+            '·观测${MoonLocation.observerLabel}';
+    // 月相按钮不承担长按说话（入口在右侧语音按钮），tooltip 可放心使用。
     return SizedBox(
       width: 48,
       height: 48,
@@ -2126,6 +2234,7 @@ class _MoonCameraButtonState extends State<_MoonCameraButton> {
           painter: MoonPhasePainter(phase, tilt),
           child: Center(
             child: IconButton(
+              tooltip: tooltip,
               icon: Icon(
                 Icons.camera_alt_outlined,
                 color: lit >= 0.5
@@ -2140,5 +2249,26 @@ class _MoonCameraButtonState extends State<_MoonCameraButton> {
         ),
       ),
     );
+  }
+
+  /// 本地时刻 HH:mm（日出日落提示用）；null（极昼/极夜）返回占位符。
+  static String _hm(DateTime? utc) {
+    if (utc == null) return '--:--';
+    final local = utc.toLocal();
+    final hh = local.hour.toString().padLeft(2, '0');
+    final mm = local.minute.toString().padLeft(2, '0');
+    return '$hh:$mm';
+  }
+}
+
+/// 农历日（1~29/30）。统一按北京时间（UTC+8）推算农历，避免设备时区差异
+/// 导致月相差一天；异常时退回 15（满月，最亮最显眼）。
+int _lunarDayOf(DateTime date) {
+  try {
+    // 本地时间 → UTC → +8h 得到北京日历字段；lunar 只取年月日，忽略时分。
+    final beijing = date.toUtc().add(const Duration(hours: 8));
+    return Solar.fromDate(beijing).getLunar().getDay();
+  } catch (_) {
+    return 15;
   }
 }
