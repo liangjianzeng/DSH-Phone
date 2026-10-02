@@ -8,11 +8,16 @@ import 'sherpa_streaming_asr.dart';
 /// 按住说话会话：长按月相按钮期间的浮层 UI + 引擎生命周期。
 ///
 /// 交互（微信式）：
-/// - `begin`：启动引擎录音并插入浮层（partial 文本实时回显）；
+/// - `start`：先插浮层（「准备中」），引擎就绪后切换实时回显；
 /// - 上滑超过阈值 → cancelMode（浮层提示「松开取消」）；
-/// - `end`：松手时取终稿（cancelMode 或空文本返回 null）。
+/// - `end`：松手时取终稿（cancelMode 或空文本返回空串）。
+///
+/// 生命周期坑（真机实测）：首次 start 要加载 ~160MB 模型（数秒），期间
+/// 用户可能已松手——调用方必须在 start 前把会话登记到持有方，松手时若
+/// 引擎未就绪则置 [cancelRequested]，由 start 完成侧负责收尾，避免会话
+/// 孤儿化（浮层滞留 + 麦克风常开）。
 class HoldToTalkSession {
-  HoldToTalkSession._();
+  HoldToTalkSession();
 
   /// 实时转写文本（已断句定稿 + 当前 partial）。
   final ValueNotifier<String> partial = ValueNotifier('');
@@ -20,38 +25,71 @@ class HoldToTalkSession {
   /// 上滑取消状态（浮层据此切换提示样式）。
   final ValueNotifier<bool> cancelMode = ValueNotifier(false);
 
+  /// 引擎是否已就绪（浮层据此从「准备中」切到实时回显）。
+  final ValueNotifier<bool> ready = ValueNotifier(false);
+
+  /// 引擎加载完成前用户已松手：start 侧收尾时按取消处理。
+  bool cancelRequested = false;
+
   OverlayEntry? _overlay;
   SherpaStreamingAsr? _engine;
   StreamSubscription<String>? _sub;
+  bool _engineStarted = false;
+  bool _aborted = false;
+
+  /// 引擎是否已开始录音（end 语义分叉的依据）。
+  bool get isStarted => _engineStarted;
 
   /// 上滑取消的位移阈值（逻辑像素，相对长按起点）。
   static const double cancelSlop = 70;
 
-  /// 开始一次按住说话：引擎启动成功返回会话并显示浮层；失败返回 null。
-  static Future<HoldToTalkSession?> begin(
-      BuildContext context, String modelDir) async {
+  /// 启动会话：插浮层 → 加载引擎 → 开始录音 → 切实时回显。
+  /// 返回 false = 启动失败（浮层已自行撤除）。
+  Future<bool> start(BuildContext context) async {
     // 先取 OverlayState（context 跨 async gap 使用会告警）
     final overlay = Overlay.of(context, rootOverlay: true);
-    final session = HoldToTalkSession._();
+    _overlay = OverlayEntry(builder: (_) => _HoldOverlay(session: this));
+    overlay.insert(_overlay!);
+    bool recording = false;
     try {
-      session._engine = await SherpaStreamingAsr.create(modelDir);
-      await session._engine!.start();
+      _engine = await SherpaStreamingAsr.create(
+          await AsrModelManager.modelDir());
+      if (_aborted) return false;
+      await _engine!.start();
+      recording = true;
+      if (_aborted) return false;
     } catch (e) {
-      debugPrint('[DSH][asr] session begin failed: $e');
-      await session._engine?.dispose();
-      return null;
+      debugPrint('[DSH][asr] session start failed: $e');
+      return false;
+    } finally {
+      if (!_engineStarted) {
+        // 失败或加载期间被中止：清理浮层与引擎
+        _removeOverlay();
+        final engine = _engine;
+        _engine = null;
+        if (engine != null) {
+          if (recording) await engine.stop();
+          await engine.dispose();
+        }
+      }
     }
-    session._sub = session._engine!.partialText.listen((t) {
-      session.partial.value = t;
+    _engineStarted = true;
+    _sub = _engine!.partialText.listen((t) {
+      partial.value = t;
     });
-    session._overlay =
-        OverlayEntry(builder: (_) => _HoldOverlay(session: session));
-    overlay.insert(session._overlay!);
-    return session;
+    ready.value = true;
+    return true;
   }
 
   /// 结束会话：[cancelled] 为 true 时丢弃结果。返回终稿文本（可能为空串）。
+  /// 引擎尚未就绪时调用 = 请求中止，由 start 的 finally 负责清理。
   Future<String> end({bool cancelled = false}) async {
+    if (!_engineStarted) {
+      _aborted = true;
+      cancelRequested = true;
+      _removeOverlay();
+      return '';
+    }
     _removeOverlay();
     await _sub?.cancel();
     _sub = null;
@@ -102,7 +140,9 @@ class _HoldOverlay extends StatelessWidget {
                           _PulsingMicIcon(red: cancelling),
                           const SizedBox(width: 10),
                           Text(
-                            cancelling ? '松开取消' : '松开发送',
+                            cancelling
+                                ? '松开取消'
+                                : session.ready.value ? '松开发送' : '准备中…',
                             style: TextStyle(
                               color: cancelling
                                   ? Colors.redAccent

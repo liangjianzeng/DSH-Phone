@@ -20,7 +20,6 @@ import 'moon_astronomy.dart';
 import 'moon_location.dart';
 import 'moon_painter.dart';
 import 'setup_screen.dart';
-import 'asr/asr_model_manager.dart';
 import 'asr/hold_to_talk.dart';
 import 'task_notifier.dart';
 import 'tunnel_service.dart';
@@ -410,18 +409,27 @@ class _WebViewScreenState extends State<WebViewScreen>
       _snack('语音模型未下载完成，稍后再长按月相按钮');
       return;
     }
-    final modelDir = await AsrModelManager.modelDir();
-    if (!mounted) return;
-    final session = await HoldToTalkSession.begin(context, modelDir);
-    if (!mounted) {
-      await session?.end(cancelled: true);
+    // 先登记会话再启动：首次引擎加载需数秒，期间松手要能被正确收尾
+    // （否则会话孤儿化：浮层滞留 + 麦克风常开，真机实测踩坑）。
+    final session = HoldToTalkSession();
+    _holdSession = session;
+    final ok = await session.start(context);
+    if (!identical(_holdSession, session)) {
+      // 期间会话已被替换/清理（异常路径），兜底收尾
+      await session.end(cancelled: true);
       return;
     }
-    if (session == null) {
+    if (!ok) {
+      setState(() => _holdSession = null);
       _snack('端侧语音识别启动失败，请重试');
       return;
     }
-    setState(() => _holdSession = session);
+    if (session.cancelRequested || !mounted) {
+      // 引擎加载期间已松手：按取消丢弃
+      await session.end(cancelled: true);
+      if (mounted) setState(() => _holdSession = null);
+      return;
+    }
   }
 
   /// 长按移动：上滑超阈值 → 切换「松开取消」。
@@ -431,9 +439,14 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   /// 长按结束（松手/系统取消）：取终稿注入消息输入框（不自动发送）。
+  /// 引擎尚未就绪（加载中松手）→ 标记取消，由 start 完成侧收尾。
   Future<void> _onPhotoLongPressEnd({bool cancelled = false}) async {
     final session = _holdSession;
     if (session == null) return;
+    if (!session.isStarted) {
+      session.cancelRequested = true;
+      return;
+    }
     if (mounted) setState(() => _holdSession = null);
     final discard = cancelled || session.cancelMode.value;
     final text = await session.end(cancelled: discard);

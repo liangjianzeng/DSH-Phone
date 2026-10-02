@@ -38,6 +38,9 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
   /// [AsrModelManager.isReady] 校验，否则抛 [StateError]。
   static Future<void> ensureLoaded(String modelDir) async {
     if (_recognizer != null) return;
+    // FFI 绑定必须先初始化（Flutter 走 DynamicLibrary.process()），
+    // 否则 OnlineRecognizer 抛 "Please initialize sherpa-onnx first"。
+    sherpa.initBindings();
     final sw = Stopwatch()..start();
     final recognizer = sherpa.OnlineRecognizer(sherpa.OnlineRecognizerConfig(
       model: sherpa.OnlineModelConfig(

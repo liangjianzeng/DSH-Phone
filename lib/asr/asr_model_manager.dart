@@ -164,9 +164,20 @@ class AsrModelManager {
               ? (update.progress * update.expectedFileSize).round()
               : 0);
         case TaskStatusUpdate():
-          if (completer.isCompleted) return;
-          completer.complete(update.status);
-          sub.cancel();
+          // 只在终态完成等待：enqueued/running/waitingForRetry 是中间态，
+          // 首个收到的状态更新可能是 enqueued（时序竞态），当成结束会误报
+          // "下载失败: TaskStatus.enqueued"（USB 真机实测）。
+          const terminalStatuses = {
+            TaskStatus.complete,
+            TaskStatus.failed,
+            TaskStatus.canceled,
+            TaskStatus.notFound,
+          };
+          if (terminalStatuses.contains(update.status) &&
+              !completer.isCompleted) {
+            completer.complete(update.status);
+            sub.cancel();
+          }
       }
     });
     await _downloader.enqueue(task);
