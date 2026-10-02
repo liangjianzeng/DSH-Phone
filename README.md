@@ -74,7 +74,7 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - ⚡ **设置自动保存**：表单编辑停止即自动落盘（无右上角"保存"按钮），返回设置页自动重连应用最新配置；实例级监控开关切换即生效。
 - 🖥️ **全屏边缘到边缘**：顶栏延伸到系统状态栏区域，最大化显示面积。
 - 🌗 **主题自适应**：跟随系统深色 / 浅色模式，背景与状态栏图标自动切换。
-- ⚙️ **设置管理**：修改地址 / 用户名 / 认证、清空缓存、缩放控制、对话区缩放控件开关、刷新缓存。
+- ⚙️ **设置管理**：修改地址 / 用户名 / 认证、清空缓存、缩放控制、对话区缩放控件 / 相机入口 / 语音输入入口开关、天气动效开关、日出日落联动开关、月相观测位置、刷新缓存。
 - ℹ️ **关于**：显示版本、项目原理、开源地址，可直接跳转 GitHub / README。
 - 🔒 **敏感信息加密**：密码 / 私钥存于 Android Keystore（`flutter_secure_storage`）。
 
@@ -142,6 +142,10 @@ lib/
 ├── download_manager.dart     # 会话级下载管理（断点续传 / 暂停 / 取消）
 ├── download_screen.dart      # 资源下载页（进度 / 暂停继续 / 另存为）
 ├── unsloth_screen.dart       # Unsloth Studio 页面（独立 WebView / 缓存刷新 / 自动登录）
+├── asr/asr_engine.dart           # 语音识别引擎抽象（StreamingAsrEngine 接口）
+├── asr/sherpa_streaming_asr.dart # sherpa-onnx 流式中文识别封装（录音→PCM→实时 partial）
+├── asr/asr_model_manager.dart    # 中文模型管理（~160MB 断点续传下载 / 就绪校验）
+├── asr/hold_to_talk.dart         # 按住说话会话（浮层回显 / 上滑取消 / 下载引导）
 ├── moon_astronomy.dart       # 真实月球观测计算（Meeus 算法：相位/照明度/盘面朝向）
 ├── moon_location.dart        # 观测位置解析（默认北京 / 手动经纬度 / GPS）
 ├── moon_painter.dart         # 月相盘面 CustomPainter（明暗界线椭圆画法）
