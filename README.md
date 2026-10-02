@@ -58,7 +58,7 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - 🔍 **界面缩放**：双指缩放 + 顶栏/设置页 放大、缩小、重置；缩放比例**自动保存**，下次沿用。
 - 🎛️ **对话区缩放控件开关**：对话区左侧的放大/缩小/重置浮动按钮默认隐藏，可在设置 → 界面设置中一键开启，避免遮挡内容。
 - 📷 **图片直传（视觉工具入口）**：对话区左侧淡蓝色圆形发光相机按钮，一眼即可识别视觉能力；点击拍照/相册选图，自动压缩（≤4096px / 90% 质量）后直传 DSH 消息输入窗口附件槽，支持 png/jpeg/webp/gif；默认开启，设置 → 界面设置可关。
-- 🎙️ **语音输入（按住说话）**：对话区**右侧麦克风悬浮按钮**（默认与月相按钮同高，可拖拽上下移动，设置 → 界面设置可关），**长按**即按住说话——sherpa-onnx 流式 Zipformer 端侧识别（模型 ~160MB 首次使用断点续传下载，之后完全离线），实时回显转写、上滑取消、松手注入消息输入框（不自动发送）；不依赖系统/ROM 识别服务，各机型表现一致。
+- 🎙️ **语音输入（按住说话）**：对话区**右侧悬浮麦克风图标**（纯图标无底框，默认比月相按钮略高，可拖拽上下移动，设置 → 界面设置可关），**长按**即按住说话——sherpa-onnx 流式 Zipformer 端侧识别（模型 ~160MB 首次使用断点续传下载，之后完全离线），实时回显转写、上滑取消、松手注入消息输入框（不自动发送）；不依赖系统/ROM 识别服务，各机型表现一致。
 - 🌙 **真实月相天文模型**：相机入口按钮按你所在观测位置呈现真实月相（太阳/月球实际位置计算照明度与盘面朝向，含农历日）；观测位置支持默认北京 / 手动经纬度 / GPS 定位（失败自动回退）。
 - 🌅 **日出日落联动**：按观测位置的日出日落时刻，白天相机按钮显示全亮（月相暂停），夜间恢复真实月相；本地天文计算无需联网，设置 → 界面设置可关（关闭则始终显示真实月相）。
 - 🌦️ **天气动效**：按观测位置经纬度查询真实天气（Open-Meteo 免费数据源，免 API Key），在相机按钮周边显示云/雨/雪/雾/雷动效——雨越大动效越强，动效随按钮拖拽位置移动、不遮挡对话内容；启动时查询一次、之后每小时刷新，设置 → 界面设置可关（默认开启）。
@@ -93,7 +93,7 @@ DSH-Phone 通过 SSH 隧道接入主机端，因此主机端需要能接受 SSH 
 
 ```bash
 flutter pub get
-flutter pub run flutter_launcher_icons   # 从 icon/logo.png 生成启动图标
+dart run flutter_launcher_icons        # 从 icon/logo.png 生成启动图标
 flutter build apk --release
 ```
 
@@ -103,7 +103,7 @@ flutter build apk --release
 
 1. 首次打开 → 配置 SSH 地址（如 `100.81.83.59`）、用户名（如 `jianzengliang`）、认证方式与本地端口（默认 `3081`）；最多可配置 3 路实例。
 2. 保存并连接，隧道建立后自动加载 `http://127.0.0.1:3081` 的 DSH Web UI。若服务端启用了 token 鉴权（访问提示 `dsh web authentication required`），先在设置对应实例填入 DSH 启动时打印的 `?token=` 值。
-3. 顶栏：实例切换器 + 连接状态 + Unsloth Studio 入口 + 设置入口。设置页含 SSH 配置、DSH 访问 Token、Unsloth Studio 配置、加载超时、界面缩放 / 刷新缓存、关于信息。
+3. 顶栏：实例切换器 + 连接状态 + Unsloth Studio 入口 + 设置入口。设置页含 SSH 配置、DSH 访问 Token、Unsloth Studio 配置、加载超时、界面开关（缩放控件 / 相机入口 / 语音输入入口 / 天气动效 / 日出日落联动）、月相观测位置、上传大小上限、关于信息。
 
 > 说明：远程 DSH 默认只监听 `127.0.0.1:3080`，且配置类接口（如 `settings.describe`）被设计为仅 loopback 访问。DSH-Phone 通过 SSH 隧道把手机本机端口转发到远程，使 WebView 以 loopback 身份访问，从而获得完整功能。
 >
@@ -125,6 +125,15 @@ flutter build apk --release
 | `file_picker` | 下载 / 另存为：系统文件选择器（SAF）保存位置 |
 | `path_provider` | 下载临时目录 |
 | `flutter_foreground_task`（本地 fork，`third_party/`） | 前台服务后台保活（隧道连接期间保持进程/网络，避免后台断线重连；补 namespace 兼容 AGP 8.x） |
+| `sherpa_onnx` + `record` | 端侧流式语音识别（sherpa-onnx 流式 Zipformer 中文模型 CPU 推理）+ 16kHz PCM 录音流 |
+| `background_downloader` | ASR 中文模型下载（~160MB 断点续传，hf-mirror 主源 + huggingface 兜底） |
+| `geolocator` | 月相观测位置定位获取（GPS，失败自动回退） |
+| `image_picker` | 相机/相册选图直传 DSH 附件槽 |
+| `receive_sharing_intent` | 系统分享入口（其它 App 分享图片/文本拉起注入） |
+| `flutter_local_notifications` | 锁屏任务通知（任务进行中/完成） |
+| `lunar` | 农历日计算（月相按钮提示展示） |
+| `permission_handler` | 麦克风运行时权限申请 |
+| `package_info_plus` | 「关于」运行时读取构建版本号（单一来源 pubspec） |
 
 ## 目录结构
 
