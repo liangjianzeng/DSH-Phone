@@ -1,16 +1,18 @@
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_highlight/flutter_highlight.dart';
 import 'package:flutter_highlight/themes/atom-one-dark.dart';
 import 'package:flutter_highlight/themes/atom-one-light.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:flutter_widget_from_html_core/flutter_widget_from_html_core.dart';
+import 'package:share_plus/share_plus.dart';
 
 import 'artifact_recognizer.dart';
+import 'tunnel_service.dart' show RemoteReadException;
 
 /// 原生成果查看器：按类型渲染 md / html / 代码，关闭即返回对话。
 ///
@@ -63,6 +65,9 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
   String? _asyncContent;
   bool _loading = false;
 
+  /// 异步加载失败原因（真实原因，如隧道未连接/文件过大，错误页展示）。
+  String? _loadError;
+
   /// 另存为状态。
   bool _saving = false;
 
@@ -83,10 +88,17 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
       }).catchError((Object e) {
         debugPrint('VIEWER load error: $e');
         if (!mounted) return;
-        setState(() => _loading = false);
+        setState(() {
+          _loadError = _errorText(e);
+          _loading = false;
+        });
       });
     }
   }
+
+  /// 提取用户可读的失败原因（自定义异常直接取 message）。
+  static String _errorText(Object e) =>
+      e is RemoteReadException ? e.message : '$e';
 
   String get _title {
     final lang = widget.language;
@@ -110,6 +122,16 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
         title: Text(_title),
         actions: [
           IconButton(
+            tooltip: '复制内容',
+            icon: const Icon(Icons.copy),
+            onPressed: _canCopyShare ? _copyContent : null,
+          ),
+          IconButton(
+            tooltip: '一键分享',
+            icon: const Icon(Icons.share),
+            onPressed: _canCopyShare ? _shareContent : null,
+          ),
+          IconButton(
             tooltip: '另存为（下载保存到本机）',
             icon: const Icon(Icons.download),
             onPressed: _saving ? null : _save,
@@ -131,6 +153,37 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
   String get _effectiveContent =>
       widget.content.isNotEmpty ? widget.content : (_asyncContent ?? '');
 
+  /// 复制/分享是否可用：加载完成且有内容。
+  bool get _canCopyShare => !_loading && _effectiveContent.isNotEmpty;
+
+  /// 复制内容全文到剪贴板。
+  Future<void> _copyContent() async {
+    final content = _effectiveContent;
+    if (content.isEmpty) return;
+    try {
+      await Clipboard.setData(ClipboardData(text: content));
+      if (!mounted) return;
+      _toast('已复制 ${content.length} 字');
+    } catch (e) {
+      if (!mounted) return;
+      _toast('复制失败：$e');
+    }
+  }
+
+  /// 一键分享：调系统分享面板（微信/邮件/备忘录等），分享内容全文。
+  Future<void> _shareContent() async {
+    final content = _effectiveContent;
+    if (content.isEmpty) return;
+    try {
+      await SharePlus.instance.share(
+        ShareParams(text: content, subject: _defaultFileName()),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      _toast('分享失败：$e');
+    }
+  }
+
   Widget _buildBody() {
     debugPrint('VIEWER: type=${widget.type} url=${widget.url} '
         'contentLen=${_effectiveContent.length} webFallback=$_webFallback');
@@ -148,7 +201,7 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
       }
       return const Center(child: Text('无内容可查看'));
     }
-    // 二进制内容防护：解码后含大量替换符视为不可读 → 提示另存为，避免灰屏
+    // 二进制内容防护：解码后替换符占比过高视为不可读 → 提示另存为，避免灰屏
     if (_looksBinary(_effectiveContent)) {
       return _buildLoadError('该文件无法直接查看（可能是二进制内容），可尝试另存为。');
     }
@@ -162,17 +215,19 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
   }
 
   /// 判断解码文本是否像二进制：替换符（U+FFFD）占比过高即视为不可读。
+  /// 占比 30% 以下仍按文本渲染（混合编码文本可能出现少量替换符，
+  /// 不影响整体阅读；此前 5% 阈值会误杀正常中文文档）。
   bool _looksBinary(String text) {
     if (text.isEmpty) return false;
     var replacements = 0;
     for (var i = 0; i < text.length; i++) {
       if (text.codeUnitAt(i) == 0xFFFD) replacements++;
     }
-    return replacements > text.length * 0.05;
+    return replacements > text.length * 0.3;
   }
 
-  /// 文件型成果读取失败界面：提示隧道状态并提供重试/另存为。
-  Widget _buildLoadError([String message = '读取成果失败，隧道可能未连接。']) {
+  /// 文件型成果读取失败界面：展示真实原因并提供重试/另存为。
+  Widget _buildLoadError([String message = '读取成果失败。']) {
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24),
@@ -182,6 +237,14 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
             const Icon(Icons.cloud_off, size: 48, color: Colors.red),
             const SizedBox(height: 16),
             Text(message, textAlign: TextAlign.center),
+            if (_loadError != null && _loadError!.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(
+                '原因：$_loadError',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.red, fontSize: 13),
+              ),
+            ],
             if (widget.url.isNotEmpty) ...[
               const SizedBox(height: 8),
               Text('地址：${widget.url}',
@@ -208,7 +271,10 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
   void _retryLoad() {
     final loader = widget.loader;
     if (loader == null) return;
-    setState(() => _loading = true);
+    setState(() {
+      _loading = true;
+      _loadError = null;
+    });
     loader().then((text) {
       if (!mounted) return;
       setState(() {
@@ -218,7 +284,10 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
     }).catchError((Object e) {
       debugPrint('VIEWER retry load error: $e');
       if (!mounted) return;
-      setState(() => _loading = false);
+      setState(() {
+        _loadError = _errorText(e);
+        _loading = false;
+      });
     });
   }
 

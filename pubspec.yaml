@@ -65,6 +65,10 @@ dependencies:
   speech_to_text: ^7.0.0
   # 语音输入前置：麦克风运行时权限申请（页面内 getUserMedia 与原生识别共用）。
   permission_handler: ^11.3.1
+  # 查看器一键分享：调系统分享面板分享成果内容全文。
+  share_plus: ^11.0.0
+  # 下载保存文件名：当前时间 MD5 后 6 位指纹（避免同名覆盖）。
+  crypto: ^3.0.3
 
 dependency_overrides:
   # 本地 fork 的 dartssh2：优化解密（processAll 批处理）+ 启用 zlib 压缩，

@@ -17,6 +17,14 @@ enum TunnelStatus { idle, connecting, connected, failed, disconnected }
 /// 远程主机类型（用于选择采集命令）。
 enum HostType { linux, windows }
 
+/// 远程文件读取失败（带用户可读原因，查看器据此展示）。
+class RemoteReadException implements Exception {
+  const RemoteReadException(this.message);
+  final String message;
+  @override
+  String toString() => message;
+}
+
 /// 单次主机采样：GPU 使用率 / GPU 温度 / CPU / 内存使用率。
 class HostSample {
   const HostSample({
@@ -323,14 +331,18 @@ class TunnelService {
   /// [remotePath] 为云端文件路径（如 `E:\Work\CaTv\xxx.md` 或 `/home/user/xxx.md`）。
   /// 采用 **SFTP** 读取：绕开 shell 命令对中文路径的编码问题（Windows cmd 用
   /// GBK 而 exec 命令按 UTF-8 发送，中文路径会被误解码）。
-  /// 隧道未连接时返回空字符串（由查看器提示）。
+  /// 失败时抛出 [RemoteReadException]，原因（未连接 / 超大 / 无法打开）
+  /// 随异常透出，由查看器展示给用户。
   ///
   /// 大小保护：超过 [maxRemoteReadBytes] 的文件不读入内存（避免 OOM），
-  /// 返回空字符串走查看器的"读取失败"流程（可另存为下载）。
+  /// 抛异常走查看器的"读取失败"流程（可另存为下载）。
   Future<String> readRemoteFile(String remotePath) async {
     final client = _client;
-    if (client == null) return '';
+    if (client == null) {
+      throw const RemoteReadException('SSH 隧道未连接，无法读取云端文件');
+    }
     // 尝试多种 SFTP 路径形态（Windows 盘符路径的表示差异）
+    Object? lastError;
     for (final path in _sftpPathCandidates(remotePath)) {
       SftpFile? file;
       SftpClient? sftp;
@@ -344,18 +356,27 @@ class TunnelService {
           debugPrint('[DSH] readRemoteFile skipped '
               '($size bytes > ${maxRemoteReadBytes ~/ (1024 * 1024)}MB) '
               'for "$path"');
-          return '';
+          throw RemoteReadException(
+            '文件过大（${(size / (1024 * 1024)).toStringAsFixed(1)}MB，'
+            '预览上限 ${maxRemoteReadBytes ~/ (1024 * 1024)}MB），'
+            '请使用"另存为"下载查看',
+          );
         }
         final bytes = await file.readBytes();
         return _decodeBytes(bytes);
+      } on RemoteReadException {
+        rethrow; // 超大文件等原因直接上抛，不再尝试其余路径形态
       } catch (e) {
         debugPrint('[DSH] readRemoteFile failed for "$path": $e');
+        lastError = e;
       } finally {
         if (file != null) await file.close(); // 顺带关闭所属 SFTP 会话/通道
         sftp?.close(); // 打开失败等分支：释放会话通道，避免泄漏
       }
     }
-    return '';
+    throw RemoteReadException(
+      '云端文件打开失败（路径不存在或无权限）: $lastError',
+    );
   }
 
   /// 解析远程路径并打开 SFTP 文件句柄（用于资源下载/断点续传）。
@@ -633,9 +654,13 @@ class TunnelService {
     }
   }
 
-  /// 健壮解码：先自动检测编码（UTF-8 → GBK/GB2312 → ASCII），
-  /// 检测/解码异常时兜底 UTF-8 宽松解码，避免返回空导致白屏。
+  /// 健壮解码：先尝试 UTF-8 严格解码（合法即采用，避免中文文本被
+  /// 误判为 GBK 产生乱码），失败再自动检测编码（UTF-8 → GBK/GB2312
+  /// → ASCII），检测/解码异常时兜底 UTF-8 宽松解码，避免返回空导致白屏。
   String _decodeBytes(Uint8List bytes) {
+    try {
+      return utf8.decode(bytes); // 严格模式：含非法字节会抛 FormatException
+    } catch (_) {}
     try {
       final detected = Charset.detect(bytes, orders: [utf8, gbk, ascii]);
       if (detected != null) return detected.decode(bytes);

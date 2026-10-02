@@ -2,6 +2,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import 'download_manager.dart';
+import 'download_name.dart';
 
 /// 资源下载页：展示进度，支持暂停/恢复（断点续传）/取消/重试，
 /// 下载完成后引导用户选择保存位置（SAF 另存为）。
@@ -19,7 +20,15 @@ class _DownloadScreenState extends State<DownloadScreen> {
   bool _saving = false;
   String? _savedPath;
 
+  /// 保存用文件名：下载完成后一次性生成（原名 + 时间戳 MD5 后 6 位），
+  /// 弹窗提示与实际保存保持同名。
+  String? _saveFileName;
+
   DownloadTask get _task => widget.task;
+
+  /// 保存文件名：完成后首次生成后缀，之后保持不变。
+  String get _effectiveSaveFileName =>
+      _saveFileName ??= applyTimestampSuffix(_task.fileName);
 
   @override
   void initState() {
@@ -35,8 +44,9 @@ class _DownloadScreenState extends State<DownloadScreen> {
     _task.statusStream.listen((s) {
       if (!mounted) return;
       setState(() {});
-      // 下载完成：提示用户选择保存位置
+      // 下载完成：生成带时间戳指纹的保存文件名，提示用户选择保存位置
       if (s == DownloadStatus.completed) {
+        _saveFileName ??= applyTimestampSuffix(_task.fileName);
         _promptSave();
       }
     });
@@ -75,7 +85,7 @@ class _DownloadScreenState extends State<DownloadScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('下载完成'),
-        content: Text('${_task.fileName} 已下载，选择保存位置？'),
+        content: Text('$_effectiveSaveFileName 已下载，选择保存位置？'),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
@@ -100,7 +110,7 @@ class _DownloadScreenState extends State<DownloadScreen> {
     setState(() => _saving = true);
     try {
       final path = await FilePicker.platform.saveFile(
-        fileName: _task.fileName,
+        fileName: _effectiveSaveFileName,
         bytes: bytes,
       );
       if (!mounted) return;
