@@ -1716,7 +1716,10 @@ class _WebViewScreenState extends State<WebViewScreen>
               _bodyHeight = stackHeight;
               _zoomControlsTop = stackHeight * 0.5; // 默认屏幕中央
               _photoControlsTop = stackHeight * (1 - 1 / 6); // 底部往上约六分之一
-              _voiceControlsTop = _photoControlsTop; // 右侧与相机入口同高
+              // 右侧语音按钮：比相机入口略高一点（视觉上不对齐成一条线，
+              // 也避免与月相/天气动效拥挤）。
+              _voiceControlsTop =
+                  (_photoControlsTop - 16).clamp(0.0, stackHeight);
             } else if ((stackHeight - _bodyHeight).abs() > 1) {
               // 容器高度变化（键盘/旋转等）时同步基准高度
               _bodyHeight = stackHeight;
@@ -2024,12 +2027,15 @@ class _WebViewScreenState extends State<WebViewScreen>
     );
   }
 
-  /// 语音输入浮动按钮：对话区**右侧**、默认与相机入口同高，可拖拽上下移动。
-  /// 长按按住说话（端侧流式识别，微信式交互）：上滑取消、松手把转写文本
-  /// 注入消息输入框；点击无动作（拖拽/长按两个手势，避免与注入动作误触）。
+  /// 语音输入浮动按钮：对话区**右侧**、默认比相机入口略高一点，可拖拽上下
+  /// 移动。长按按住说话（端侧流式识别，微信式交互）：上滑取消、松手把转写
+  /// 文本注入消息输入框；点击无动作（拖拽/长按两个手势，避免与注入动作误触）。
+  ///
+  /// 视觉上**只画麦克风图标本身**（无圆圈底/边框，用户要求：小一点也知道是
+  /// 干什么）；命中区域仍占满 48×48，保证拖拽与长按好按。
   Widget _buildVoiceControls(BuildContext context, double stackHeight) {
     return Positioned(
-      right: 6,
+      right: 8,
       top: _voiceControlsTop,
       // 占满命中区域捕获拖拽与长按；无内部按钮，点击不产生动作
       child: GestureDetector(
@@ -2041,32 +2047,11 @@ class _WebViewScreenState extends State<WebViewScreen>
         onLongPressMoveUpdate: _onVoiceLongPressMoveUpdate,
         onLongPressEnd: (_) => _onVoiceLongPressEnd(),
         onLongPressCancel: () => _onVoiceLongPressEnd(cancelled: true),
-        child: SizedBox(
+        child: const SizedBox(
           width: 48,
           height: 48,
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: Theme.of(context).colorScheme.surfaceContainerHighest
-                  .withValues(alpha: 0.85),
-              border: Border.all(
-                color: Theme.of(context).colorScheme.primary,
-                width: 2,
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: Theme.of(context)
-                      .colorScheme
-                      .primary
-                      .withValues(alpha: 0.25),
-                  blurRadius: 8,
-                  spreadRadius: 1,
-                ),
-              ],
-            ),
-            child: const Center(
-              child: Icon(Icons.mic, size: 24),
-            ),
+          child: Center(
+            child: Icon(Icons.mic, size: 24),
           ),
         ),
       ),
