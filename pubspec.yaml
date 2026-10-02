@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 0.1.9+15
+version: 0.2.0+16
 
 environment:
   sdk: ^3.6.0
@@ -60,11 +60,14 @@ dependencies:
   # 系统分享入口（Share Target）：其它 App 分享图片/文本拉起本应用，
   # 图片注入 DSH 附件槽、文本注入消息输入框。
   receive_sharing_intent: ^1.8.1
-  # 语音输入：端侧系统语音识别（zh-CN 实时转写）→ 文本注入消息输入框。
-  # 绕开 dsh 的浏览器麦克风 STT（WebView 内权限/模型下载体验差）。
-  speech_to_text: ^7.0.0
-  # 语音输入前置：麦克风运行时权限申请（页面内 getUserMedia 与原生识别共用）。
+  # 语音输入前置：麦克风运行时权限申请（按住说话/页面内 getUserMedia 共用）。
   permission_handler: ^11.3.1
+  # 语音输入：端侧流式识别（sherpa-onnx 流式 Zipformer zh int8，
+  # 模型不进 APK，首次使用时断点续传下载）。
+  sherpa_onnx: ^1.13.8
+  record: ^6.2.1
+  background_downloader: 8.9.5
+  path: ^1.9.1
   # 查看器一键分享：调系统分享面板分享成果内容全文。
   share_plus: ^11.0.0
   # 下载保存文件名：当前时间 MD5 后 6 位指纹（避免同名覆盖）。

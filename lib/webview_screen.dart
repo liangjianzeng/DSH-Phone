@@ -6,7 +6,6 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:lunar/lunar.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -21,10 +20,11 @@ import 'moon_astronomy.dart';
 import 'moon_location.dart';
 import 'moon_painter.dart';
 import 'setup_screen.dart';
+import 'asr/asr_model_manager.dart';
+import 'asr/hold_to_talk.dart';
 import 'task_notifier.dart';
 import 'tunnel_service.dart';
 import 'unsloth_screen.dart';
-import 'voice_input.dart';
 import 'webview_bridges.dart';
 
 /// 主界面：SSH 隧道就绪后，用 WebView 加载 DSH Web UI，并带缓存加速与设置入口。
@@ -36,9 +36,6 @@ import 'webview_bridges.dart';
 /// 支持最多 3 路 SSH 实例配置，顶部状态栏可自由切换激活实例。
 class WebViewScreen extends StatefulWidget {
   const WebViewScreen({super.key});
-
-  /// 语音输入功能开关：暂挂起（入口隐藏），代码保留待更优方案。
-  static const bool voiceInputEnabled = false;
 
   @override
   State<WebViewScreen> createState() => _WebViewScreenState();
@@ -65,6 +62,9 @@ class _WebViewScreenState extends State<WebViewScreen>
   StreamSubscription<TunnelStatus>? _tunnelSub;
   bool _reconnecting = false;
   bool _switching = false; // 手动切换实例时抑制自动重连
+
+  /// 按住说话会话（长按月相按钮期间非 null；结束后置回 null）。
+  HoldToTalkSession? _holdSession;
 
   /// 连续自动重连次数上限：防止"死循环连接"刷屏/耗尽资源。
   static const int _maxReconnect = 5;
@@ -373,17 +373,72 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   /// 相机入口拖拽：更新归一化顶边（相对 Stack，px）。
+  /// 按住说话期间不拖拽（长按赢得手势竞技场后拖拽本就不会触发，此处双保险）。
   void _onPhotoControlsPanStart(DragStartDetails details, double stackHeight) {
+    if (_holdSession != null) return;
     _photoGripOffset = details.globalPosition.dy - _photoControlsTop;
   }
 
   void _onPhotoControlsPanUpdate(
       DragUpdateDetails details, double stackHeight) {
+    if (_holdSession != null) return;
     final newTop = (details.globalPosition.dy - _photoGripOffset)
         .clamp(0.0, stackHeight - _photoControlHeight);
     if ((newTop - _photoControlsTop).abs() > 1.0) {
       setState(() => _photoControlsTop = newTop);
     }
+  }
+
+  // ---- 按住说话（长按月相按钮 → 端侧流式识别） ----
+
+  /// 长按开始：授权麦克风 → 确保模型就绪（未就绪弹断点续传下载引导）→
+  /// 启动会话与浮层。系统识别（speech_to_text）已移除：ROM 权限问题
+  /// 导致部分机型（小米系）一用即崩，2026-10-02 决策只保留端侧方案。
+  Future<void> _onPhotoLongPressStart() async {
+    if (_holdSession != null) return;
+    final c = _controller;
+    if (c == null) return;
+    final mic = await Permission.microphone.request();
+    if (!mounted) return;
+    if (!mic.isGranted) {
+      _snack('未授权麦克风，语音输入不可用');
+      return;
+    }
+    final modelReady = await AsrModelGate.ensureModelReady(context);
+    if (!mounted) return;
+    if (!modelReady) {
+      _snack('语音模型未下载完成，稍后再长按月相按钮');
+      return;
+    }
+    final modelDir = await AsrModelManager.modelDir();
+    if (!mounted) return;
+    final session = await HoldToTalkSession.begin(context, modelDir);
+    if (!mounted) {
+      await session?.end(cancelled: true);
+      return;
+    }
+    if (session == null) {
+      _snack('端侧语音识别启动失败，请重试');
+      return;
+    }
+    setState(() => _holdSession = session);
+  }
+
+  /// 长按移动：上滑超阈值 → 切换「松开取消」。
+  void _onPhotoLongPressMoveUpdate(LongPressMoveUpdateDetails details) {
+    _holdSession?.cancelMode.value =
+        details.offsetFromOrigin.dy < -HoldToTalkSession.cancelSlop;
+  }
+
+  /// 长按结束（松手/系统取消）：取终稿注入消息输入框（不自动发送）。
+  Future<void> _onPhotoLongPressEnd({bool cancelled = false}) async {
+    final session = _holdSession;
+    if (session == null) return;
+    if (mounted) setState(() => _holdSession = null);
+    final discard = cancelled || session.cancelMode.value;
+    final text = await session.end(cancelled: discard);
+    if (discard || text.isEmpty || !mounted) return;
+    await _injectComposerText(text);
   }
 
   /// 月相观测位置设置变更：持久化并重新解析（observer 变化自动触发重绘）。
@@ -975,12 +1030,11 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   /// 相机/相册选图 → base64 → 注入 DSH 消息输入窗口（附件槽）；
-  /// 或选择本地文件 → SFTP 上传 → 注入远程路径文本；
-  /// 或语音输入 → 端侧识别 → 注入转写文本。
+  /// 或选择本地文件 → SFTP 上传 → 注入远程路径文本。
   Future<void> _pickAndSendImage() async {
     final c = _controller;
     if (c == null) return;
-    // 选择来源：相册 / 拍照 / 选择文件上传 / 语音输入
+    // 选择来源：相册 / 拍照 / 选择文件上传
     final source = await showModalBottomSheet<String>(
       context: context,
       builder: (_) => SafeArea(
@@ -1003,24 +1057,11 @@ class _WebViewScreenState extends State<WebViewScreen>
               subtitle: const Text('上传到服务器，路径注入消息框'),
               onTap: () => Navigator.pop(context, 'file'),
             ),
-            // 语音输入暂时挂起：端侧系统识别在小米系 ROM 上不可用，
-            // 离线小模型识别质量不佳（2026-10-01 决策，待更优方案再启用）。
-            if (WebViewScreen.voiceInputEnabled)
-              ListTile(
-                leading: const Icon(Icons.mic_none_outlined),
-                title: const Text('语音输入'),
-                subtitle: const Text('端侧语音识别，转写文本注入消息框'),
-                onTap: () => Navigator.pop(context, 'voice'),
-              ),
           ],
         ),
       ),
     );
     if (source == null) return;
-    if (source == 'voice') {
-      await _startVoiceInput();
-      return;
-    }
     if (source == 'file') {
       await _pickAndSendFile();
       return;
@@ -1063,36 +1104,16 @@ class _WebViewScreenState extends State<WebViewScreen>
     }
   }
 
-  /// 语音输入：先确保麦克风权限，再走端侧系统识别；机型无识别服务时
-  /// 降级为页面内语音输入（dsh 自带 mic 按钮，音频经 WebView 采集、
-  /// 转写模型跑在 host 端），转写文本注入消息输入框（不自动发送）。
-  Future<void> _startVoiceInput() async {
+  /// 文本注入 DSH 消息输入框（composer 桥，不自动发送），失败提示。
+  Future<void> _injectComposerText(String text) async {
     final c = _controller;
     if (c == null) return;
-    debugPrint('[DSH][voice] dialog open');
-    // 麦克风运行时权限：原生识别与页面内 getUserMedia 共用
-    final mic = await Permission.microphone.request();
-    if (!mounted) return;
-    if (!mic.isGranted) {
-      _snack('未授权麦克风，语音输入不可用');
-      return;
-    }
-    final text = await VoiceInputDialog.show(context);
-    debugPrint('[DSH][voice] dialog result: ${text?.length ?? 'null'} chars');
-    if (text == null || !mounted) return;
-    // 哨兵：本机无系统识别服务 → 改用页面内语音输入
-    if (text == VoiceInputDialog.pageMicFallback) {
-      _snack('已授权麦克风：请点击页面中的麦克风按钮使用语音输入'
-          '（首次使用 dsh 会在服务器准备识别模型）');
-      return;
-    }
-    if (text.isEmpty) return;
     final js = "window.__dshComposerBridge.insertText(${jsonEncode(text)})";
     final result = await c.evaluateJavascript(source: js) as Object?;
     if (result is Map && result['ok'] == false) {
-      _snack('语音文本注入失败：${result['error'] ?? '未知错误'}');
+      _snack('文本注入失败：${result['error'] ?? '未知错误'}');
     } else {
-      debugPrint('[DSH] voice input injected: ${text.length} chars');
+      debugPrint('[DSH] composer text injected: ${text.length} chars');
     }
   }
 
@@ -1855,12 +1876,17 @@ class _WebViewScreenState extends State<WebViewScreen>
     return Positioned(
       left: 6,
       top: _photoControlsTop,
-      // 可拖拽自由上下移动：占满命中区域捕获拖拽，点击透传给内部相机按钮
+      // 可拖拽自由上下移动：占满命中区域捕获拖拽，点击透传给内部相机按钮，
+      // 长按启动按住说话（端侧流式识别，微信式交互）
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onPanStart: (details) => _onPhotoControlsPanStart(details, stackHeight),
         onPanUpdate: (details) =>
             _onPhotoControlsPanUpdate(details, stackHeight),
+        onLongPressStart: (_) => _onPhotoLongPressStart(),
+        onLongPressMoveUpdate: _onPhotoLongPressMoveUpdate,
+        onLongPressEnd: (_) => _onPhotoLongPressEnd(),
+        onLongPressCancel: () => _onPhotoLongPressEnd(cancelled: true),
         child: SizedBox(
           width: 48,
           height: 48,
@@ -1885,13 +1911,11 @@ class _WebViewScreenState extends State<WebViewScreen>
             ),
             child: CustomPaint(
               painter: MoonPhasePainter(obs.phase01, obs.tiltDeg),
-              child: Center(
-                child: IconButton(
-                  tooltip: '添加图片/拍照（视觉工具）·${obs.name}'
-                      '·照明 ${(lit * 100).round()}%'
-                      '·农历${_lunarDay(now)}'
-                      '·观测${MoonLocation.observerLabel}',
-                  icon: Icon(
+                child: Center(
+                  child: IconButton(
+                    // 注意：不能加 tooltip——tooltip 自带长按手势，会抢走
+                    // 外层的长按（按住说话）手势（2026-10-02 真机实测）。
+                    icon: Icon(
                     Icons.camera_alt_outlined,
                     color: lit >= 0.5
                         ? const Color(0xFF1565C0) // 亮面：深蓝图标
@@ -1907,18 +1931,6 @@ class _WebViewScreenState extends State<WebViewScreen>
         ),
       ),
     );
-  }
-
-  /// 农历日（1~29/30）。统一按北京时间（UTC+8）推算农历，避免设备时区差异
-  /// 导致月相差一天；异常时退回 15（满月，最亮最显眼）。
-  static int _lunarDay(DateTime date) {
-    try {
-      // 本地时间 → UTC → +8h 得到北京日历字段；lunar 只取年月日，忽略时分。
-      final beijing = date.toUtc().add(const Duration(hours: 8));
-      return Solar.fromDate(beijing).getLunar().getDay();
-    } catch (_) {
-      return 15;
-    }
   }
 }
 
