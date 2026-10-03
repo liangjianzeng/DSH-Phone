@@ -25,9 +25,11 @@ void main() async {
 
   runApp(const DshPhoneApp());
 
-  // 启动后后台预热端侧 ASR 引擎：模型已下载时提前加载识别器（约数秒），
-  // 避免首次按住说话时现场加载造成卡顿；未下载则跳过，待首次使用时再加载。
-  unawaited(SherpaStreamingAsr.warmup());
+  // 启动完成后（首帧渲染后）再后台预热端侧 ASR 引擎：不阻塞/拉长启动过程。
+  // 模型已下载时提前加载识别器，首次按住说话不再现场加载；未下载则跳过。
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    unawaited(SherpaStreamingAsr.warmup());
+  });
 }
 
 class DshPhoneApp extends StatelessWidget {

@@ -262,6 +262,18 @@ class TunnelService {
     _handleForward(localSocket);
   }
 
+  /// 就地更新当前隧道的转发目标配置（不重建 SSH 会话）。
+  ///
+  /// 转发通道按连接逐条拨号 [_activeConfig.remotePort]（见 _handleForward），
+  /// 因此同实例内切换服务模式（DSH 3080 ⇄ Zcode 8787）只需更新内存配置，
+  /// 新连接即走新端口，无需断开重连。仅当 [profileIndex] 与当前激活实例
+  /// 一致时生效，防止迟到的旧实例调用串线。
+  void updateActiveConfig(SSHConfig config, {int? profileIndex}) {
+    if (_client == null) return;
+    if (profileIndex != null && profileIndex != _activeProfileIndex) return;
+    _activeConfig = config;
+  }
+
   Future<void> _handleForward(Socket local) async {
     final client = _client;
     if (client == null) {

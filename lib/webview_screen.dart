@@ -813,10 +813,12 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   /// 顶栏模式一键切换：同实例内翻转 DSH/Zcode。端口若仍是另一模式的默认值
-  /// 则落到本模式默认值（自定义端口保留），持久化后断开重连——页面地址由
-  /// _connect 的地址校验自动重载，无需进设置页。
+  /// 则落到本模式默认值（自定义端口保留），持久化后重载页面。
+  ///
+  /// 同一台服务器的两种模式只是转发目标端口不同（DSH 3080 / Zcode 8787），
+  /// SSH 会话原样保留——转发通道按连接逐条拨号 _activeConfig.remotePort，
+  /// 就地更新内存配置后新连接自动走新端口，无需断开重连。
   Future<void> _toggleMode() async {
-    if (_switching) return;
     final newMode =
         _config.isZcodeMode ? SSHConfig.modeDsh : SSHConfig.modeZcode;
     var newPort = _config.remotePort;
@@ -834,10 +836,16 @@ class _WebViewScreenState extends State<WebViewScreen>
       _profiles[_activeIndex] = updated;
       _config = updated;
     });
-    _snack('已切换到 ${newMode == SSHConfig.modeZcode ? "Zcode" : "DSH"} 模式，重连中…');
-    await TunnelService.instance.disconnect();
-    if (!mounted) return;
-    _manualConnect();
+    TunnelService.instance
+        .updateActiveConfig(updated, profileIndex: _activeIndex);
+    final modeName = newMode == SSHConfig.modeZcode ? "Zcode" : "DSH";
+    if (TunnelService.instance.status == TunnelStatus.connected) {
+      _snack('已切换到 $modeName 模式');
+      await _loadTargetUrl();
+    } else {
+      _snack('已切换到 $modeName 模式，连接中…');
+      _manualConnect();
+    }
   }
 
   Future<void> _connect() async {
@@ -1778,13 +1786,12 @@ class _WebViewScreenState extends State<WebViewScreen>
               ),
             ),
             const Spacer(),
-            // 模式一键切换：配置只是配置，切换在顶栏完成（同实例内翻转
-            // DSH/Zcode，自动落到对应模式默认端口并重连；页面地址由
-            // _connect 的地址校验自动重载）。分段滑块开关，当前模式
-            // 高亮显示，点击即切——无需进设置页。
-            _ModeSegmentSwitch(
-              isZcode: _config.isZcodeMode,
-              onTap: _toggleMode,
+            // 模式一键切换：与顶栏其它图标同款样式的 IconButton（点击翻转
+            // DSH/Zcode 并自动重连）。
+            IconButton(
+              tooltip: _config.isZcodeMode ? '切换到 DSH 模式' : '切换到 Zcode 模式',
+              icon: const Icon(Icons.swap_horiz, color: Colors.green),
+              onPressed: _toggleMode,
             ),
             _buildInstanceSwitcher(context),
             // Unsloth 入口：全部实例未启用时隐藏（首页无意义）
@@ -1964,10 +1971,17 @@ class _WebViewScreenState extends State<WebViewScreen>
                     // 页面就绪：消费冷启动/排队中的分享内容
                     _processPendingShares();
                   },
-                  onReceivedError: (controller, request, error) => _onPageError(
-                    '加载失败：${error.description}\n'
-                    '（${error.type}）',
-                  ),
+                  onReceivedError: (controller, request, error) {
+                    // 只有主框架加载失败才升级为整页错误。子资源/XHR/SSE 的
+                    // 瞬时失败（EventSource 断开重连、切会话关闭旧流、轮询
+                    // 抖动等）在长连接页面里是常态，整页报错会反复打断使用
+                    // （表现为一点会话切换就「无法加载远程界面 net::ERR_FAILED」）。
+                    if (request.isForMainFrame != true) return;
+                    _onPageError(
+                      '加载失败：${error.description}\n'
+                      '（${error.type}）',
+                    );
+                  },
                   onReceivedHttpError: (controller, request, errorResponse) {
                     // 只处理主文档响应；子资源（图标等）的 401/404 不打扰页面
                     if (request.isForMainFrame != true) return;
@@ -2322,7 +2336,8 @@ class _InstanceChip extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.only(right: 4),
       child: Chip(
-        avatar: Icon(Icons.swap_horiz, size: 16, color: color),
+        // 服务器图标标识"实例/主机"，避免与顶栏绿色模式切换图标撞脸
+        avatar: Icon(Icons.dns_outlined, size: 16, color: color),
         label: Text(
           label,
           style: const TextStyle(fontSize: 12),
@@ -2616,97 +2631,4 @@ class _MicWavePainter extends CustomPainter {
   @override
   bool shouldRepaint(_MicWavePainter oldDelegate) =>
       oldDelegate.t != t || oldDelegate.color != color;
-}
-
-/// 顶栏模式分段开关：DSH | Zcode 两段滑块，当前段高亮（DSH 蓝 / Zcode 紫），
-/// 点击另一段即切换模式并自动重连。带滑块动画，视觉与顶栏整体协调。
-class _ModeSegmentSwitch extends StatelessWidget {
-  const _ModeSegmentSwitch({required this.isZcode, required this.onTap});
-
-  final bool isZcode;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    const dshColor = Color(0xFF1F6FEB);
-    const zcodeColor = Color(0xFF7C5CFF);
-    return Tooltip(
-      message: isZcode ? '切换到 DSH 模式' : '切换到 Zcode 模式',
-      child: Material(
-        color: Theme.of(context).colorScheme.surfaceContainerHighest
-            .withValues(alpha: 0.6),
-        borderRadius: BorderRadius.circular(999),
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(999),
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 220),
-            curve: Curves.easeOutCubic,
-            height: 30,
-            padding: const EdgeInsets.all(3),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                _segment(
-                  context,
-                  label: 'DSH',
-                  icon: Icons.smart_toy_outlined,
-                  selected: !isZcode,
-                  color: dshColor,
-                ),
-                const SizedBox(width: 2),
-                _segment(
-                  context,
-                  label: 'ZCode',
-                  icon: Icons.auto_awesome_outlined,
-                  selected: isZcode,
-                  color: zcodeColor,
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _segment(
-    BuildContext context, {
-    required String label,
-    required IconData icon,
-    required bool selected,
-    required Color color,
-  }) {
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 220),
-      curve: Curves.easeOutCubic,
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
-      decoration: BoxDecoration(
-        color: selected ? color.withValues(alpha: 0.18) : Colors.transparent,
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(
-          color: selected ? color : Colors.transparent,
-          width: 1,
-        ),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 13, color: selected ? color : Theme.of(context).colorScheme.onSurfaceVariant),
-          const SizedBox(width: 4),
-          Text(
-            label,
-            style: TextStyle(
-              fontSize: 12,
-              height: 1,
-              fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-              color: selected
-                  ? color
-                  : Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
 }
