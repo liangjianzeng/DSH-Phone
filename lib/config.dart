@@ -57,6 +57,15 @@ class SSHConfig {
   /// Unsloth Studio 连接端口默认值。
   static const int defaultUnslothPort = 8888;
 
+  /// 实例服务模式：DSH（DeepSeek Harness Web UI）或 Zcode（zcode-phone-server）。
+  /// 模式只决定 SSH 隧道对端跑的是什么服务；隧道与 WebView 架构两种模式共用。
+  static const String modeDsh = 'dsh';
+  static const String modeZcode = 'zcode';
+
+  /// 远端服务端口默认值：DSH Web UI 监听 3080；Zcode 模式默认 8787。
+  static const int defaultRemotePort = 3080;
+  static const int defaultZcodeRemotePort = 8787;
+
   /// 文件上传大小上限（MB）默认值。
   static const int defaultUploadMaxMb = 10;
 
@@ -73,6 +82,8 @@ class SSHConfig {
   static const String keyLocalPort = 'local_port';
   static const String keyAuthType = 'auth_type';
   static const String keyAlias = 'alias';
+  static const String keyMode = 'mode';
+  static const String keyRemotePort = 'remote_port';
 
   // 激活实例 / 超时
   static const String keyActiveProfile = 'active_profile';
@@ -122,6 +133,12 @@ class SSHConfig {
   final String keyPassphrase; // 私钥口令（可空）
   final String alias; // 实例别名（可空，为空时展示名回退为地址）
 
+  /// 实例服务模式：[modeDsh]（默认，兼容旧数据）或 [modeZcode]。
+  final String mode;
+
+  /// 隧道对端服务端口（远端 127.0.0.1 上的端口）：DSH=3080，Zcode=8787。
+  final int remotePort;
+
   /// 实例级"默认主机资源监控"开关：开启后该实例成为全局监控目标，
   /// 顶栏趋势曲线始终显示它的主机数据（与当前连接实例无关）。
   /// 所有实例默认关闭，且全局最多一个实例开启。
@@ -158,6 +175,8 @@ class SSHConfig {
     this.privateKeyPem = '',
     this.keyPassphrase = '',
     this.alias = '',
+    this.mode = modeDsh,
+    this.remotePort = defaultRemotePort,
     this.hostMonitorEnabled = false,
     this.unslothEnabled = false,
     this.unslothPort = defaultUnslothPort,
@@ -169,9 +188,16 @@ class SSHConfig {
   bool get isConfigured =>
       host.isNotEmpty && username.isNotEmpty && sshPort > 0 && localPort > 0;
 
+  bool get isZcodeMode => mode == modeZcode;
+
   /// 复制并覆盖指定字段（其余字段原样保留）。
   @pragma('vm:prefer-inline')
-  SSHConfig copyWith({String? accessToken}) => SSHConfig(
+  SSHConfig copyWith({
+    String? accessToken,
+    String? mode,
+    int? remotePort,
+  }) =>
+      SSHConfig(
         host: host,
         sshPort: sshPort,
         username: username,
@@ -181,6 +207,8 @@ class SSHConfig {
         privateKeyPem: privateKeyPem,
         keyPassphrase: keyPassphrase,
         alias: alias,
+        mode: mode ?? this.mode,
+        remotePort: remotePort ?? this.remotePort,
         hostMonitorEnabled: hostMonitorEnabled,
         unslothEnabled: unslothEnabled,
         unslothPort: unslothPort,
@@ -192,9 +220,10 @@ class SSHConfig {
   bool get useKey => authType == authTypeKey;
 
   /// 展示名：优先别名；无别名时回退为地址（IP），未配置时显示"未配置"。
+  /// Zcode 模式加前缀区分（同一台机器可能两种模式并存）。
   String get label {
-    if (alias.isNotEmpty) return alias;
-    return host.isNotEmpty ? host : '未配置';
+    final base = alias.isNotEmpty ? alias : (host.isNotEmpty ? host : '未配置');
+    return isZcodeMode ? '[Z] $base' : base;
   }
 
   // ============ 单实例键名（按索引）============
@@ -245,6 +274,8 @@ class SSHConfig {
         privateKeyPem: privateKeyPem,
         keyPassphrase: keyPassphrase,
         alias: prefs.getString(_pKey(i, keyAlias)) ?? '',
+        mode: prefs.getString(_pKey(i, keyMode)) ?? modeDsh,
+        remotePort: prefs.getInt(_pKey(i, keyRemotePort)) ?? defaultRemotePort,
         hostMonitorEnabled:
             prefs.getBool(_pKey(i, keyInstanceHostMonitor)) ?? false,
         unslothEnabled:
@@ -291,6 +322,8 @@ class SSHConfig {
     await prefs.setInt(_pKey(i, keyLocalPort), config.localPort);
     await prefs.setString(_pKey(i, keyAuthType), config.authType);
     await prefs.setString(_pKey(i, keyAlias), config.alias);
+    await prefs.setString(_pKey(i, keyMode), config.mode);
+    await prefs.setInt(_pKey(i, keyRemotePort), config.remotePort);
     await prefs.setBool(
         _pKey(i, keyInstanceHostMonitor), config.hostMonitorEnabled);
     await prefs.setBool(_pKey(i, keyUnslothEnabled), config.unslothEnabled);

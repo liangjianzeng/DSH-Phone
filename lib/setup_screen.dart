@@ -153,6 +153,9 @@ class _SetupScreenState extends State<SetupScreen> {
   late TextEditingController _keyPassphrase;
   late TextEditingController _localPort;
 
+  /// 隧道对端服务端口（远端 127.0.0.1 上的端口）。
+  late TextEditingController _remotePort;
+
   /// DSH Web 访问 Token（可选；新版 dsh>=0.1.2-rc.1 启用 token 鉴权时填写）。
   late TextEditingController _accessToken;
 
@@ -161,6 +164,9 @@ class _SetupScreenState extends State<SetupScreen> {
   late TextEditingController _unslothPassword;
 
   late String _authType;
+
+  /// 当前编辑实例的服务模式（DSH / Zcode，随实例切换回填）。
+  late String _mode;
 
   /// 当前编辑实例的"默认主机资源监控"开关（实例级，随实例切换回填）。
   late bool _instanceHostMonitorEnabled;
@@ -339,6 +345,21 @@ class _SetupScreenState extends State<SetupScreen> {
     await SSHConfig.saveCategoryWords(catId, saved);
   }
 
+  /// 切换服务模式：未手动改过远端端口时（等于另一模式的默认值），自动回填新模式的默认端口。
+  void _applyMode(String mode) {
+    setState(() {
+      final current = int.tryParse(_remotePort.text.trim());
+      if (current == null ||
+          current == SSHConfig.defaultRemotePort ||
+          current == SSHConfig.defaultZcodeRemotePort) {
+        _remotePort.text =
+            '${mode == SSHConfig.modeZcode ? SSHConfig.defaultZcodeRemotePort : SSHConfig.defaultRemotePort}';
+      }
+      _mode = mode;
+    });
+    _scheduleAutoSave();
+  }
+
   /// 把指定实例配置回填到表单控件。
   void _loadFromProfile(int index) {
     final c = widget.profiles[index];
@@ -350,10 +371,12 @@ class _SetupScreenState extends State<SetupScreen> {
     _privateKey = TextEditingController(text: c.privateKeyPem);
     _keyPassphrase = TextEditingController(text: c.keyPassphrase);
     _localPort = TextEditingController(text: '${c.localPort}');
+    _remotePort = TextEditingController(text: '${c.remotePort}');
     _accessToken = TextEditingController(text: c.accessToken);
     _unslothPort = TextEditingController(text: '${c.unslothPort}');
     _unslothPassword = TextEditingController(text: c.unslothPassword);
     _authType = c.authType;
+    _mode = c.mode;
     _instanceHostMonitorEnabled = c.hostMonitorEnabled;
     _unslothEnabled = c.unslothEnabled;
     _unslothUseSsh = c.unslothUseSsh;
@@ -376,6 +399,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _privateKey.dispose();
     _keyPassphrase.dispose();
     _localPort.dispose();
+    _remotePort.dispose();
     _accessToken.dispose();
     _unslothPort.dispose();
     _unslothPassword.dispose();
@@ -471,24 +495,7 @@ class _SetupScreenState extends State<SetupScreen> {
         if (i == _profileIndex) continue;
         final other = widget.profiles[i];
         if (!other.hostMonitorEnabled) continue;
-        await SSHConfig.saveProfile(
-            i,
-            SSHConfig(
-              host: other.host,
-              sshPort: other.sshPort,
-              username: other.username,
-              localPort: other.localPort,
-              authType: other.authType,
-              password: other.password,
-              privateKeyPem: other.privateKeyPem,
-              keyPassphrase: other.keyPassphrase,
-              alias: other.alias,
-              hostMonitorEnabled: false,
-              unslothEnabled: other.unslothEnabled,
-              unslothPort: other.unslothPort,
-              unslothUseSsh: other.unslothUseSsh,
-              unslothPassword: other.unslothPassword,
-            ));
+        await SSHConfig.saveProfile(i, other.copyWith(hostMonitorEnabled: false));
       }
     }
     widget.onInstanceMonitorChanged?.call(on);
@@ -505,24 +512,7 @@ class _SetupScreenState extends State<SetupScreen> {
         if (i == _profileIndex) continue;
         final other = widget.profiles[i];
         if (!other.unslothEnabled) continue;
-        await SSHConfig.saveProfile(
-            i,
-            SSHConfig(
-              host: other.host,
-              sshPort: other.sshPort,
-              username: other.username,
-              localPort: other.localPort,
-              authType: other.authType,
-              password: other.password,
-              privateKeyPem: other.privateKeyPem,
-              keyPassphrase: other.keyPassphrase,
-              alias: other.alias,
-              hostMonitorEnabled: other.hostMonitorEnabled,
-              unslothEnabled: false,
-              unslothPort: other.unslothPort,
-              unslothUseSsh: other.unslothUseSsh,
-              unslothPassword: other.unslothPassword,
-            ));
+        await SSHConfig.saveProfile(i, other.copyWith(unslothEnabled: false));
       }
     }
   }
@@ -534,6 +524,11 @@ class _SetupScreenState extends State<SetupScreen> {
       sshPort: int.tryParse(_sshPort.text.trim()) ?? 22,
       username: _username.text.trim(),
       localPort: int.tryParse(_localPort.text.trim()) ?? 3081,
+      mode: _mode,
+      remotePort: int.tryParse(_remotePort.text.trim()) ??
+          (_mode == SSHConfig.modeZcode
+              ? SSHConfig.defaultZcodeRemotePort
+              : SSHConfig.defaultRemotePort),
       authType: _authType,
       password: _authType == SSHConfig.authTypePassword ? _password.text : '',
       privateKeyPem:
@@ -720,6 +715,44 @@ class _SetupScreenState extends State<SetupScreen> {
               labelText: '本地隧道端口',
               helperText: '默认 3081，DSH 界面将通过 http://127.0.0.1:<端口> 访问',
               border: OutlineInputBorder(),
+            ),
+            validator: _validatePort,
+            onChanged: (_) => _scheduleAutoSave(),
+          ),
+          const SizedBox(height: 12),
+          const Text('服务模式', style: TextStyle(fontSize: 16)),
+          Row(
+            children: [
+              Expanded(
+                child: RadioListTile<String>(
+                  title: const Text('DSH'),
+                  subtitle: const Text('DeepSeek Harness'),
+                  value: SSHConfig.modeDsh,
+                  groupValue: _mode,
+                  onChanged: (v) => _applyMode(v ?? SSHConfig.modeDsh),
+                ),
+              ),
+              Expanded(
+                child: RadioListTile<String>(
+                  title: const Text('Zcode'),
+                  subtitle: const Text('zcode-phone-server'),
+                  value: SSHConfig.modeZcode,
+                  groupValue: _mode,
+                  onChanged: (v) => _applyMode(v ?? SSHConfig.modeDsh),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: _remotePort,
+            keyboardType: TextInputType.number,
+            decoration: InputDecoration(
+              labelText: '远端服务端口',
+              helperText: _mode == SSHConfig.modeZcode
+                  ? '隧道对端端口：zcode-phone-server 默认 8787'
+                  : '隧道对端端口：DSH Web UI 默认 3080',
+              border: const OutlineInputBorder(),
             ),
             validator: _validatePort,
             onChanged: (_) => _scheduleAutoSave(),

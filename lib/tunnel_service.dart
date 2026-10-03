@@ -183,7 +183,7 @@ class TunnelService {
       server.listen(_handleLocalConnection);
 
       debugPrint('[DSH] tunnel up: 127.0.0.1:${config.localPort} -> '
-          '127.0.0.1:3080');
+          '127.0.0.1:${config.remotePort}');
       _setStatus(TunnelStatus.connected);
     } catch (e) {
       debugPrint('[DSH] connect failed: $e');
@@ -269,8 +269,9 @@ class TunnelService {
       return;
     }
     try {
-      // 远程 DSH 监听 127.0.0.1:3080
-      final forward = await client.forwardLocal('127.0.0.1', 3080);
+      // 远端服务监听 127.0.0.1:<remotePort>（DSH Web UI=3080 / zcode-phone-server=8787）
+      final forward = await client
+          .forwardLocal('127.0.0.1', _activeConfig?.remotePort ?? 3080);
       _pipe(local, forward);
     } catch (_) {
       local.destroy();
