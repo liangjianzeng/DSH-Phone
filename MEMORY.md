@@ -4,6 +4,16 @@
 
 ---
 
+## 🔴 红线禁令：禁止卸载 (2026-10-03 记录)
+
+- **未经用户明确允许，禁止 `uninstall` / 卸载任何应用，禁止删除用户数据。**
+- 推送一律使用**覆盖安装**：`adb install -r <apk>`。
+- 若签名不一致导致覆盖失败：先排查并**统一签名**（如让 debug 也使用 release 证书），**而不是卸载重装**。
+- 违反此规则后果极其严重，绝不可再犯。
+- 相关背景：release 签名 `android/key.properties` → `../key.jks`（证书 CN=TongYiLite）；已改 `android/app/build.gradle` 让 debug 在有 key.properties 时也用 release 证书签名，保证可覆盖安装。
+
+---
+
 ## Git 拉取代码 (pull) — 已知坑与最优流程
 
 ### 问题现象
@@ -62,6 +72,7 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 - **Flutter 路径**：`C:/src/flutter/bin/flutter`（Git Bash）/ `C:\src\flutter\bin\flutter.bat`（PowerShell / CMD）。不在系统 PATH，未安装到常见位置。
 - **静态分析**：`flutter analyze`（项目根目录）。分析单文件：`flutter analyze lib/webview_screen.dart`。
 - **构建 APK**：`flutter build apk --release`，产物 `build/app/outputs/flutter-apk/app-release.apk`。
+- **打包默认 release（用户要求，2026-10-02）**：给手机装包/上传 Releases 一律 release 构建；仅在明确的 bug 排查需要时才构建 debug 版。
 - 改完代码后先 `flutter analyze` 确认无报错再提交。
 - **沙箱限制（重要）**：DSH 文件策略为 `workspace-write` 时，**dart/flutter 工具启动即挂起**（连 `dart --version` 都无输出，与 git/MSYS2 同源）。必须 `danger-full-access` 策略下才能运行 `flutter analyze` / `flutter build` / `dart format` 等。
 

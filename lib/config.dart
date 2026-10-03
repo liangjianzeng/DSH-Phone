@@ -2,6 +2,15 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'asr/default_hotwords.dart';
+
+/// 端侧 ASR 识别增强档位。
+///
+/// sherpa-onnx 流式（Online）API 不支持语言模型（LM 仅在离线 API 可用），
+/// 因此增强档位在同一流式模型上启用 beam search + 热词 + blankPenalty，
+/// 不新增下载、体积不变、流式实时出字不变。
+enum AsrMode { standard, enhanced }
+
 /// SSH 连接配置（单个实例）+ 持久化。
 ///
 /// 支持最多 [maxProfiles] 路 SSH 实例配置（指向不同服务端），
@@ -386,6 +395,91 @@ class SSHConfig {
   static Future<void> saveResourceDownloadEnabled(bool enabled) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(keyResourceDownload, enabled);
+  }
+
+  // ============ 端侧 ASR 识别增强档位 ============
+
+  /// 端侧 ASR 识别增强档位键名。
+  ///
+  /// sherpa-onnx 流式（Online）API 不支持语言模型（LM 仅在离线 API 可用），
+  /// 因此增强档位在同一流式模型上启用 beam search + 热词 + blankPenalty，
+  /// 不新增下载、体积不变、流式实时出字不变。
+  static const String keyAsrMode = 'asr_mode';
+
+  /// 读取识别增强档位（默认 standard，保持现状）。
+  static Future<AsrMode> loadAsrMode() async {
+    await _migrateLegacy();
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(keyAsrMode) == 'enhanced'
+        ? AsrMode.enhanced
+        : AsrMode.standard;
+  }
+
+  /// 保存识别增强档位。
+  static Future<void> saveAsrMode(AsrMode mode) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+        keyAsrMode, mode == AsrMode.enhanced ? 'enhanced' : 'standard');
+  }
+
+  // ============ 端侧 ASR 热词表（按分类） ============
+
+  /// 启用分类键：存启用分类 id，逗号分隔。
+  static const String keyAsrHotwordCats = 'asr_hotword_cats';
+
+  /// 分类自定义词表键前缀：`asr_hotword_words_<catId>` 存用户编辑的词表。
+  static String _catWordsKey(String catId) => 'asr_hotword_words_$catId';
+
+  /// 读取启用分类（默认全部启用）。
+  static Future<List<String>> loadEnabledCategories() async {
+    await _migrateLegacy();
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(keyAsrHotwordCats);
+    if (raw == null || raw.trim().isEmpty) return defaultHotwordCategoryIds();
+    return raw
+        .split(',')
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toList();
+  }
+
+  /// 保存启用分类。
+  static Future<void> saveEnabledCategories(List<String> ids) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(keyAsrHotwordCats, ids.join(','));
+  }
+
+  /// 读取某分类的词表：用户编辑过的自定义词表优先，否则默认词表。
+  /// 用户自定义分类（[kCustomHotwordCatId]）无内置默认词表，返回空串。
+  static Future<String> loadCategoryWords(String catId) async {
+    await _migrateLegacy();
+    final prefs = await SharedPreferences.getInstance();
+    final v = prefs.getString(_catWordsKey(catId));
+    if (v != null && v.trim().isNotEmpty) return v.trim();
+    if (catId == kCustomHotwordCatId) return '';
+    return defaultCategoryWords(catId).join('\n');
+  }
+
+  /// 保存某分类的自定义词表（空串 = 恢复默认）。
+  static Future<void> saveCategoryWords(String catId, String words) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_catWordsKey(catId), words.trim());
+  }
+
+  /// 合并启用分类的词表，供增强档位 per-stream 热词使用。
+  static Future<String> loadHotwords() async {
+    await _migrateLegacy();
+    final enabled = await loadEnabledCategories();
+    final lines = <String>[];
+    for (final c in hotwordCategories) {
+      if (!enabled.contains(c.id)) continue;
+      lines.add(await loadCategoryWords(c.id));
+    }
+    // 用户自定义分类（不在 hotwordCategories，单独合并）
+    if (enabled.contains(kCustomHotwordCatId)) {
+      lines.add(await loadCategoryWords(kCustomHotwordCatId));
+    }
+    return lines.join('\n');
   }
 
   // ============ 旧单实例配置迁移 ============

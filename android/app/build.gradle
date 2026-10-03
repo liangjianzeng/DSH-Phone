@@ -47,6 +47,12 @@ android {
     }
 
     buildTypes {
+        debug {
+            // 统一签名：有 key.properties 时 debug 也用 release 证书，
+            // 保证 debug 包可 `install -r` 覆盖安装 release 包（签名一致）。
+            def hasKey = rootProject.file('key.properties').exists()
+            signingConfig = hasKey ? signingConfigs.release : signingConfigs.debug
+        }
         release {
             // 有 key.properties 用 release 签名；否则回退 debug 签名，
             // 保证各打包机在未配置签名密钥时也能产出可安装 APK。

@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:record/record.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 
+import '../config.dart';
 import 'asr_engine.dart';
 
 /// 端侧流式识别引擎：sherpa-onnx 流式 Zipformer（zh int8，chunk-16）。
@@ -13,12 +14,28 @@ import 'asr_engine.dart';
 /// - 录音用 record 的 16kHz mono PCM16 流，逐块喂入解码，partial 文本
 ///   经 [partialText] 广播（endpoint 静音断句后自动定稿并继续监听）。
 /// - 输出无标点（流式 transducer 特性），注入后可再编辑。
+///
+/// 识别增强档位（[ensureLoaded] 的 [enhanced]）：
+/// - sherpa-onnx 流式（Online）API 不支持 LM（LM 仅在离线 API 可用），
+///   因此增强档位在同一模型上启用 beam search + 热词 + blankPenalty：
+///   - 解码 greedy_search → modified_beam_search（maxActivePaths 加大）；
+///   - 热词：每次按住说话从设置读取热词表（[SSHConfig.loadHotwords]），
+///     经 per-stream [sherpa.OnlineRecognizer.createStream] 传入解码器；
+///   - blankPenalty 抑制静音过度吞字。
+///   不新增下载、体积不变、流式实时出字不变。切换档位会重载识别器；
+///   修改热词表即时生效（下次按住说话即用新热词，无需重载）。
 class SherpaStreamingAsr implements StreamingAsrEngine {
-  SherpaStreamingAsr._(this.modelDir);
+  SherpaStreamingAsr._(this.modelDir, this.enhanced);
 
   final String modelDir;
 
+  /// 当前会话是否增强档位（决定 start 时是否传热词）。
+  final bool enhanced;
+
   static sherpa.OnlineRecognizer? _recognizer;
+
+  /// 已加载识别器对应的增强档位（切换档位时据此重载）。
+  static bool? _loadedEnhanced;
 
   final AudioRecorder _recorder = AudioRecorder();
   StreamSubscription<Uint8List>? _pcmSub;
@@ -34,10 +51,12 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
   @override
   Stream<String> get partialText => _partialCtrl.stream;
 
-  /// 加载识别器（幂等，进程内一次）。模型文件必须已通过
-  /// [AsrModelManager.isReady] 校验，否则抛 [StateError]。
-  static Future<void> ensureLoaded(String modelDir) async {
-    if (_recognizer != null) return;
+  /// 加载识别器。模型文件必须已通过 [AsrModelManager.isReady] 校验，
+  /// 否则抛 [StateError]。同档位幂等（进程内一次）；切换 [enhanced] 档位
+  /// 会释放旧识别器并重新加载。
+  static Future<void> ensureLoaded(String modelDir,
+      {bool enhanced = false}) async {
+    if (_recognizer != null && _loadedEnhanced == enhanced) return;
     // FFI 绑定必须先初始化（Flutter 走 DynamicLibrary.process()），
     // 否则 OnlineRecognizer 抛 "Please initialize sherpa-onnx first"。
     sherpa.initBindings();
@@ -54,21 +73,31 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
         provider: 'cpu',
         debug: false,
       ),
-      decodingMethod: 'greedy_search',
+      // 增强档位：beam search + 热词 + blankPenalty；标准档位保持 greedy。
+      // 热词不在此配置（文件热词），改为每次按住说话 per-stream 传入，
+      // 这样设置里改热词即时生效、无需重载识别器。
+      decodingMethod: enhanced ? 'modified_beam_search' : 'greedy_search',
+      maxActivePaths: enhanced ? 16 : 4,
+      hotwordsScore: 3.0,
+      blankPenalty: enhanced ? 0.5 : 0.0,
       enableEndpoint: true,
       // 按住说话场景：静音 1.2s 判定断句（句间停顿即定稿），长句 20s 兜底
       rule1MinTrailingSilence: 2.4,
       rule2MinTrailingSilence: 1.2,
       rule3MinUtteranceLength: 20,
     ));
-    debugPrint('[DSH][asr] recognizer loaded in ${sw.elapsedMilliseconds}ms');
+    _recognizer?.free();
     _recognizer = recognizer;
+    _loadedEnhanced = enhanced;
+    debugPrint('[DSH][asr] recognizer loaded (enhanced=$enhanced) '
+        'in ${sw.elapsedMilliseconds}ms');
   }
 
   /// 创建会话（每次按住说话一个实例）。
-  static Future<SherpaStreamingAsr> create(String modelDir) async {
-    await ensureLoaded(modelDir);
-    return SherpaStreamingAsr._(modelDir);
+  static Future<SherpaStreamingAsr> create(String modelDir,
+      {bool enhanced = false}) async {
+    await ensureLoaded(modelDir, enhanced: enhanced);
+    return SherpaStreamingAsr._(modelDir, enhanced);
   }
 
   @override
@@ -79,7 +108,10 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
     }
     _stopped = false;
     _segments.clear();
-    _stream = recognizer.createStream();
+    // 增强档位：从设置读取热词表，per-stream 传给解码器（改热词即时生效）。
+    // 热词以逗号/换行分隔；空表则走默认无热词路径。
+    final hotwords = enhanced ? await SSHConfig.loadHotwords() : '';
+    _stream = recognizer.createStream(hotwords: hotwords);
     final pcmStream = await _recorder.startStream(const RecordConfig(
       encoder: AudioEncoder.pcm16bits,
       sampleRate: 16000,

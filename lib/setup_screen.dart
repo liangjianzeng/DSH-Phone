@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'asr/default_hotwords.dart';
 import 'config.dart';
 import 'moon_location.dart';
 import 'tunnel_service.dart';
@@ -209,6 +210,12 @@ class _SetupScreenState extends State<SetupScreen> {
   /// 文件上传大小上限（MB），默认 10，范围 1~30（全局配置）。
   late int _uploadMaxMb;
 
+  /// 端侧 ASR 识别增强档位（全局配置，独立路由本地持有即时反映）。
+  late AsrMode _asrMode;
+
+  /// 端侧 ASR 已启用的热词分类 id 集合（独立路由本地持有即时反映）。
+  final Set<String> _enabledCatIds = <String>{};
+
   /// 应用显示版本号（运行时从构建产物读取，异步加载后回填；默认兜底值先行）。
   late String _appVersion;
 
@@ -231,9 +238,12 @@ class _SetupScreenState extends State<SetupScreen> {
     _resourceViewEnabled = widget.resourceViewEnabled;
     _resourceDownloadEnabled = widget.resourceDownloadEnabled;
     _uploadMaxMb = SSHConfig.defaultUploadMaxMb;
+    _asrMode = AsrMode.standard;
     _appVersion = SSHConfig.fallbackAppVersion;
     _loadFromProfile(_profileIndex);
     _loadUploadLimit();
+    _loadAsrMode();
+    _loadEnabledCats();
     _loadAppVersion();
   }
 
@@ -248,6 +258,85 @@ class _SetupScreenState extends State<SetupScreen> {
   Future<void> _loadUploadLimit() async {
     final v = await SSHConfig.loadUploadMaxMb();
     if (mounted) setState(() => _uploadMaxMb = v);
+  }
+
+  /// 异步加载端侧 ASR 识别增强档位（独立路由，本地持有即时反映）。
+  Future<void> _loadAsrMode() async {
+    final v = await SSHConfig.loadAsrMode();
+    if (mounted) setState(() => _asrMode = v);
+  }
+
+  /// 即时保存 ASR 增强档位（切换即生效，无需等待防抖保存）。
+  Future<void> _saveAsrMode(AsrMode v) async {
+    await SSHConfig.saveAsrMode(v);
+  }
+
+  /// 异步加载已启用的热词分类（独立路由，本地持有即时反映）。
+  Future<void> _loadEnabledCats() async {
+    final list = await SSHConfig.loadEnabledCategories();
+    if (!mounted) return;
+    setState(() {
+      _enabledCatIds
+        ..clear()
+        ..addAll(list);
+    });
+  }
+
+  /// 即时保存启用的热词分类。
+  Future<void> _saveEnabledCats() async {
+    await SSHConfig.saveEnabledCategories(_enabledCatIds.toList());
+  }
+
+  /// 编辑指定分类的词表：多行编辑，保存后即时生效（下次按住说话即用新词表）。
+  Future<void> _editCategoryWords(String catId, String name) async {
+    final current = await SSHConfig.loadCategoryWords(catId);
+    if (!mounted) return;
+    final ctrl = TextEditingController(text: current);
+    final saved = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('编辑「$name」热词'),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 320,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: ctrl,
+                  expands: true,
+                  maxLines: null,
+                  minLines: null,
+                  textAlignVertical: TextAlignVertical.top,
+                  decoration: const InputDecoration(
+                    hintText: '一行一个热词，如：\n大模型\n智能体\n代码生成',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 6),
+              const Text('增强档位下优先识别这些词；清空则恢复默认词表。',
+                  style: TextStyle(fontSize: 12, color: Colors.grey)),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(ctrl.text),
+            child: const Text('保存'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(null),
+            child: const Text('取消'),
+          ),
+        ],
+      ),
+    );
+    ctrl.dispose();
+    if (saved == null || !mounted) return;
+    await SSHConfig.saveCategoryWords(catId, saved);
   }
 
   /// 把指定实例配置回填到表单控件。
@@ -970,6 +1059,106 @@ class _SetupScreenState extends State<SetupScreen> {
             setState(() => _resourceDownloadEnabled = v);
             widget.onResourceDownloadChanged?.call(v);
           },
+        ),
+        const Divider(),
+        const Text('端侧语音识别增强', style: TextStyle(fontSize: 16)),
+        const SizedBox(height: 8),
+        const Padding(
+          padding: EdgeInsets.only(bottom: 8),
+          child: Text(
+            '同一流式模型（约 160MB），增强档位启用 beam search + 热词 + '
+            'blankPenalty 提升中文准确率；不新增下载、按住说话实时出字不变。'
+            '切换后首次按住说话自动重载识别器。',
+            style: TextStyle(color: Colors.grey, fontSize: 12),
+          ),
+        ),
+        RadioListTile<AsrMode>(
+          value: AsrMode.standard,
+          groupValue: _asrMode,
+          title: const Text('标准（推荐）'),
+          subtitle: const Text('greedy 解码，无热词；体积与现状一致'),
+          onChanged: (v) {
+            if (v == null) return;
+            setState(() => _asrMode = v);
+            _saveAsrMode(v);
+          },
+        ),
+        RadioListTile<AsrMode>(
+          value: AsrMode.enhanced,
+          groupValue: _asrMode,
+          title: const Text('增强准确率'),
+          subtitle: const Text('beam search + 热词 + blankPenalty，'
+              '常见词/领域词命中更高'),
+          onChanged: (v) {
+            if (v == null) return;
+            setState(() => _asrMode = v);
+            _saveAsrMode(v);
+          },
+        ),
+        // 热词表配置：可折叠区块（默认收起），避免一次性展开太长。
+        // 含「用户自定义」分类（用户自填词表）与内置分类（可勾选/编辑）。
+        ExpansionTile(
+          leading: const Icon(Icons.format_list_bulleted),
+          title: const Text('语音识别热词'),
+          subtitle: Text(
+            '已启用 ${_enabledCatIds.length}/${hotwordCategories.length + 1} 类'
+            '（勾选与编辑请展开）',
+          ),
+          children: [
+            const Padding(
+              padding: EdgeInsets.only(left: 16, right: 16, bottom: 8),
+              child: Text(
+                '增强档位下优先识别勾选分类的中文词；每类可单独编辑词表。'
+                '勾选越多解码越慢，建议只启用常用分类。',
+                style: TextStyle(color: Colors.grey, fontSize: 12),
+              ),
+            ),
+            // 用户自定义分类：词表由用户自己新增/编辑。
+            CheckboxListTile(
+              dense: true,
+              title: const Text('用户自定义'),
+              subtitle: const Text('自己新增/编辑的词，始终可启用'),
+              value: _enabledCatIds.contains(kCustomHotwordCatId),
+              controlAffinity: ListTileControlAffinity.leading,
+              secondary: TextButton(
+                onPressed: () => _editCategoryWords(
+                    kCustomHotwordCatId, '用户自定义'),
+                child: const Text('编辑'),
+              ),
+              onChanged: (v) {
+                setState(() {
+                  if (v ?? false) {
+                    _enabledCatIds.add(kCustomHotwordCatId);
+                  } else {
+                    _enabledCatIds.remove(kCustomHotwordCatId);
+                  }
+                });
+                _saveEnabledCats();
+              },
+            ),
+            for (final c in hotwordCategories)
+              CheckboxListTile(
+                dense: true,
+                title: Text(c.name),
+                subtitle: Text('${c.words.length} 个默认热词'),
+                value: _enabledCatIds.contains(c.id),
+                controlAffinity: ListTileControlAffinity.leading,
+                secondary: TextButton(
+                  onPressed: () => _editCategoryWords(c.id, c.name),
+                  child: const Text('编辑'),
+                ),
+                onChanged: (v) {
+                  setState(() {
+                    if (v ?? false) {
+                      _enabledCatIds.add(c.id);
+                    } else {
+                      _enabledCatIds.remove(c.id);
+                    }
+                  });
+                  _saveEnabledCats();
+                },
+              ),
+          ],
         ),
         if (widget.showUiControls) ...[
           const Divider(),

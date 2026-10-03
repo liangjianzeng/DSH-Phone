@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../config.dart';
 import 'asr_model_manager.dart';
 import 'sherpa_streaming_asr.dart';
 
@@ -56,8 +57,12 @@ class HoldToTalkSession {
     // （引擎刚启动即被 stop/dispose，随后 _engine! 空指针崩溃，真机实测）。
     bool success = false;
     try {
+      // 按配置的增强档位加载引擎：同一流式模型，增强档位启用
+      // beam search + 热词 + blankPenalty（不新增下载、流式不变）。
+      final enhanced = await SSHConfig.loadAsrMode() == AsrMode.enhanced;
       _engine = await SherpaStreamingAsr.create(
-          await AsrModelManager.modelDir());
+          await AsrModelManager.modelDir(),
+          enhanced: enhanced);
       if (_aborted) return false;
       await _engine!.start();
       recording = true;
