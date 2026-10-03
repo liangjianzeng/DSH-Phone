@@ -25,8 +25,8 @@ void main() async {
 
   runApp(const DshPhoneApp());
 
-  // 启动完成后（首帧渲染后）再后台预热端侧 ASR 引擎：不阻塞/拉长启动过程。
-  // 模型已下载时提前加载识别器，首次按住说话不再现场加载；未下载则跳过。
+  // 启动完成后（首帧渲染后）再后台预热端侧 ASR：在后台 isolate 预读模型
+  // 文件到页缓存，不阻塞主线程/UI、不导致启动黑屏；首次按住说话 IO 更快。
   WidgetsBinding.instance.addPostFrameCallback((_) {
     unawaited(SherpaStreamingAsr.warmup());
   });

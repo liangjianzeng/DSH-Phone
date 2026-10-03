@@ -1,6 +1,9 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:isolate';
 
 import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
 import 'package:record/record.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 
@@ -101,19 +104,35 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
     return SherpaStreamingAsr._(modelDir, enhanced);
   }
 
-  /// 启动预热：模型文件已下载时提前加载识别器（进程内幂等），避免首次按住
-  /// 说话时现场加载（约数秒）造成卡顿。模型未下载（首次启动）跳过，待首次
-  /// 按住说话时走下载引导后再加载。按当前设置档位预热，切换档位会重载。
-  /// 预热失败不阻塞启动：首次按住说话时仍走完整加载路径。
+  /// 启动完成后预热：模型文件已下载时在**后台 isolate** 预读文件到 OS 页缓存
+  /// （按块读取并丢弃），**不阻塞主线程/UI、不导致启动黑屏**；首次按住说话
+  /// 创建识别器时文件已在内存，IO 更快、卡顿更短。模型未下载（首次启动）
+  /// 跳过，待首次使用时走下载引导后再加载。失败不阻塞启动。
   static Future<void> warmup() async {
     try {
       if (!await AsrModelManager.isReady()) return;
-      final enhanced = await SSHConfig.loadAsrMode() == AsrMode.enhanced;
-      await ensureLoaded(await AsrModelManager.modelDir(),
-          enhanced: enhanced);
-      debugPrint('[DSH][asr] warmup loaded (enhanced=$enhanced)');
+      final dir = await AsrModelManager.modelDir();
+      await Isolate.run(() => _preloadFiles(dir));
+      debugPrint('[DSH][asr] warmup: model files preloaded to page cache');
     } catch (e) {
       debugPrint('[DSH][asr] warmup skipped: $e');
+    }
+  }
+
+  /// 后台 isolate：分块读取模型文件并丢弃，把文件页拉进 OS 页缓存。
+  static void _preloadFiles(String dir) {
+    for (final f in AsrModelManager.files) {
+      final file = File(p.join(dir, f));
+      if (!file.existsSync()) continue;
+      try {
+        final raf = file.openSync();
+        try {
+          // 每次读 1MB，读到 EOF（返回空）为止；不一次性整读，避免内存尖峰
+          while (raf.readSync(1 << 20).isNotEmpty) {}
+        } finally {
+          raf.closeSync();
+        }
+      } catch (_) {}
     }
   }
 

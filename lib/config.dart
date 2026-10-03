@@ -236,11 +236,8 @@ class SSHConfig {
   bool get useKey => authType == authTypeKey;
 
   /// 展示名：优先别名；无别名时回退为地址（IP），未配置时显示"未配置"。
-  /// Zcode 模式加前缀区分（同一台机器可能两种模式并存）。
-  String get label {
-    final base = alias.isNotEmpty ? alias : (host.isNotEmpty ? host : '未配置');
-    return isZcodeMode ? '[Z] $base' : base;
-  }
+  String get label =>
+      alias.isNotEmpty ? alias : (host.isNotEmpty ? host : '未配置');
 
   // ============ 单实例键名（按索引）============
 
