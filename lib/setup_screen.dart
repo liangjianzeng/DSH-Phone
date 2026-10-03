@@ -787,10 +787,17 @@ class _SetupScreenState extends State<SetupScreen> {
             controller: _accessToken,
             obscureText: _obscureToken,
             decoration: InputDecoration(
-              labelText: 'DSH 访问 Token（可选）',
-              hintText: '粘贴 DSH 访问 Token（留空则不启用）',
-              helperText: '新版 DSH(≥0.1.2) 启用 token 鉴权，首次访问需携带；'
-                  '换取 30 天签名 cookie 后免 token，过期需重新填写',
+              labelText: _mode == SSHConfig.modeZcode
+                  ? 'Zcode 服务访问 Token（必填）'
+                  : 'DSH 访问 Token（可选）',
+              hintText: _mode == SSHConfig.modeZcode
+                  ? '粘贴 zcode-phone-server 的访问令牌'
+                  : '粘贴 DSH 访问 Token（留空则不启用）',
+              helperText: _mode == SSHConfig.modeZcode
+                  ? '服务端首次启动自动生成：见 zcode-phone-server/config.json '
+                      '的 token 字段或启动控制台；不填服务端会拒绝访问'
+                  : '新版 DSH(≥0.1.2) 启用 token 鉴权，首次访问需携带；'
+                      '换取 30 天签名 cookie 后免 token，过期需重新填写',
               border: const OutlineInputBorder(),
               suffixIcon: IconButton(
                 icon: Icon(_obscureToken
