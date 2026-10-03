@@ -1780,11 +1780,11 @@ class _WebViewScreenState extends State<WebViewScreen>
             const Spacer(),
             // 模式一键切换：配置只是配置，切换在顶栏完成（同实例内翻转
             // DSH/Zcode，自动落到对应模式默认端口并重连；页面地址由
-            // _connect 的地址校验自动重载）
-            IconButton(
-              tooltip: _config.isZcodeMode ? '切换到 DSH 模式' : '切换到 Zcode 模式',
-              icon: const Icon(Icons.swap_horiz),
-              onPressed: _toggleMode,
+            // _connect 的地址校验自动重载）。分段滑块开关，当前模式
+            // 高亮显示，点击即切——无需进设置页。
+            _ModeSegmentSwitch(
+              isZcode: _config.isZcodeMode,
+              onTap: _toggleMode,
             ),
             _buildInstanceSwitcher(context),
             // Unsloth 入口：全部实例未启用时隐藏（首页无意义）
@@ -2616,4 +2616,97 @@ class _MicWavePainter extends CustomPainter {
   @override
   bool shouldRepaint(_MicWavePainter oldDelegate) =>
       oldDelegate.t != t || oldDelegate.color != color;
+}
+
+/// 顶栏模式分段开关：DSH | Zcode 两段滑块，当前段高亮（DSH 蓝 / Zcode 紫），
+/// 点击另一段即切换模式并自动重连。带滑块动画，视觉与顶栏整体协调。
+class _ModeSegmentSwitch extends StatelessWidget {
+  const _ModeSegmentSwitch({required this.isZcode, required this.onTap});
+
+  final bool isZcode;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    const dshColor = Color(0xFF1F6FEB);
+    const zcodeColor = Color(0xFF7C5CFF);
+    return Tooltip(
+      message: isZcode ? '切换到 DSH 模式' : '切换到 Zcode 模式',
+      child: Material(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest
+            .withValues(alpha: 0.6),
+        borderRadius: BorderRadius.circular(999),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(999),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeOutCubic,
+            height: 30,
+            padding: const EdgeInsets.all(3),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _segment(
+                  context,
+                  label: 'DSH',
+                  icon: Icons.smart_toy_outlined,
+                  selected: !isZcode,
+                  color: dshColor,
+                ),
+                const SizedBox(width: 2),
+                _segment(
+                  context,
+                  label: 'ZCode',
+                  icon: Icons.auto_awesome_outlined,
+                  selected: isZcode,
+                  color: zcodeColor,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _segment(
+    BuildContext context, {
+    required String label,
+    required IconData icon,
+    required bool selected,
+    required Color color,
+  }) {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOutCubic,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+      decoration: BoxDecoration(
+        color: selected ? color.withValues(alpha: 0.18) : Colors.transparent,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: selected ? color : Colors.transparent,
+          width: 1,
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 13, color: selected ? color : Theme.of(context).colorScheme.onSurfaceVariant),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 12,
+              height: 1,
+              fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+              color: selected
+                  ? color
+                  : Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }

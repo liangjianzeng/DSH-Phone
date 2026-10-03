@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'asr/sherpa_streaming_asr.dart';
 import 'config.dart';
 import 'foreground_service.dart';
 import 'setup_screen.dart';
@@ -21,6 +24,10 @@ void main() async {
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
 
   runApp(const DshPhoneApp());
+
+  // 启动后后台预热端侧 ASR 引擎：模型已下载时提前加载识别器（约数秒），
+  // 避免首次按住说话时现场加载造成卡顿；未下载则跳过，待首次使用时再加载。
+  unawaited(SherpaStreamingAsr.warmup());
 }
 
 class DshPhoneApp extends StatelessWidget {

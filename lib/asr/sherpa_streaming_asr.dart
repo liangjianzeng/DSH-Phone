@@ -6,6 +6,7 @@ import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 
 import '../config.dart';
 import 'asr_engine.dart';
+import 'asr_model_manager.dart';
 
 /// 端侧流式识别引擎：sherpa-onnx 流式 Zipformer（zh int8，chunk-16）。
 ///
@@ -100,6 +101,22 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
     return SherpaStreamingAsr._(modelDir, enhanced);
   }
 
+  /// 启动预热：模型文件已下载时提前加载识别器（进程内幂等），避免首次按住
+  /// 说话时现场加载（约数秒）造成卡顿。模型未下载（首次启动）跳过，待首次
+  /// 按住说话时走下载引导后再加载。按当前设置档位预热，切换档位会重载。
+  /// 预热失败不阻塞启动：首次按住说话时仍走完整加载路径。
+  static Future<void> warmup() async {
+    try {
+      if (!await AsrModelManager.isReady()) return;
+      final enhanced = await SSHConfig.loadAsrMode() == AsrMode.enhanced;
+      await ensureLoaded(await AsrModelManager.modelDir(),
+          enhanced: enhanced);
+      debugPrint('[DSH][asr] warmup loaded (enhanced=$enhanced)');
+    } catch (e) {
+      debugPrint('[DSH][asr] warmup skipped: $e');
+    }
+  }
+
   @override
   Future<void> start() async {
     final recognizer = _recognizer;
@@ -108,10 +125,12 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
     }
     _stopped = false;
     _segments.clear();
-    // 增强档位：从设置读取热词表，per-stream 传给解码器（改热词即时生效）。
-    // 热词以逗号/换行分隔；空表则走默认无热词路径。
-    final hotwords = enhanced ? await SSHConfig.loadHotwords() : '';
-    _stream = recognizer.createStream(hotwords: hotwords);
+    // 从设置读取热词表，per-stream 传给解码器（改热词即时生效）：
+    // 标准与增强档位都会应用勾选/自定义的热词，保证自定义人名等词优先识别。
+    // 热词归一化为逐词换行分隔（sherpa 按换行切分每个热词，逗号连写会被
+    // 当成一个整体热词而失效）；空表则走默认无热词路径。
+    final hotwordList = _normalizeHotwords(await SSHConfig.loadHotwords());
+    _stream = recognizer.createStream(hotwords: hotwordList.join('\n'));
     final pcmStream = await _recorder.startStream(const RecordConfig(
       encoder: AudioEncoder.pcm16bits,
       sampleRate: 16000,
@@ -188,6 +207,19 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
 
   /// 静态文本快照（浮层展示当前累计文本用）。
   String get currentText => _segments.toString();
+
+  /// 把热词表归一化为逐词换行分隔：兼容用户以逗号/换行/全角逗号混填的词表，
+  /// 去掉空串与重复项——sherpa 按换行切分每个热词，逗号连写会被当成一个
+  /// 整体热词导致不生效。
+  static List<String> _normalizeHotwords(String raw) {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final w in raw.split(RegExp(r'[,，\n\r]'))) {
+      final t = w.trim();
+      if (t.isNotEmpty && seen.add(t)) out.add(t);
+    }
+    return out;
+  }
 
   static Float32List _pcm16ToFloat32(Uint8List bytes) {
     final sampleCount = bytes.length ~/ 2;
