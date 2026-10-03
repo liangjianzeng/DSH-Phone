@@ -196,6 +196,8 @@ class SSHConfig {
     String? accessToken,
     String? mode,
     int? remotePort,
+    bool? hostMonitorEnabled,
+    bool? unslothEnabled,
   }) =>
       SSHConfig(
         host: host,
@@ -209,8 +211,8 @@ class SSHConfig {
         alias: alias,
         mode: mode ?? this.mode,
         remotePort: remotePort ?? this.remotePort,
-        hostMonitorEnabled: hostMonitorEnabled,
-        unslothEnabled: unslothEnabled,
+        hostMonitorEnabled: hostMonitorEnabled ?? this.hostMonitorEnabled,
+        unslothEnabled: unslothEnabled ?? this.unslothEnabled,
         unslothPort: unslothPort,
         unslothUseSsh: unslothUseSsh,
         unslothPassword: unslothPassword,

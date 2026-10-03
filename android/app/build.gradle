@@ -29,6 +29,11 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // 仅打包手机 ARM 原生库：sherpa-onnx 依赖的 libonnxruntime.so 很大，
+        // 去掉 x86/x86_64 桌面 ABI 可砍掉约 60-70MB（手机用不到）。
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a'
+        }
     }
 
     signingConfigs {

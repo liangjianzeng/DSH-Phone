@@ -54,6 +54,30 @@ void main() {
       expect(WeatherService.kindFromWmo(42, null), WeatherKind.clear);
       expect(WeatherService.kindFromWmo(-1, null), WeatherKind.clear);
     });
+
+    test('实际无降水时，雨/雷/雪码降级为云系动效（预报码≠实况）', () {
+      // 无降水（< 阈值）时不再渲染任何雨雪雷动效。
+      expect(WeatherService.kindFromWmo(61, 0.0), WeatherKind.cloudy);
+      expect(WeatherService.kindFromWmo(95, 0.0), WeatherKind.cloudy);
+      expect(WeatherService.kindFromWmo(71, 0.0), WeatherKind.cloudy);
+      expect(WeatherService.kindFromWmo(65, 0.0), WeatherKind.cloudy);
+      // 缺省云量回退「阴」；按云量选档位。
+      expect(WeatherService.kindFromWmo(95, 0.0, cloudCover: 90),
+          WeatherKind.cloudy);
+      expect(WeatherService.kindFromWmo(95, 0.0, cloudCover: 50),
+          WeatherKind.partlyCloudy);
+      expect(WeatherService.kindFromWmo(95, 0.0, cloudCover: 10),
+          WeatherKind.clear);
+    });
+
+    test('大雨/雷暴码但实测量级很低：按量级降级为雨/毛毛雨', () {
+      expect(WeatherService.kindFromWmo(95, 0.2), WeatherKind.drizzle);
+      expect(WeatherService.kindFromWmo(95, 0.5), WeatherKind.rain);
+      expect(WeatherService.kindFromWmo(65, 0.2), WeatherKind.drizzle);
+      // 达到下限时保持大雨/雷暴。
+      expect(WeatherService.kindFromWmo(95, 2.0), WeatherKind.thunder);
+      expect(WeatherService.kindFromWmo(82, 5.0), WeatherKind.heavyRain);
+    });
   });
 
   group('WeatherService.summaryFromWmo 中文描述', () {
@@ -70,6 +94,19 @@ void main() {
         expect(WeatherService.summaryFromWmo(code), isNotEmpty,
             reason: 'WMO $code 描述不应为空');
       }
+    });
+
+    test('实际无降水时，降水码描述降级为云系/按量级', () {
+      expect(WeatherService.summaryFromWmo(95, precipitation: 0.0), '阴');
+      expect(WeatherService.summaryFromWmo(61, precipitation: 0.0), '阴');
+      expect(WeatherService.summaryFromWmo(95, precipitation: 0.2), '毛毛雨');
+      expect(WeatherService.summaryFromWmo(95, precipitation: 0.5), '小雨');
+      expect(WeatherService.summaryFromWmo(95, precipitation: 2.0), '雷阵雨');
+      // 按云量选描述档位。
+      expect(WeatherService.summaryFromWmo(95, precipitation: 0.0,
+          cloudCover: 50), '多云');
+      expect(WeatherService.summaryFromWmo(95, precipitation: 0.0,
+          cloudCover: 10), '晴');
     });
   });
 }

@@ -134,15 +134,29 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 语音入口顶边 Y（相对 Stack，px），默认与相机入口同高（右侧对称位置）。
   double _voiceControlsTop = 0;
 
-  /// 拖拽抓手偏移：pan 起始时“手指 Y − 控件顶边 Y”，使控件顶边始终跟随手指。
+  /// 语音入口是否吸附在左侧边缘（false = 右侧）；松手时按水平位置吸附，
+  /// 方便左右手操作。
+  bool _voiceControlsOnLeft = false;
+
+  /// 拖拽中语音入口的临时左侧 X（相对 Stack）；非拖拽时为 null。
+  double? _voiceControlsDragLeft;
+
+  /// 拖拽抓手偏移：pan 起始时“手指 − 控件顶边/左边”，使控件始终跟随手指。
   double _zoomGripOffset = 0;
   double _photoGripOffset = 0;
   double _voiceGripOffset = 0;
+  double _voiceGripOffsetX = 0;
 
   /// 控件拖拽时顶边允许的最大值（Stack 高度 − 控件高度），保证不滑出屏外。
   static const double _zoomControlHeight = 120; // 3 图标 + 2 分隔，近似
   static const double _photoControlHeight = 48; // 圆形按钮 48×48
   static const double _voiceControlHeight = 48; // 圆形麦克风按钮 48×48
+  static const double _voiceControlWidth = 48; // 圆形麦克风按钮 48×48
+  static const double _voiceEdgeGap = 8; // 吸附后距屏幕边缘的间距
+
+  /// 语音入口当前左侧 X（非拖拽时按吸附侧取固定边距；拖拽中取临时值）。
+  double _currentVoiceLeft(double stackWidth) => _voiceControlsDragLeft ??
+      (_voiceControlsOnLeft ? _voiceEdgeGap : stackWidth - _voiceControlWidth - _voiceEdgeGap);
 
   // ---- WebView 页面加载状态 ----
   bool _pageLoading = false; // 远程页面加载中（隧道已通，页面未就绪）
@@ -468,21 +482,41 @@ class _WebViewScreenState extends State<WebViewScreen>
     }
   }
 
-  /// 语音入口拖拽：更新顶边（相对 Stack，px）。
+  /// 语音入口拖拽：更新顶边与水平位置（相对 Stack，px）。
   /// 按住说话期间不拖拽（长按赢得手势竞技场后拖拽本就不会触发，此处双保险）。
-  void _onVoiceControlsPanStart(DragStartDetails details, double stackHeight) {
+  void _onVoiceControlsPanStart(DragStartDetails details, double stackHeight,
+      double stackWidth) {
     if (_holdSession != null) return;
     _voiceGripOffset = details.globalPosition.dy - _voiceControlsTop;
+    _voiceGripOffsetX =
+        details.globalPosition.dx - _currentVoiceLeft(stackWidth);
   }
 
-  void _onVoiceControlsPanUpdate(
-      DragUpdateDetails details, double stackHeight) {
+  void _onVoiceControlsPanUpdate(DragUpdateDetails details, double stackHeight,
+      double stackWidth) {
     if (_holdSession != null) return;
     final newTop = (details.globalPosition.dy - _voiceGripOffset)
         .clamp(0.0, stackHeight - _voiceControlHeight);
     if ((newTop - _voiceControlsTop).abs() > 1.0) {
       setState(() => _voiceControlsTop = newTop);
     }
+    // 水平跟随手指；松手时按位置吸附到左/右边缘。
+    final newLeft = (details.globalPosition.dx - _voiceGripOffsetX)
+        .clamp(0.0, stackWidth - _voiceControlWidth);
+    if ((_voiceControlsDragLeft == null ||
+        (newLeft - _voiceControlsDragLeft!).abs() > 1.0)) {
+      setState(() => _voiceControlsDragLeft = newLeft);
+    }
+  }
+
+  /// 语音入口松手：按水平位置吸附到最近边缘（左半 → 左边缘，右半 → 右边缘）。
+  void _onVoiceControlsPanEnd(double stackWidth) {
+    final dragLeft = _voiceControlsDragLeft;
+    if (dragLeft == null) return;
+    setState(() {
+      _voiceControlsOnLeft = dragLeft < stackWidth / 2;
+      _voiceControlsDragLeft = null;
+    });
   }
 
   // ---- 按住说话（长按右侧语音按钮 → 端侧流式识别） ----
@@ -545,7 +579,8 @@ class _WebViewScreenState extends State<WebViewScreen>
         details.offsetFromOrigin.dy < -HoldToTalkSession.cancelSlop;
   }
 
-  /// 长按结束（松手/系统取消）：取终稿注入消息输入框（不自动发送）。
+  /// 长按结束（松手/系统取消）：取终稿注入消息输入框并自动发送，
+  /// 减少一次"确认发送"点击。
   /// 引擎尚未就绪（加载中松手）→ 标记取消，由 start 完成侧收尾。
   Future<void> _onVoiceLongPressEnd({bool cancelled = false}) async {
     _voiceLongPressActive = false; // 弹窗期间的收尾判断依赖此标记
@@ -559,7 +594,13 @@ class _WebViewScreenState extends State<WebViewScreen>
     final discard = cancelled || session.cancelMode.value;
     final text = await session.end(cancelled: discard);
     if (discard || text.isEmpty || !mounted) return;
-    await _injectComposerText(text);
+    final ok = await _injectComposerTextAndSend(text);
+    if (!mounted) return;
+    if (ok) {
+      _snack('已发送');
+    } else {
+      _snack('已注入，请点发送');
+    }
   }
 
   /// 月相观测位置设置变更：持久化并重新解析（observer 变化自动触发重绘）。
@@ -1231,17 +1272,32 @@ class _WebViewScreenState extends State<WebViewScreen>
     }
   }
 
-  /// 文本注入 DSH 消息输入框（composer 桥，不自动发送），失败提示。
-  Future<void> _injectComposerText(String text) async {
+  /// 文本注入后自动发送（语音松手场景）。返回是否成功发送。
+  /// 注入失败或找不到发送入口时返回 false（文本已注入，用户可手动发送）。
+  Future<bool> _injectComposerTextAndSend(String text) async {
     final c = _controller;
-    if (c == null) return;
-    final js = "window.__dshComposerBridge.insertText(${jsonEncode(text)})";
-    final result = await c.evaluateJavascript(source: js) as Object?;
-    if (result is Map && result['ok'] == false) {
-      _snack('文本注入失败：${result['error'] ?? '未知错误'}');
-    } else {
-      debugPrint('[DSH] composer text injected: ${text.length} chars');
+    if (c == null) return false;
+    // 先注入文本
+    final inj = await c.evaluateJavascript(
+        source: "window.__dshComposerBridge.insertText(${jsonEncode(text)})")
+        as Object?;
+    if (inj is Map && inj['ok'] == false) {
+      _snack('文本注入失败：${inj['error'] ?? '未知错误'}');
+      return false;
     }
+    debugPrint('[DSH] composer text injected: ${text.length} chars');
+    // 等 React 同步文本、发送按钮变为可点（DSH 富文本编辑器异步更新）
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    if (!mounted) return false;
+    // 再触发发送
+    final send = await c.evaluateJavascript(
+        source: "window.__dshComposerBridge.send()") as Object?;
+    if (send is Map && send['ok'] == true) {
+      debugPrint('[DSH] composer text sent via ${send['via']}');
+      return true;
+    }
+    debugPrint('[DSH] composer send failed: ${(send as Map?)?['error']}');
+    return false;
   }
 
   /// 依据文件名判断 DSH 附件可接受的图片 MIME（png/jpeg/webp/gif）。
@@ -1711,12 +1767,13 @@ class _WebViewScreenState extends State<WebViewScreen>
         return LayoutBuilder(
           builder: (context, constraints) {
             final stackHeight = constraints.maxHeight;
+            final stackWidth = constraints.maxWidth;
             if (_bodyHeight == 0) {
               _bodyHeight = stackHeight;
               _zoomControlsTop = stackHeight * 0.5; // 默认屏幕中央
               _photoControlsTop = stackHeight * (1 - 1 / 6); // 底部往上约六分之一
-              // 右侧语音按钮：比相机入口略高一点（视觉上不对齐成一条线，
-              // 也避免与月相/天气动效拥挤）。
+              // 语音按钮默认吸附右侧、比相机入口略高一点（视觉上不对齐成一
+              // 条线，也避免与月相/天气动效拥挤）；可拖到左/右边缘吸附。
               _voiceControlsTop =
                   (_photoControlsTop - 16).clamp(0.0, stackHeight);
             } else if ((stackHeight - _bodyHeight).abs() > 1) {
@@ -1820,7 +1877,7 @@ class _WebViewScreenState extends State<WebViewScreen>
                 if (_voiceControlsEnabled &&
                     !_pageLoading &&
                     _pageError == null)
-                  _buildVoiceControls(context, stackHeight),
+                  _buildVoiceControls(context, stackHeight, stackWidth),
                 // 天气动效：云/雨/雪/雾/雷锚定相机按钮当前位置（拖拽跟随），
                 // 绘制在按钮上层、低不透明度且不拦截触摸；相机入口隐藏时一并隐藏。
                 if (_photoControlsEnabled &&
@@ -2026,24 +2083,32 @@ class _WebViewScreenState extends State<WebViewScreen>
     );
   }
 
-  /// 语音输入浮动按钮：对话区**右侧**、默认比相机入口略高一点，可拖拽上下
-  /// 移动。长按按住说话（端侧流式识别，微信式交互）：上滑取消、松手把转写
-  /// 文本注入消息输入框；点击无动作（拖拽/长按两个手势，避免与注入动作误触）。
+  /// 语音输入浮动按钮：默认吸附**右侧**（比相机入口略高一点），可拖拽到
+  /// 左/右屏幕边缘吸附（松手按水平位置吸附最近边缘，方便左右手操作），
+  /// 也可上下移动。长按按住说话（端侧流式识别，微信式交互）：上滑取消、
+  /// 松手把转写文本注入消息输入框并自动发送；点击无动作（拖拽/长按两个
+  /// 手势，避免与注入动作误触）。
   ///
   /// 视觉上**只画麦克风图标本身**（无圆圈底/边框，用户要求：小一点也知道是
   /// 干什么）；命中区域仍占满 48×48，保证拖拽与长按好按。按住说话期间图标
   /// 播放声纹扩散动效（[_VoiceMicButton]），上滑取消时变红——让用户一眼
   /// 知道正在监听。
-  Widget _buildVoiceControls(BuildContext context, double stackHeight) {
+  Widget _buildVoiceControls(BuildContext context, double stackHeight,
+      double stackWidth) {
+    // 拖拽中用临时左侧 X；非拖拽时按吸附侧用 left/right 固定边距。
+    final dragLeft = _voiceControlsDragLeft;
     return Positioned(
-      right: 8,
       top: _voiceControlsTop,
+      left: dragLeft ?? (_voiceControlsOnLeft ? _voiceEdgeGap : null),
+      right: (dragLeft == null && !_voiceControlsOnLeft) ? _voiceEdgeGap : null,
       // 占满命中区域捕获拖拽与长按；无内部按钮，点击不产生动作
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onPanStart: (details) => _onVoiceControlsPanStart(details, stackHeight),
+        onPanStart: (details) =>
+            _onVoiceControlsPanStart(details, stackHeight, stackWidth),
         onPanUpdate: (details) =>
-            _onVoiceControlsPanUpdate(details, stackHeight),
+            _onVoiceControlsPanUpdate(details, stackHeight, stackWidth),
+        onPanEnd: (_) => _onVoiceControlsPanEnd(stackWidth),
         onLongPressStart: (_) => _onVoiceLongPressStart(),
         onLongPressMoveUpdate: _onVoiceLongPressMoveUpdate,
         onLongPressEnd: (_) => _onVoiceLongPressEnd(),

@@ -62,3 +62,11 @@ apk/
 .flutter
 .flutter_tool_state
 .workbuddy/
+
+# DSH ACL 修复备份与报告（不提交）
+.dsh-acl-recovery/
+
+# 本地分析输出与截图（不提交）
+analyze_out.txt
+screen1.png
+build_release_log.txt

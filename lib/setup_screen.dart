@@ -340,9 +340,21 @@ class _SetupScreenState extends State<SetupScreen> {
         ],
       ),
     );
-    ctrl.dispose();
+    // 不显式 dispose：dialog 关闭动画期间 TextField 仍引用该 controller，
+    // 此时 dispose 会抛 "used after disposed"（debug 红屏）。controller 为
+    // 局部变量，dialog 关闭后无引用，由 GC 回收，无泄漏。
     if (saved == null || !mounted) return;
-    await SSHConfig.saveCategoryWords(catId, saved);
+    try {
+      await SSHConfig.saveCategoryWords(catId, saved);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('「$name」热词已保存')));
+    } catch (e) {
+      debugPrint('[DSH][asr] save hotwords error: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('保存失败：$e')));
+    }
   }
 
   /// 切换服务模式：未手动改过远端端口时（等于另一模式的默认值），自动回填新模式的默认端口。

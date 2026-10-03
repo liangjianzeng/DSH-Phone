@@ -222,10 +222,11 @@ class WeatherService {
         throw const FormatException('响应缺少 weather_code');
       }
       final precip = (currentBlock['precipitation'] as num?)?.toDouble();
+      final cloud = (currentBlock['cloud_cover'] as num?)?.toDouble();
       return WeatherInfo(
-        kind: kindFromWmo(code, precip),
+        kind: kindFromWmo(code, precip, cloudCover: cloud),
         wmoCode: code,
-        summary: summaryFromWmo(code),
+        summary: summaryFromWmo(code, precipitation: precip, cloudCover: cloud),
         temperature: (currentBlock['temperature_2m'] as num?)?.toDouble(),
         precipitation: precip,
         fetchedAt: DateTime.now().toUtc(),
@@ -235,9 +236,87 @@ class WeatherService {
     }
   }
 
-  /// WMO 标准天气码 → 动效种类。[precipitation]（mm/h）用于在常规雨码上
-  /// 识别实际更强的降水（阵性降水码 61/63 但雨强很大时升级为大雨动效）。
-  static WeatherKind kindFromWmo(int code, double? precipitation) {
+  /// 视为「无降水」的降水量阈值（mm）。低于该值即使天气码标注雨/雪/雷，
+  /// 也认为当前并未实际降水（预报码与实际观测不一致时，以实测为准）。
+  static const double _tracePrecipThreshold = 0.1;
+
+  /// 大雨/雷暴码所需的降水量下限（mm，当前 15 分钟间隔）。
+  /// 低于该值时天气码与实测量级明显不符，降级为普通雨/毛毛雨。
+  static const double _heavyPrecipFloor = 1.0;
+
+  /// 常规雨与毛毛雨的降水量分界（mm，当前 15 分钟间隔）。
+  static const double _lightRainPrecip = 0.3;
+
+  /// 是否为降水类天气码（毛毛雨/雨/雪/雷暴/冻雨）。
+  static bool _isPrecipCode(int code) {
+    switch (code) {
+      case 51:
+      case 53:
+      case 55:
+      case 56:
+      case 57:
+      case 61:
+      case 63:
+      case 65:
+      case 66:
+      case 67:
+      case 80:
+      case 81:
+      case 82:
+      case 71:
+      case 73:
+      case 75:
+      case 77:
+      case 85:
+      case 86:
+      case 95:
+      case 96:
+      case 99:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /// 是否为大降水/雷暴类天气码（这些码与实际低降水量最易矛盾）。
+  static bool _isHeavyOrThunderCode(int code) =>
+      code == 65 || code == 67 || code == 82 ||
+      code == 95 || code == 96 || code == 99;
+
+  /// 无降水时的云系动效种类（依据云量，缺省回退「阴」）。
+  static WeatherKind _cloudKind(double? cloudCover) {
+    if (cloudCover == null) return WeatherKind.cloudy;
+    if (cloudCover >= 85) return WeatherKind.cloudy;
+    if (cloudCover >= 30) return WeatherKind.partlyCloudy;
+    return WeatherKind.clear;
+  }
+
+  /// 无降水时的云系中文描述（与 [_cloudKind] 一致）。
+  static String _cloudSummary(double? cloudCover) {
+    if (cloudCover == null) return '阴';
+    if (cloudCover >= 85) return '阴';
+    if (cloudCover >= 30) return '多云';
+    return '晴';
+  }
+
+  /// WMO 标准天气码 → 动效种类。[precipitation]（mm）用于两处校正：
+  /// 1) 实际无降水时，雨/雪/雷码降级为云系动效（预报码≠当下实况）；
+  /// 2) 大雨/雷暴码但实测量级很低时，按实测量级降级为普通雨/毛毛雨；
+  /// 常规雨码 + 很大降水量时升级为大雨动效。
+  /// [cloudCover]（%）仅用于无降水降级时选择云量档位。
+  static WeatherKind kindFromWmo(int code, double? precipitation,
+      {double? cloudCover}) {
+    final precip = precipitation;
+    if (precip != null && _isPrecipCode(code)) {
+      if (precip < _tracePrecipThreshold) {
+        // 实际无降水：不渲染任何雨雪雷。
+        return _cloudKind(cloudCover);
+      }
+      if (_isHeavyOrThunderCode(code) && precip < _heavyPrecipFloor) {
+        // 大雨/雷暴码但实测量级很低：按量级降级。
+        return precip >= _lightRainPrecip ? WeatherKind.rain : WeatherKind.drizzle;
+      }
+    }
     switch (code) {
       case 0:
         return WeatherKind.clear;
@@ -259,6 +338,7 @@ class WeatherService {
       case 63: // 中雨
       case 66: // 冻雨
       case 80: // 阵雨
+      case 81: // 强阵雨
         if (precipitation != null && precipitation >= 6.0) {
           return WeatherKind.heavyRain;
         }
@@ -284,7 +364,19 @@ class WeatherService {
   }
 
   /// WMO 标准天气码 → 中文描述（设置页状态行展示）。
-  static String summaryFromWmo(int code) {
+  /// 与 [kindFromWmo] 一致：实际无降水时降水码降级为云系描述，
+  /// 大雨/雷暴码但实测量级很低时按量级降级为毛毛雨/小雨。
+  static String summaryFromWmo(int code,
+      {double? precipitation, double? cloudCover}) {
+    final precip = precipitation;
+    if (precip != null && _isPrecipCode(code)) {
+      if (precip < _tracePrecipThreshold) {
+        return _cloudSummary(cloudCover);
+      }
+      if (_isHeavyOrThunderCode(code) && precip < _heavyPrecipFloor) {
+        return precip >= _lightRainPrecip ? '小雨' : '毛毛雨';
+      }
+    }
     const table = {
       0: '晴',
       1: '大部晴朗',
