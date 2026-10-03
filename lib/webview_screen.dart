@@ -139,6 +139,13 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 相机入口顶边 Y（相对 Stack，px），默认底部往上约六分之一处。
   double _photoControlsTop = 0;
 
+  /// 相机入口是否吸附在左侧边缘（false = 右侧）；松手时按水平位置吸附，
+  /// 方便左右手操作（与语音入口一致）。
+  bool _photoControlsOnLeft = true;
+
+  /// 拖拽中相机入口的临时左侧 X（相对 Stack）；非拖拽时为 null。
+  double? _photoControlsDragLeft;
+
   /// 语音入口顶边 Y（相对 Stack，px），默认与相机入口同高（右侧对称位置）。
   double _voiceControlsTop = 0;
 
@@ -152,19 +159,25 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 拖拽抓手偏移：pan 起始时“手指 − 控件顶边/左边”，使控件始终跟随手指。
   double _zoomGripOffset = 0;
   double _photoGripOffset = 0;
+  double _photoGripOffsetX = 0;
   double _voiceGripOffset = 0;
   double _voiceGripOffsetX = 0;
 
   /// 控件拖拽时顶边允许的最大值（Stack 高度 − 控件高度），保证不滑出屏外。
   static const double _zoomControlHeight = 120; // 3 图标 + 2 分隔，近似
   static const double _photoControlHeight = 48; // 圆形按钮 48×48
+  static const double _photoControlWidth = 48; // 圆形按钮 48×48
   static const double _voiceControlHeight = 48; // 圆形麦克风按钮 48×48
   static const double _voiceControlWidth = 48; // 圆形麦克风按钮 48×48
-  static const double _voiceEdgeGap = 8; // 吸附后距屏幕边缘的间距
+  static const double _edgeGap = 8; // 吸附后距屏幕边缘的间距
+
+  /// 相机入口当前左侧 X（非拖拽时按吸附侧取固定边距；拖拽中取临时值）。
+  double _currentPhotoLeft(double stackWidth) => _photoControlsDragLeft ??
+      (_photoControlsOnLeft ? _edgeGap : stackWidth - _photoControlWidth - _edgeGap);
 
   /// 语音入口当前左侧 X（非拖拽时按吸附侧取固定边距；拖拽中取临时值）。
   double _currentVoiceLeft(double stackWidth) => _voiceControlsDragLeft ??
-      (_voiceControlsOnLeft ? _voiceEdgeGap : stackWidth - _voiceControlWidth - _voiceEdgeGap);
+      (_voiceControlsOnLeft ? _edgeGap : stackWidth - _voiceControlWidth - _edgeGap);
 
   // ---- WebView 页面加载状态 ----
   bool _pageLoading = false; // 远程页面加载中（隧道已通，页面未就绪）
@@ -494,18 +507,38 @@ class _WebViewScreenState extends State<WebViewScreen>
     }
   }
 
-  /// 相机入口拖拽：更新归一化顶边（相对 Stack，px）。
-  void _onPhotoControlsPanStart(DragStartDetails details, double stackHeight) {
+  /// 相机入口拖拽开始：记录上下/左右抓手偏移（相对 Stack）。
+  void _onPhotoControlsPanStart(DragStartDetails details, double stackHeight,
+      double stackWidth) {
     _photoGripOffset = details.globalPosition.dy - _photoControlsTop;
+    _photoGripOffsetX =
+        details.globalPosition.dx - _currentPhotoLeft(stackWidth);
   }
 
-  void _onPhotoControlsPanUpdate(
-      DragUpdateDetails details, double stackHeight) {
+  /// 相机入口拖拽：顶边跟随手指上下移动，左侧 X 跟随手指左右移动。
+  void _onPhotoControlsPanUpdate(DragUpdateDetails details, double stackHeight,
+      double stackWidth) {
     final newTop = (details.globalPosition.dy - _photoGripOffset)
         .clamp(0.0, stackHeight - _photoControlHeight);
     if ((newTop - _photoControlsTop).abs() > 1.0) {
       setState(() => _photoControlsTop = newTop);
     }
+    final newLeft = (details.globalPosition.dx - _photoGripOffsetX)
+        .clamp(0.0, stackWidth - _photoControlWidth);
+    if ((_photoControlsDragLeft == null ||
+        (newLeft - _photoControlsDragLeft!).abs() > 1.0)) {
+      setState(() => _photoControlsDragLeft = newLeft);
+    }
+  }
+
+  /// 相机入口松手：按水平位置吸附到最近边缘（左半 → 左边缘，右半 → 右边缘）。
+  void _onPhotoControlsPanEnd(double stackWidth) {
+    final dragLeft = _photoControlsDragLeft;
+    if (dragLeft == null) return;
+    setState(() {
+      _photoControlsOnLeft = dragLeft < stackWidth / 2;
+      _photoControlsDragLeft = null;
+    });
   }
 
   /// 语音入口拖拽：更新顶边与水平位置（相对 Stack，px）。
@@ -1895,11 +1928,12 @@ class _WebViewScreenState extends State<WebViewScreen>
                 // 默认关闭，仅在设置页开启后显示。
                 if (_zoomControlsEnabled && !_pageLoading && _pageError == null)
                   _buildZoomControls(context, stackHeight),
-                // 相机入口浮动按钮：对话区左侧靠屏幕边，可拖拽上下移动，默认开启。
+                // 相机入口浮动按钮：默认对话区左侧靠屏幕边，可拖拽上下/左右
+                // 移动并吸附到最近边缘（方便左右手操作），默认开启。
                 if (_photoControlsEnabled &&
                     !_pageLoading &&
                     _pageError == null)
-                  _buildPhotoControls(context, stackHeight),
+                  _buildPhotoControls(context, stackHeight, stackWidth),
                 // 语音输入浮动按钮：对话区右侧靠屏幕边（与相机入口对称），
                 // 可拖拽上下移动，长按按住说话，默认开启。
                 // 语音并入相机开启时隐藏右侧麦克风按钮（相机按钮承担语音）。
@@ -2095,19 +2129,26 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 相机入口浮动按钮：对话区左侧、屏幕底部往上约六分之一处（避开底部安全区与
   /// 键盘、缩放控件）。按钮呈现为**真实观测的月相**（夜间）或**全亮日光模式**
   /// （白天，日出日落联动开启时）——细节见 [_MoonCameraButton]。
-  Widget _buildPhotoControls(BuildContext context, double stackHeight) {
+  Widget _buildPhotoControls(BuildContext context, double stackHeight,
+      double stackWidth) {
     final mergeVoice = _voiceMergeToCamera;
+    final dragLeft = _photoControlsDragLeft;
     return Positioned(
-      left: 6,
       top: _photoControlsTop,
-      // 可拖拽自由上下移动：占满命中区域捕获拖拽，点击透传给内部相机按钮。
+      // 可拖拽左右移动并吸附到左/右边缘（方便左右手操作）：
+      // 拖拽中用临时左侧 X，非拖拽时按吸附侧用 left/right 固定边距。
+      left: dragLeft ?? (_photoControlsOnLeft ? _edgeGap : null),
+      right: (dragLeft == null && !_photoControlsOnLeft) ? _edgeGap : null,
+      // 占满命中区域捕获拖拽，点击透传给内部相机按钮。
       // 语音并入相机开启时：长按 = 按住说话（端侧识别，同右侧麦克风按钮），
       // 短按仍为相机（拍照/传图）；关闭时相机按钮不承担长按说话。
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onPanStart: (details) => _onPhotoControlsPanStart(details, stackHeight),
+        onPanStart: (details) =>
+            _onPhotoControlsPanStart(details, stackHeight, stackWidth),
         onPanUpdate: (details) =>
-            _onPhotoControlsPanUpdate(details, stackHeight),
+            _onPhotoControlsPanUpdate(details, stackHeight, stackWidth),
+        onPanEnd: (_) => _onPhotoControlsPanEnd(stackWidth),
         onLongPressStart:
             mergeVoice ? (_) => _onVoiceLongPressStart() : null,
         onLongPressMoveUpdate: mergeVoice ? _onVoiceLongPressMoveUpdate : null,
@@ -2139,8 +2180,8 @@ class _WebViewScreenState extends State<WebViewScreen>
     final dragLeft = _voiceControlsDragLeft;
     return Positioned(
       top: _voiceControlsTop,
-      left: dragLeft ?? (_voiceControlsOnLeft ? _voiceEdgeGap : null),
-      right: (dragLeft == null && !_voiceControlsOnLeft) ? _voiceEdgeGap : null,
+      left: dragLeft ?? (_voiceControlsOnLeft ? _edgeGap : null),
+      right: (dragLeft == null && !_voiceControlsOnLeft) ? _edgeGap : null,
       // 占满命中区域捕获拖拽与长按；无内部按钮，点击不产生动作
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
