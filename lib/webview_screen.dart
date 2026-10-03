@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -811,6 +812,34 @@ class _WebViewScreenState extends State<WebViewScreen>
     _connect();
   }
 
+  /// 顶栏模式一键切换：同实例内翻转 DSH/Zcode。端口若仍是另一模式的默认值
+  /// 则落到本模式默认值（自定义端口保留），持久化后断开重连——页面地址由
+  /// _connect 的地址校验自动重载，无需进设置页。
+  Future<void> _toggleMode() async {
+    if (_switching) return;
+    final newMode =
+        _config.isZcodeMode ? SSHConfig.modeDsh : SSHConfig.modeZcode;
+    var newPort = _config.remotePort;
+    if (newMode == SSHConfig.modeZcode &&
+        newPort == SSHConfig.defaultRemotePort) {
+      newPort = SSHConfig.defaultZcodeRemotePort;
+    } else if (newMode == SSHConfig.modeDsh &&
+        newPort == SSHConfig.defaultZcodeRemotePort) {
+      newPort = SSHConfig.defaultRemotePort;
+    }
+    final updated = _config.copyWith(mode: newMode, remotePort: newPort);
+    await SSHConfig.saveProfile(_activeIndex, updated);
+    if (!mounted) return;
+    setState(() {
+      _profiles[_activeIndex] = updated;
+      _config = updated;
+    });
+    _snack('已切换到 ${newMode == SSHConfig.modeZcode ? "Zcode" : "DSH"} 模式，重连中…');
+    await TunnelService.instance.disconnect();
+    if (!mounted) return;
+    _manualConnect();
+  }
+
   Future<void> _connect() async {
     // 已连接则跳过，避免冗余重连造成界面闪烁/循环
     if (TunnelService.instance.status == TunnelStatus.connected) return;
@@ -826,10 +855,19 @@ class _WebViewScreenState extends State<WebViewScreen>
       if (!mounted) return;
       _reconnectCount = 0; // 连接成功：重置重连计数
       setState(() => _tunnelStatus = TunnelStatus.connected);
-      // 注意：这里不手动 loadUrl。WebView 每次在 body 重建时都会用
-      // initialUrlRequest（即当前 _targetUrl）加载，切换实例/重连后
-      // 会自动加载新地址；手动调用会用到尚未就绪/过期的 controller，
-      // 触发 MissingPluginException。
+      // WebView 只在 body 重建时用 initialUrlRequest 加载；同一实例内改
+      // 模式/端口（设置保存返回，body 不重建）时页面仍是旧地址——曾因此
+      // 在 Zcode 模式下残留 DSH 页面。校验实际地址，不一致就强制重载。
+      try {
+        final c = _controller;
+        final current = (await c?.getUrl())?.toString();
+        if (c != null && current != null && current != _targetUrl) {
+          debugPrint('[DSH] page url mismatch ($current != ${_targetUrl.replaceAll(RegExp(r'token=[^&]+'), 'token=***')}), reloading');
+          await _loadTargetUrl();
+        }
+      } catch (_) {
+        // controller 未就绪：body 重建路径会自行加载
+      }
     } catch (e) {
       if (!mounted) return;
       _handleConnectFailure('$e');
@@ -1037,19 +1075,23 @@ class _WebViewScreenState extends State<WebViewScreen>
           a.unslothPort != b.unslothPort ||
           a.unslothUseSsh != b.unslothUseSsh ||
           a.unslothPassword != b.unslothPassword ||
-          a.accessToken != b.accessToken) {
+          a.accessToken != b.accessToken ||
+          a.zcodeToken != b.zcodeToken) {
         return true;
       }
     }
     return false;
   }
 
-  /// DSH 入口 URL。配置了访问 Token 时拼上 `?token=`，让新版 DSH
-  /// (>=0.1.2-rc.1) 在首次访问完成鉴权并下发 30 天签名 cookie；
-  /// 未配置 Token（旧版服务 / 已换过 cookie）则保持裸地址直连。
+  /// 入口 URL（按当前模式取对应 Token）。
+  /// DSH：配置了访问 Token 时拼上 `?token=`，让新版 DSH (>=0.1.2-rc.1)
+  /// 在首次访问完成鉴权并下发 30 天签名 cookie；未配置则裸地址直连。
+  /// Zcode：zcode-phone-server 对每个请求校验 Token，必须携带。
   String get _targetUrl {
     final base = 'http://127.0.0.1:${_config.localPort}';
-    final token = _config.accessToken.trim();
+    final token =
+        (_config.isZcodeMode ? _config.zcodeToken : _config.accessToken)
+            .trim();
     if (token.isEmpty) return base;
     return '$base/?token=${Uri.encodeQueryComponent(token)}';
   }
@@ -1633,11 +1675,13 @@ class _WebViewScreenState extends State<WebViewScreen>
     });
   }
 
-  /// 保存内嵌输入的新 Token 到当前实例配置，并带新 Token 重载页面。
+  /// 保存内嵌输入的新 Token 到当前实例配置（按模式存对应字段），并重载页面。
   Future<void> _saveTokenAndReload() async {
     final token = _tokenCtrl.text.trim();
     if (token.isEmpty) return;
-    final updated = _config.copyWith(accessToken: token);
+    final updated = _config.isZcodeMode
+        ? _config.copyWith(zcodeToken: token)
+        : _config.copyWith(accessToken: token);
     await SSHConfig.saveProfile(_activeIndex, updated);
     if (!mounted) return;
     setState(() {
@@ -1720,17 +1764,28 @@ class _WebViewScreenState extends State<WebViewScreen>
                         ),
                       ),
                     ),
-                  // 文字半透明底：曲线透出时仍清晰
+                  // 文字半透明底：曲线透出时仍清晰。
+                  // 顶栏名称跟随当前连接模式：Zcode 模式显示 ZCode-Phone。
                   Container(
                     color: theme.colorScheme.surface.withValues(alpha: 0.7),
                     padding: const EdgeInsets.symmetric(vertical: 2),
-                    child:
-                        Text('DSH-Phone', style: theme.textTheme.titleMedium),
+                    child: Text(
+                      _config.isZcodeMode ? 'ZCode-Phone' : 'DSH-Phone',
+                      style: theme.textTheme.titleMedium,
+                    ),
                   ),
                 ],
               ),
             ),
             const Spacer(),
+            // 模式一键切换：配置只是配置，切换在顶栏完成（同实例内翻转
+            // DSH/Zcode，自动落到对应模式默认端口并重连；页面地址由
+            // _connect 的地址校验自动重载）
+            IconButton(
+              tooltip: _config.isZcodeMode ? '切换到 DSH 模式' : '切换到 Zcode 模式',
+              icon: const Icon(Icons.swap_horiz),
+              onPressed: _toggleMode,
+            ),
             _buildInstanceSwitcher(context),
             // Unsloth 入口：全部实例未启用时隐藏（首页无意义）
             if (_unslothAvailable)
@@ -1838,7 +1893,14 @@ class _WebViewScreenState extends State<WebViewScreen>
               _voiceControlsTop =
                   (_photoControlsTop - 16).clamp(0.0, stackHeight);
             } else if ((stackHeight - _bodyHeight).abs() > 1) {
-              // 容器高度变化（键盘/旋转等）时同步基准高度
+              // 容器高度变化（键盘弹出/收起、旋转等）：按高度比例上推/下拉
+              // 浮动控件，让相机/语音/缩放按钮跟随页面内容一起移动——键盘
+              // 上推页面时相机不会留在原地被键盘遮挡，天气动效锚定相机故
+              // 一并移动。
+              final ratio = stackHeight / _bodyHeight;
+              _zoomControlsTop = _zoomControlsTop * ratio;
+              _photoControlsTop = _photoControlsTop * ratio;
+              _voiceControlsTop = _voiceControlsTop * ratio;
               _bodyHeight = stackHeight;
             }
             return Stack(
@@ -2218,15 +2280,19 @@ class _WebViewScreenState extends State<WebViewScreen>
             (_bodyHeight - height).clamp(0.0, double.infinity);
         final top = (_photoControlsTop + _photoControlHeight / 2 - height * 0.45)
             .clamp(0.0, maxTop);
-        // 水平锚定：动效区中心对齐相机按钮中心，跟随按钮左右拖拽/边缘吸附，
-        // 并 clamp 在对话区宽度内，按钮拖到左/右边缘时动效区不滑出屏幕。
+        // 水平锚定：天气正对相机正上方——动效区中心对齐相机按钮中心，跟随按钮
+        // 左右拖拽/边缘吸附。相机吸附到左/右边缘时动效区宽度收窄（最多收窄到
+        // 约按钮宽度），使动效区保持居中且不越出屏幕，避免旧代码把动效区推向
+        // 屏幕中心导致天气偏左/偏右偏离相机。
         final photoLeft = _currentPhotoLeft(stackWidth);
         final centerX = photoLeft + _photoControlWidth / 2;
-        final left = (centerX - width / 2).clamp(0.0, stackWidth - width);
+        final effectiveWidth = math.min(
+            width, math.min(2 * centerX, 2 * (stackWidth - centerX)));
+        final left = centerX - effectiveWidth / 2;
         return Positioned(
           left: left,
           top: top,
-          width: width,
+          width: effectiveWidth,
           height: height,
           child: IgnorePointer(
             child: WeatherOverlay(kind: weather.kind),
@@ -2292,7 +2358,8 @@ class _MoonCameraButton extends StatefulWidget {
 
   final VoidCallback onPressed;
 
-  /// 是否叠加麦克风角标（语音并入相机开启时显示，提示该按钮支持长按说话）。
+  /// 是否显示麦克风图标（语音并入相机开启时显示，放在相机图标正下方，
+  /// 提示该按钮支持长按说话）。
   final bool showMicBadge;
 
   @override
@@ -2369,7 +2436,8 @@ class _MoonCameraButtonState extends State<_MoonCameraButton> {
         ),
         child: CustomPaint(
           painter: MoonPhasePainter(phase, tilt),
-          // 相机图标居中；语音并入相机时右下角叠一个麦克风小角标。
+          // 相机图标居中；语音并入相机时麦克风放在相机图标正下方，
+          // 不加彩色圆底、颜色与相机图标一致（随月相亮暗切换），合二为一。
           child: Center(
             child: SizedBox(
               width: 48,
@@ -2391,28 +2459,17 @@ class _MoonCameraButtonState extends State<_MoonCameraButton> {
                     visualDensity: VisualDensity.compact,
                     onPressed: widget.onPressed,
                   ),
+                  // 麦克风直接放在相机图标正下方：只画图标本身（无彩色圆底），
+                  // 颜色与相机图标一致、随月相亮暗切换，与相机合二为一。
                   if (widget.showMicBadge)
                     Positioned(
-                      right: -1,
-                      bottom: -1,
-                      child: Container(
-                        padding: const EdgeInsets.all(3),
-                        decoration: BoxDecoration(
-                          color: borderColor,
-                          shape: BoxShape.circle,
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withValues(alpha: 0.25),
-                              blurRadius: 2,
-                              offset: const Offset(0, 1),
-                            ),
-                          ],
-                        ),
-                        child: const Icon(
-                          Icons.mic,
-                          size: 10,
-                          color: Colors.white,
-                        ),
+                      top: 35,
+                      child: Icon(
+                        Icons.mic,
+                        size: 12,
+                        color: lit >= 0.5
+                            ? const Color(0xFF1565C0)
+                            : Colors.white,
                       ),
                     ),
                 ],

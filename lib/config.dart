@@ -118,6 +118,10 @@ class SSHConfig {
   // 即可免 token 访问；cookie 过期后需重新填写。
   static const String secAccessToken = 'access_token';
 
+  // Zcode 服务访问 Token（敏感项）：zcode-phone-server 的 config.json token，
+  // 服务端首次启动自动生成。与 DSH 的 access_token 相互独立、分开存储。
+  static const String secZcodeToken = 'zcode_token';
+
   static const String authTypeKey = 'key';
   static const String authTypePassword = 'password';
 
@@ -165,6 +169,13 @@ class SSHConfig {
   /// cookie 过期或服务端更换签名密钥后需更新此值。留空 = 旧版无鉴权直连。
   final String accessToken;
 
+  /// Zcode 服务访问 Token（敏感项，存 secure storage）。
+  ///
+  /// zcode-phone-server 首次启动自动生成（见其 config.json 的 token 字段或
+  /// 启动控制台）；Zcode 模式下 WebView 以 `?token=X` 访问，服务端对每个
+  /// 请求校验。与 DSH 的 [accessToken] 相互独立、分开存储。
+  final String zcodeToken;
+
   const SSHConfig({
     this.host = '',
     this.sshPort = 22,
@@ -183,6 +194,7 @@ class SSHConfig {
     this.unslothUseSsh = false,
     this.unslothPassword = '',
     this.accessToken = '',
+    this.zcodeToken = '',
   });
 
   bool get isConfigured =>
@@ -194,6 +206,7 @@ class SSHConfig {
   @pragma('vm:prefer-inline')
   SSHConfig copyWith({
     String? accessToken,
+    String? zcodeToken,
     String? mode,
     int? remotePort,
     bool? hostMonitorEnabled,
@@ -217,6 +230,7 @@ class SSHConfig {
         unslothUseSsh: unslothUseSsh,
         unslothPassword: unslothPassword,
         accessToken: accessToken ?? this.accessToken,
+        zcodeToken: zcodeToken ?? this.zcodeToken,
       );
 
   bool get useKey => authType == authTypeKey;
@@ -266,6 +280,8 @@ class SSHConfig {
           await _safeSecRead(storage, _pKey(i, secUnslothPassword));
       final accessToken =
           await _safeSecRead(storage, _pKey(i, secAccessToken));
+      final zcodeToken =
+          await _safeSecRead(storage, _pKey(i, secZcodeToken));
       list.add(SSHConfig(
         host: prefs.getString(_pKey(i, keyHost)) ?? '',
         sshPort: prefs.getInt(_pKey(i, keySshPort)) ?? 22,
@@ -287,6 +303,7 @@ class SSHConfig {
         unslothUseSsh: prefs.getBool(_pKey(i, keyUnslothUseSsh)) ?? false,
         unslothPassword: unslothPassword,
         accessToken: accessToken,
+        zcodeToken: zcodeToken,
       ));
     }
     return list;
@@ -362,6 +379,12 @@ class SSHConfig {
           key: _pKey(i, secAccessToken), value: config.accessToken);
     } else {
       await storage.delete(key: _pKey(i, secAccessToken));
+    }
+    if (config.zcodeToken.isNotEmpty) {
+      await storage.write(
+          key: _pKey(i, secZcodeToken), value: config.zcodeToken);
+    } else {
+      await storage.delete(key: _pKey(i, secZcodeToken));
     }
   }
 

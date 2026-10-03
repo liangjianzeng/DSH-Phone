@@ -168,6 +168,10 @@ class _SetupScreenState extends State<SetupScreen> {
   /// DSH Web 访问 Token（可选；新版 dsh>=0.1.2-rc.1 启用 token 鉴权时填写）。
   late TextEditingController _accessToken;
 
+  /// Zcode 服务访问 Token（Zcode 模式必填；zcode-phone-server 的访问令牌）。
+  /// 与 DSH token 相互独立、分开存储。
+  late TextEditingController _zcodeToken;
+
   /// Unsloth Studio 配置控件（实例级）。
   late TextEditingController _unslothPort;
   late TextEditingController _unslothPassword;
@@ -398,6 +402,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _localPort = TextEditingController(text: '${c.localPort}');
     _remotePort = TextEditingController(text: '${c.remotePort}');
     _accessToken = TextEditingController(text: c.accessToken);
+    _zcodeToken = TextEditingController(text: c.zcodeToken);
     _unslothPort = TextEditingController(text: '${c.unslothPort}');
     _unslothPassword = TextEditingController(text: c.unslothPassword);
     _authType = c.authType;
@@ -426,6 +431,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _localPort.dispose();
     _remotePort.dispose();
     _accessToken.dispose();
+    _zcodeToken.dispose();
     _unslothPort.dispose();
     _unslothPassword.dispose();
     super.dispose();
@@ -566,6 +572,7 @@ class _SetupScreenState extends State<SetupScreen> {
       unslothUseSsh: _unslothUseSsh,
       unslothPassword: _unslothPassword.text,
       accessToken: _accessToken.text.trim(),
+      zcodeToken: _zcodeToken.text.trim(),
     );
   }
 
@@ -783,21 +790,29 @@ class _SetupScreenState extends State<SetupScreen> {
             onChanged: (_) => _scheduleAutoSave(),
           ),
           const SizedBox(height: 12),
+          // DSH 与 Zcode 的访问 Token 分开存储：各自独立输入框、独立加密存储，
+          // 改其一不影响另一（连接时按当前模式取对应字段）。
           TextFormField(
             controller: _accessToken,
             obscureText: _obscureToken,
+            decoration: const InputDecoration(
+              labelText: 'DSH 访问 Token（可选）',
+              hintText: '粘贴 DSH 访问 Token（留空则不启用）',
+              helperText: '新版 DSH(≥0.1.2) 启用 token 鉴权，首次访问需携带；'
+                  '换取 30 天签名 cookie 后免 token，过期需重新填写',
+              border: OutlineInputBorder(),
+            ),
+            onChanged: (_) => _scheduleAutoSave(),
+          ),
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: _zcodeToken,
+            obscureText: _obscureToken,
             decoration: InputDecoration(
-              labelText: _mode == SSHConfig.modeZcode
-                  ? 'Zcode 服务访问 Token（必填）'
-                  : 'DSH 访问 Token（可选）',
-              hintText: _mode == SSHConfig.modeZcode
-                  ? '粘贴 zcode-phone-server 的访问令牌'
-                  : '粘贴 DSH 访问 Token（留空则不启用）',
-              helperText: _mode == SSHConfig.modeZcode
-                  ? '服务端首次启动自动生成：见 zcode-phone-server/config.json '
-                      '的 token 字段或启动控制台；不填服务端会拒绝访问'
-                  : '新版 DSH(≥0.1.2) 启用 token 鉴权，首次访问需携带；'
-                      '换取 30 天签名 cookie 后免 token，过期需重新填写',
+              labelText: 'Zcode 服务访问 Token（Zcode 模式必填）',
+              hintText: '粘贴 zcode-phone-server 的访问令牌',
+              helperText: '服务端首次启动自动生成：见 zcode-phone-server/config.json '
+                  '的 token 字段或启动控制台；不填服务端会拒绝访问',
               border: const OutlineInputBorder(),
               suffixIcon: IconButton(
                 icon: Icon(_obscureToken
@@ -1141,7 +1156,7 @@ class _SetupScreenState extends State<SetupScreen> {
           value: AsrMode.standard,
           groupValue: _asrMode,
           title: const Text('标准（推荐）'),
-          subtitle: const Text('greedy 解码，无热词；体积与现状一致'),
+          subtitle: const Text('greedy 解码；勾选/自定义热词同样生效'),
           onChanged: (v) {
             if (v == null) return;
             setState(() => _asrMode = v);
@@ -1173,8 +1188,8 @@ class _SetupScreenState extends State<SetupScreen> {
             const Padding(
               padding: EdgeInsets.only(left: 16, right: 16, bottom: 8),
               child: Text(
-                '增强档位下优先识别勾选分类的中文词；每类可单独编辑词表。'
-                '勾选越多解码越慢，建议只启用常用分类。',
+                '勾选/自定义的中文词会被优先识别（标准与增强档位均生效）；'
+                '每类可单独编辑词表。勾选越多解码越慢，建议只启用常用分类。',
                 style: TextStyle(color: Colors.grey, fontSize: 12),
               ),
             ),
@@ -1302,8 +1317,8 @@ class _SetupScreenState extends State<SetupScreen> {
           SwitchListTile(
             title: const Text('语音输入并入相机按钮'),
             subtitle: const Text(
-              '默认关闭；开启后隐藏右侧麦克风浮动按钮，相机按钮右上角显示'
-              '麦克风标，短按相机（拍照/传图），长按按住说话（端侧识别）',
+              '默认关闭；开启后隐藏右侧麦克风浮动按钮，相机图标正下方显示'
+              '麦克风图标，短按相机（拍照/传图），长按按住说话（端侧识别）',
             ),
             value: _voiceMergeToCamera,
             onChanged: (v) {
