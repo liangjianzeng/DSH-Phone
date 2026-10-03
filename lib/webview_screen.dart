@@ -1942,13 +1942,14 @@ class _WebViewScreenState extends State<WebViewScreen>
                     !_pageLoading &&
                     _pageError == null)
                   _buildVoiceControls(context, stackHeight, stackWidth),
-                // 天气动效：云/雨/雪/雾/雷锚定相机按钮当前位置（拖拽跟随），
-                // 绘制在按钮上层、低不透明度且不拦截触摸；相机入口隐藏时一并隐藏。
+                // 天气动效：云/雨/雪/雾/雷锚定相机按钮当前位置（拖拽上下/左右
+                // 均跟随），绘制在按钮上层、低不透明度且不拦截触摸；相机入口
+                // 隐藏时一并隐藏。
                 if (_photoControlsEnabled &&
                     _weatherEffectsEnabled &&
                     !_pageLoading &&
                     _pageError == null)
-                  _buildWeatherOverlay(context),
+                  _buildWeatherOverlay(context, stackWidth),
                 // 侧边栏终端按键条：xterm 面板可见时显示在底部中央
                 //（手机软键盘没有 Esc/Ctrl/方向键，这些是终端刚需）
                 if (_terminalVisible && !_pageLoading && _pageError == null)
@@ -2202,7 +2203,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 天气动效层：锚定相机按钮当前位置（拖拽跟随移动），宽度约 120dp 的
   /// 左侧窄条——不大面积遮挡对话区；整层 IgnorePointer 不拦截触摸。
   /// 天气未知（未查到/已关闭）或晴朗时不绘制任何内容。
-  Widget _buildWeatherOverlay(BuildContext context) {
+  Widget _buildWeatherOverlay(BuildContext context, double stackWidth) {
     return ValueListenableBuilder<WeatherInfo?>(
       valueListenable: WeatherService.current,
       builder: (context, weather, _) {
@@ -2217,8 +2218,13 @@ class _WebViewScreenState extends State<WebViewScreen>
             (_bodyHeight - height).clamp(0.0, double.infinity);
         final top = (_photoControlsTop + _photoControlHeight / 2 - height * 0.45)
             .clamp(0.0, maxTop);
+        // 水平锚定：动效区中心对齐相机按钮中心，跟随按钮左右拖拽/边缘吸附，
+        // 并 clamp 在对话区宽度内，按钮拖到左/右边缘时动效区不滑出屏幕。
+        final photoLeft = _currentPhotoLeft(stackWidth);
+        final centerX = photoLeft + _photoControlWidth / 2;
+        final left = (centerX - width / 2).clamp(0.0, stackWidth - width);
         return Positioned(
-          left: 0,
+          left: left,
           top: top,
           width: width,
           height: height,
@@ -2329,16 +2335,16 @@ class _MoonCameraButtonState extends State<_MoonCameraButton> {
     final sun = widget.sunSwitchEnabled
         ? SunTimes.compute(nowUtc, MoonLocation.observer.value)
         : null;
-    // 语音并入相机开启时提示"长按说话"，否则仅提示相机。
-    final voiceHint = widget.showMicBadge ? '·长按说话（语音）' : '';
+    // 月相/日照提示文案；语音并入相机开启时禁用 tooltip（长按=语音），
+    // 避免长按弹出月相提示干扰按住说话。
     final tooltip = dayMode
         ? '添加图片/拍照（视觉工具）·白天·日光模式'
             '${_hm(sun?.sunriseUtc)}~${_hm(sun?.sunsetUtc)}'
-            '·观测${MoonLocation.observerLabel}$voiceHint'
+            '·观测${MoonLocation.observerLabel}'
         : '添加图片/拍照（视觉工具）·${obs.name}'
             '·照明 ${(obs.illumination * 100).round()}%'
             '·农历${_lunarDayOf(now)}'
-            '·观测${MoonLocation.observerLabel}$voiceHint';
+            '·观测${MoonLocation.observerLabel}';
     return SizedBox(
       width: 48,
       height: 48,
@@ -2373,7 +2379,8 @@ class _MoonCameraButtonState extends State<_MoonCameraButton> {
                 alignment: Alignment.center,
                 children: [
                   IconButton(
-                    tooltip: tooltip,
+                    // 语音并入相机时禁用 tooltip：长按留给语音，不弹月相提示。
+                    tooltip: widget.showMicBadge ? null : tooltip,
                     icon: Icon(
                       Icons.camera_alt_outlined,
                       color: lit >= 0.5
