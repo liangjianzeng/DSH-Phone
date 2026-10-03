@@ -32,6 +32,8 @@ class SetupScreen extends StatefulWidget {
     this.onPhotoControlsChanged,
     this.voiceControlsEnabled = true,
     this.onVoiceControlsChanged,
+    this.voiceMergeToCamera = false,
+    this.onVoiceMergeToCameraChanged,
     this.weatherEffectsEnabled = true,
     this.onWeatherEffectsChanged,
     this.sunSwitchEnabled = true,
@@ -93,6 +95,13 @@ class SetupScreen extends StatefulWidget {
 
   /// 切换对话区语音输入入口显示（默认开启）。
   final ValueChanged<bool>? onVoiceControlsChanged;
+
+  /// 语音输入并入相机按钮（默认关闭）：开启后隐藏右侧麦克风按钮，
+  /// 相机按钮叠加麦克风角标，短按相机、长按按住说话。
+  final bool voiceMergeToCamera;
+
+  /// 切换语音输入并入相机按钮（默认关闭）。
+  final ValueChanged<bool>? onVoiceMergeToCameraChanged;
 
   /// 天气动效开关（默认开启；关闭则停止天气查询并隐藏动效）。
   final bool weatherEffectsEnabled;
@@ -195,6 +204,9 @@ class _SetupScreenState extends State<SetupScreen> {
   /// 对话区语音输入入口开关的本地状态（同上）。
   late bool _voiceControlsEnabled;
 
+  /// 语音输入并入相机按钮的本地状态（同上）。
+  late bool _voiceMergeToCamera;
+
   /// 天气动效开关的本地状态（同上）。
   late bool _weatherEffectsEnabled;
 
@@ -233,6 +245,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _zoomControlsEnabled = widget.zoomControlsEnabled;
     _photoControlsEnabled = widget.photoControlsEnabled;
     _voiceControlsEnabled = widget.voiceControlsEnabled;
+    _voiceMergeToCamera = widget.voiceMergeToCamera;
     _weatherEffectsEnabled = widget.weatherEffectsEnabled;
     _sunSwitchEnabled = widget.sunSwitchEnabled;
     _moonMode = widget.moonLocationMode;
@@ -1277,6 +1290,18 @@ class _SetupScreenState extends State<SetupScreen> {
             onChanged: (v) {
               setState(() => _voiceControlsEnabled = v);
               widget.onVoiceControlsChanged?.call(v);
+            },
+          ),
+          SwitchListTile(
+            title: const Text('语音输入并入相机按钮'),
+            subtitle: const Text(
+              '默认关闭；开启后隐藏右侧麦克风浮动按钮，相机按钮右上角显示'
+              '麦克风标，短按相机（拍照/传图），长按按住说话（端侧识别）',
+            ),
+            value: _voiceMergeToCamera,
+            onChanged: (v) {
+              setState(() => _voiceMergeToCamera = v);
+              widget.onVoiceMergeToCameraChanged?.call(v);
             },
           ),
           SwitchListTile(

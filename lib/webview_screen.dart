@@ -88,6 +88,10 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 对话区右侧语音输入入口的开关键（持久化，默认开启）。
   static const String _voiceControlsPrefKey = 'webview_voice_controls_enabled';
 
+  /// 语音输入并入相机按钮的开关（持久化，默认关闭）：开启后隐藏右侧麦克风
+  /// 浮动按钮，相机按钮叠加麦克风角标，短按相机（拍照/传图）、长按按住说话。
+  static const String _voiceMergePrefKey = 'webview_voice_merge_to_camera';
+
   /// 天气动效开关（持久化，默认开启；WeatherService.enabled 同步启停查询）。
   static const String _weatherEffectsPrefKey = 'weather_effects_enabled';
 
@@ -111,6 +115,10 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   /// 对话区右侧语音输入入口是否显示（默认开启，由设置页开关控制）。
   bool _voiceControlsEnabled = true;
+
+  /// 语音输入并入相机按钮（默认关闭，由设置页开关控制）：开启后隐藏右侧
+  /// 麦克风按钮，相机按钮叠加麦克风角标，短按相机/长按说话。
+  bool _voiceMergeToCamera = false;
 
   /// 天气动效是否显示（默认开启，由设置页开关控制）。
   bool _weatherEffectsEnabled = true;
@@ -222,6 +230,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     _loadZoomControls();
     _loadPhotoControls();
     _loadVoiceControls();
+    _loadVoiceMerge();
     _loadToolSwitches();
     // 监控采样定时器常驻，内部仅在隧道 connected 时旁路采集。
     HostMonitor.instance.start();
@@ -415,6 +424,23 @@ class _WebViewScreenState extends State<WebViewScreen>
     setState(() => _voiceControlsEnabled = enabled);
     SharedPreferences.getInstance().then(
       (prefs) => prefs.setBool(_voiceControlsPrefKey, enabled),
+    );
+  }
+
+  /// 读取持久化的"语音输入并入相机按钮"开关。
+  Future<void> _loadVoiceMerge() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool(_voiceMergePrefKey) ?? false;
+    if (!mounted) return;
+    setState(() => _voiceMergeToCamera = enabled);
+  }
+
+  /// 保存并应用"语音输入并入相机按钮"开关（默认关闭）。
+  void _setVoiceMergeToCamera(bool enabled) {
+    if (!mounted) return;
+    setState(() => _voiceMergeToCamera = enabled);
+    SharedPreferences.getInstance().then(
+      (prefs) => prefs.setBool(_voiceMergePrefKey, enabled),
     );
   }
 
@@ -906,6 +932,8 @@ class _WebViewScreenState extends State<WebViewScreen>
           onPhotoControlsChanged: _setPhotoControlsEnabled,
           voiceControlsEnabled: _voiceControlsEnabled,
           onVoiceControlsChanged: _setVoiceControlsEnabled,
+          voiceMergeToCamera: _voiceMergeToCamera,
+          onVoiceMergeToCameraChanged: _setVoiceMergeToCamera,
           weatherEffectsEnabled: _weatherEffectsEnabled,
           onWeatherEffectsChanged: _setWeatherEffectsEnabled,
           sunSwitchEnabled: _sunSwitchEnabled,
@@ -1874,7 +1902,9 @@ class _WebViewScreenState extends State<WebViewScreen>
                   _buildPhotoControls(context, stackHeight),
                 // 语音输入浮动按钮：对话区右侧靠屏幕边（与相机入口对称），
                 // 可拖拽上下移动，长按按住说话，默认开启。
+                // 语音并入相机开启时隐藏右侧麦克风按钮（相机按钮承担语音）。
                 if (_voiceControlsEnabled &&
+                    !_voiceMergeToCamera &&
                     !_pageLoading &&
                     _pageError == null)
                   _buildVoiceControls(context, stackHeight, stackWidth),
@@ -2066,17 +2096,27 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 键盘、缩放控件）。按钮呈现为**真实观测的月相**（夜间）或**全亮日光模式**
   /// （白天，日出日落联动开启时）——细节见 [_MoonCameraButton]。
   Widget _buildPhotoControls(BuildContext context, double stackHeight) {
+    final mergeVoice = _voiceMergeToCamera;
     return Positioned(
       left: 6,
       top: _photoControlsTop,
-      // 可拖拽自由上下移动：占满命中区域捕获拖拽，点击透传给内部相机按钮
+      // 可拖拽自由上下移动：占满命中区域捕获拖拽，点击透传给内部相机按钮。
+      // 语音并入相机开启时：长按 = 按住说话（端侧识别，同右侧麦克风按钮），
+      // 短按仍为相机（拍照/传图）；关闭时相机按钮不承担长按说话。
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onPanStart: (details) => _onPhotoControlsPanStart(details, stackHeight),
         onPanUpdate: (details) =>
             _onPhotoControlsPanUpdate(details, stackHeight),
+        onLongPressStart:
+            mergeVoice ? (_) => _onVoiceLongPressStart() : null,
+        onLongPressMoveUpdate: mergeVoice ? _onVoiceLongPressMoveUpdate : null,
+        onLongPressEnd: mergeVoice ? (_) => _onVoiceLongPressEnd() : null,
+        onLongPressCancel:
+            mergeVoice ? () => _onVoiceLongPressEnd(cancelled: true) : null,
         child: _MoonCameraButton(
           sunSwitchEnabled: _sunSwitchEnabled,
+          showMicBadge: mergeVoice,
           onPressed: _pickAndSendImage,
         ),
       ),
@@ -2197,12 +2237,16 @@ class _MoonCameraButton extends StatefulWidget {
   const _MoonCameraButton({
     required this.sunSwitchEnabled,
     required this.onPressed,
+    this.showMicBadge = false,
   });
 
   /// 日出日落联动开关（设置页可关；关闭 = 始终真实月相）。
   final bool sunSwitchEnabled;
 
   final VoidCallback onPressed;
+
+  /// 是否叠加麦克风角标（语音并入相机开启时显示，提示该按钮支持长按说话）。
+  final bool showMicBadge;
 
   @override
   State<_MoonCameraButton> createState() => _MoonCameraButtonState();
@@ -2244,15 +2288,16 @@ class _MoonCameraButtonState extends State<_MoonCameraButton> {
     final sun = widget.sunSwitchEnabled
         ? SunTimes.compute(nowUtc, MoonLocation.observer.value)
         : null;
+    // 语音并入相机开启时提示"长按说话"，否则仅提示相机。
+    final voiceHint = widget.showMicBadge ? '·长按说话（语音）' : '';
     final tooltip = dayMode
         ? '添加图片/拍照（视觉工具）·白天·日光模式'
             '${_hm(sun?.sunriseUtc)}~${_hm(sun?.sunsetUtc)}'
-            '·观测${MoonLocation.observerLabel}'
+            '·观测${MoonLocation.observerLabel}$voiceHint'
         : '添加图片/拍照（视觉工具）·${obs.name}'
             '·照明 ${(obs.illumination * 100).round()}%'
             '·农历${_lunarDayOf(now)}'
-            '·观测${MoonLocation.observerLabel}';
-    // 月相按钮不承担长按说话（入口在右侧语音按钮），tooltip 可放心使用。
+            '·观测${MoonLocation.observerLabel}$voiceHint';
     return SizedBox(
       width: 48,
       height: 48,
@@ -2277,18 +2322,53 @@ class _MoonCameraButtonState extends State<_MoonCameraButton> {
         ),
         child: CustomPaint(
           painter: MoonPhasePainter(phase, tilt),
+          // 相机图标居中；语音并入相机时右下角叠一个麦克风小角标。
           child: Center(
-            child: IconButton(
-              tooltip: tooltip,
-              icon: Icon(
-                Icons.camera_alt_outlined,
-                color: lit >= 0.5
-                    ? const Color(0xFF1565C0) // 亮面：深蓝图标
-                    : Colors.white, // 暗面：白色图标
+            child: SizedBox(
+              width: 48,
+              height: 48,
+              child: Stack(
+                clipBehavior: Clip.none,
+                alignment: Alignment.center,
+                children: [
+                  IconButton(
+                    tooltip: tooltip,
+                    icon: Icon(
+                      Icons.camera_alt_outlined,
+                      color: lit >= 0.5
+                          ? const Color(0xFF1565C0) // 亮面：深蓝图标
+                          : Colors.white, // 暗面：白色图标
+                    ),
+                    iconSize: 22,
+                    visualDensity: VisualDensity.compact,
+                    onPressed: widget.onPressed,
+                  ),
+                  if (widget.showMicBadge)
+                    Positioned(
+                      right: -1,
+                      bottom: -1,
+                      child: Container(
+                        padding: const EdgeInsets.all(3),
+                        decoration: BoxDecoration(
+                          color: borderColor,
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withValues(alpha: 0.25),
+                              blurRadius: 2,
+                              offset: const Offset(0, 1),
+                            ),
+                          ],
+                        ),
+                        child: const Icon(
+                          Icons.mic,
+                          size: 10,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                ],
               ),
-              iconSize: 22,
-              visualDensity: VisualDensity.compact,
-              onPressed: widget.onPressed,
             ),
           ),
         ),
