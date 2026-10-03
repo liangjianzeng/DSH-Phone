@@ -1916,8 +1916,11 @@ class _WebViewScreenState extends State<WebViewScreen>
                 InAppWebView(
                   initialUrlRequest: URLRequest(url: WebUri(_targetUrl)),
                   initialSettings: InAppWebViewSettings(
-                    // 本地缓存加速：优先用缓存，缺时才走网络
-                    cacheMode: CacheMode.LOAD_CACHE_ELSE_NETWORK,
+                    // 缓存策略：LOAD_DEFAULT 尊重 HTTP 缓存头——zcode-phone-server
+                    // 对 HTML 发 no-store，保证页面代码始终最新。曾因
+                    // LOAD_CACHE_ELSE_NETWORK（哪怕过期也吃缓存）长期加载旧页面，
+                    // 服务端修复全部无法到达手机；DSH 静态资源仍按其缓存头命中
+                    cacheMode: CacheMode.LOAD_DEFAULT,
                     // DSH 是含 WebSocket 的 SPA
                     javaScriptEnabled: true,
                     transparentBackground: false,
