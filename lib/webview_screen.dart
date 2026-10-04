@@ -137,7 +137,8 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 缩放控件顶边 Y（相对 Stack，px），默认屏幕中央。
   double _zoomControlsTop = 0;
 
-  /// 相机入口顶边 Y（相对 Stack，px），默认底部往上约六分之一处。
+  /// 相机入口顶边 Y（相对 Stack，px）。默认底部往上约六分之一再上移约 1 厘米；
+  /// 用户拖动过则下次进入按上次保存位置恢复（见 _photoPosTopPrefKey）。
   double _photoControlsTop = 0;
 
   /// 相机入口是否吸附在左侧边缘（false = 右侧）；松手时按水平位置吸附，
@@ -171,6 +172,18 @@ class _WebViewScreenState extends State<WebViewScreen>
   static const double _voiceControlHeight = 48; // 圆形麦克风按钮 48×48
   static const double _voiceControlWidth = 48; // 圆形麦克风按钮 48×48
   static const double _edgeGap = 8; // 吸附后距屏幕边缘的间距
+
+  /// 相机入口位置持久化：顶边相对 Stack 高度的比例 + 吸附侧，
+  /// 下次进入按最后拖动位置布局（纵向存比例，兼容不同屏高/键盘推挤）。
+  static const String _photoPosTopPrefKey = 'photoControlsTopRatio';
+  static const String _photoPosLeftPrefKey = 'photoControlsOnLeftEdge';
+
+  /// 相机默认位置整体上移约 1 厘米（60dp）：默认顶边 = 底部起 5/6 处再上移。
+  static const double _photoDefaultRaise = 60;
+
+  /// 启动读取的上次保存的相机入口位置（null = 从未拖动过，用默认值）。
+  double? _savedPhotoTopRatio;
+  bool? _savedPhotoOnLeft;
 
   /// 相机入口当前左侧 X（非拖拽时按吸附侧取固定边距；拖拽中取临时值）。
   double _currentPhotoLeft(double stackWidth) => _photoControlsDragLeft ??
@@ -243,6 +256,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     _loadZoomScale();
     _loadZoomControls();
     _loadPhotoControls();
+    _loadPhotoControlsPos();
     _loadVoiceControls();
     _loadVoiceMerge();
     _loadToolSwitches();
@@ -390,6 +404,23 @@ class _WebViewScreenState extends State<WebViewScreen>
     await prefs.setDouble(_zoomPrefKey, _zoomScaleNotifier.value);
   }
 
+  /// 读取上次保存的相机入口位置（纵向比例 + 吸附侧），下次进入按其布局。
+  Future<void> _loadPhotoControlsPos() async {
+    final prefs = await SharedPreferences.getInstance();
+    final r = prefs.getDouble(_photoPosTopPrefKey);
+    if (r != null && r > 0 && r < 1) _savedPhotoTopRatio = r;
+    _savedPhotoOnLeft = prefs.getBool(_photoPosLeftPrefKey);
+  }
+
+  /// 保存相机入口当前位置（顶边/Stack 高度比例 + 吸附侧）：拖拽松手后落盘。
+  Future<void> _savePhotoControlsPos() async {
+    final h = _bodyHeight;
+    if (h <= 0) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_photoPosTopPrefKey, _photoControlsTop / h);
+    await prefs.setBool(_photoPosLeftPrefKey, _photoControlsOnLeft);
+  }
+
   /// 读取持久化的对话区缩放控件开关。
   Future<void> _loadZoomControls() async {
     final prefs = await SharedPreferences.getInstance();
@@ -532,7 +563,8 @@ class _WebViewScreenState extends State<WebViewScreen>
     }
   }
 
-  /// 相机入口松手：按水平位置吸附到最近边缘（左半 → 左边缘，右半 → 右边缘）。
+  /// 相机入口松手：按水平位置吸附到最近边缘（左半 → 左边缘，右半 → 右边缘），
+  /// 并把最终位置（纵向比例 + 吸附侧）持久化，下次进入按最后位置布局。
   void _onPhotoControlsPanEnd(double stackWidth) {
     final dragLeft = _photoControlsDragLeft;
     if (dragLeft == null) return;
@@ -540,6 +572,7 @@ class _WebViewScreenState extends State<WebViewScreen>
       _photoControlsOnLeft = dragLeft < stackWidth / 2;
       _photoControlsDragLeft = null;
     });
+    _savePhotoControlsPos();
   }
 
   /// 语音入口拖拽：更新顶边与水平位置（相对 Stack，px）。
@@ -1907,7 +1940,13 @@ class _WebViewScreenState extends State<WebViewScreen>
             if (_bodyHeight == 0) {
               _bodyHeight = stackHeight;
               _zoomControlsTop = stackHeight * 0.5; // 默认屏幕中央
-              _photoControlsTop = stackHeight * (1 - 1 / 6); // 底部往上约六分之一
+              // 相机默认：底部往上约六分之一、再整体上移约 1 厘米；
+              // 用户拖动过则按上次保存的比例位置恢复（含吸附侧）。
+              _photoControlsTop = _savedPhotoTopRatio != null
+                  ? (_savedPhotoTopRatio! * stackHeight)
+                      .clamp(0.0, stackHeight - _photoControlHeight)
+                  : stackHeight * (1 - 1 / 6) - _photoDefaultRaise;
+              _photoControlsOnLeft = _savedPhotoOnLeft ?? true;
               // 语音按钮默认吸附右侧、比相机入口略高一点（视觉上不对齐成一
               // 条线，也避免与月相/天气动效拥挤）；可拖到左/右边缘吸附。
               _voiceControlsTop =
