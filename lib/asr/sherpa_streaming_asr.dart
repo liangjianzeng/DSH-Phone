@@ -1,11 +1,15 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:isolate';
 
 import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
 import 'package:record/record.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 
 import '../config.dart';
 import 'asr_engine.dart';
+import 'asr_model_manager.dart';
 
 /// 端侧流式识别引擎：sherpa-onnx 流式 Zipformer（zh int8，chunk-16）。
 ///
@@ -100,6 +104,38 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
     return SherpaStreamingAsr._(modelDir, enhanced);
   }
 
+  /// 启动完成后预热：模型文件已下载时在**后台 isolate** 预读文件到 OS 页缓存
+  /// （按块读取并丢弃），**不阻塞主线程/UI、不导致启动黑屏**；首次按住说话
+  /// 创建识别器时文件已在内存，IO 更快、卡顿更短。模型未下载（首次启动）
+  /// 跳过，待首次使用时走下载引导后再加载。失败不阻塞启动。
+  static Future<void> warmup() async {
+    try {
+      if (!await AsrModelManager.isReady()) return;
+      final dir = await AsrModelManager.modelDir();
+      await Isolate.run(() => _preloadFiles(dir));
+      debugPrint('[DSH][asr] warmup: model files preloaded to page cache');
+    } catch (e) {
+      debugPrint('[DSH][asr] warmup skipped: $e');
+    }
+  }
+
+  /// 后台 isolate：分块读取模型文件并丢弃，把文件页拉进 OS 页缓存。
+  static void _preloadFiles(String dir) {
+    for (final f in AsrModelManager.files) {
+      final file = File(p.join(dir, f));
+      if (!file.existsSync()) continue;
+      try {
+        final raf = file.openSync();
+        try {
+          // 每次读 1MB，读到 EOF（返回空）为止；不一次性整读，避免内存尖峰
+          while (raf.readSync(1 << 20).isNotEmpty) {}
+        } finally {
+          raf.closeSync();
+        }
+      } catch (_) {}
+    }
+  }
+
   @override
   Future<void> start() async {
     final recognizer = _recognizer;
@@ -108,10 +144,12 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
     }
     _stopped = false;
     _segments.clear();
-    // 增强档位：从设置读取热词表，per-stream 传给解码器（改热词即时生效）。
-    // 热词以逗号/换行分隔；空表则走默认无热词路径。
-    final hotwords = enhanced ? await SSHConfig.loadHotwords() : '';
-    _stream = recognizer.createStream(hotwords: hotwords);
+    // 从设置读取热词表，per-stream 传给解码器（改热词即时生效）：
+    // 标准与增强档位都会应用勾选/自定义的热词，保证自定义人名等词优先识别。
+    // 热词归一化为逐词换行分隔（sherpa 按换行切分每个热词，逗号连写会被
+    // 当成一个整体热词而失效）；空表则走默认无热词路径。
+    final hotwordList = _normalizeHotwords(await SSHConfig.loadHotwords());
+    _stream = recognizer.createStream(hotwords: hotwordList.join('\n'));
     final pcmStream = await _recorder.startStream(const RecordConfig(
       encoder: AudioEncoder.pcm16bits,
       sampleRate: 16000,
@@ -188,6 +226,19 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
 
   /// 静态文本快照（浮层展示当前累计文本用）。
   String get currentText => _segments.toString();
+
+  /// 把热词表归一化为逐词换行分隔：兼容用户以逗号/换行/全角逗号混填的词表，
+  /// 去掉空串与重复项——sherpa 按换行切分每个热词，逗号连写会被当成一个
+  /// 整体热词导致不生效。
+  static List<String> _normalizeHotwords(String raw) {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final w in raw.split(RegExp(r'[,，\n\r]'))) {
+      final t = w.trim();
+      if (t.isNotEmpty && seen.add(t)) out.add(t);
+    }
+    return out;
+  }
 
   static Float32List _pcm16ToFloat32(Uint8List bytes) {
     final sampleCount = bytes.length ~/ 2;

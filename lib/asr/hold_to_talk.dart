@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
@@ -147,12 +148,10 @@ class _HoldOverlay extends StatelessWidget {
                       builder: (_, cancelling, __) => Row(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          _PulsingMicIcon(red: cancelling),
+                          _ListeningIndicator(red: cancelling),
                           const SizedBox(width: 10),
                           Text(
-                            cancelling
-                                ? '松开取消'
-                                : session.ready.value ? '松开发送' : '准备中…',
+                            cancelling ? '松开取消' : '松开发送',
                             style: TextStyle(
                               color: cancelling
                                   ? Colors.redAccent
@@ -189,21 +188,26 @@ class _HoldOverlay extends StatelessWidget {
   }
 }
 
-/// 麦克风呼吸动画：说话中持续脉动，取消态变红。
-class _PulsingMicIcon extends StatefulWidget {
-  const _PulsingMicIcon({required this.red});
+/// 聆听动态效果：麦克风图标 + 一排声浪条持续波动（提示正在监听语音）。
+/// 说话中蓝色声浪，上滑取消时整体变红。
+class _ListeningIndicator extends StatefulWidget {
+  const _ListeningIndicator({required this.red});
 
+  /// 取消态（上滑超过阈值）：声浪变红。
   final bool red;
 
   @override
-  State<_PulsingMicIcon> createState() => _PulsingMicIconState();
+  State<_ListeningIndicator> createState() => _ListeningIndicatorState();
 }
 
-class _PulsingMicIconState extends State<_PulsingMicIcon>
+class _ListeningIndicatorState extends State<_ListeningIndicator>
     with SingleTickerProviderStateMixin {
+  /// 单控制器驱动声浪相位，帧间无随机抖动。
   late final AnimationController _ctrl =
-      AnimationController(vsync: this, duration: const Duration(milliseconds: 900))
-        ..repeat(reverse: true);
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 720))
+        ..repeat();
+
+  static const int _bars = 5;
 
   @override
   void dispose() {
@@ -213,11 +217,33 @@ class _PulsingMicIconState extends State<_PulsingMicIcon>
 
   @override
   Widget build(BuildContext context) {
-    return FadeTransition(
-      opacity: Tween(begin: 0.45, end: 1.0).animate(_ctrl),
-      child: Icon(Icons.mic,
-          color: widget.red ? Colors.redAccent : Colors.lightBlueAccent,
-          size: 26),
+    return AnimatedBuilder(
+      animation: _ctrl,
+      builder: (_, __) {
+        final color =
+            widget.red ? Colors.redAccent : Colors.lightBlueAccent;
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Icon(Icons.mic, color: color, size: 24),
+            const SizedBox(width: 6),
+            for (var i = 0; i < _bars; i++)
+              Container(
+                width: 4,
+                margin: const EdgeInsets.symmetric(horizontal: 1),
+                // 正弦相位级联 → 声浪像水流一样从左到右波动
+                height: 10 +
+                    10 * ((math.sin(_ctrl.value * math.pi * 2 * 2 +
+                                i * 1.3) + 1) / 2),
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.85),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+          ],
+        );
+      },
     );
   }
 }

@@ -32,6 +32,8 @@ class SetupScreen extends StatefulWidget {
     this.onPhotoControlsChanged,
     this.voiceControlsEnabled = true,
     this.onVoiceControlsChanged,
+    this.voiceMergeToCamera = false,
+    this.onVoiceMergeToCameraChanged,
     this.weatherEffectsEnabled = true,
     this.onWeatherEffectsChanged,
     this.sunSwitchEnabled = true,
@@ -94,6 +96,13 @@ class SetupScreen extends StatefulWidget {
   /// 切换对话区语音输入入口显示（默认开启）。
   final ValueChanged<bool>? onVoiceControlsChanged;
 
+  /// 语音输入并入相机按钮（默认关闭）：开启后隐藏右侧麦克风按钮，
+  /// 相机按钮叠加麦克风角标，短按相机、长按按住说话。
+  final bool voiceMergeToCamera;
+
+  /// 切换语音输入并入相机按钮（默认关闭）。
+  final ValueChanged<bool>? onVoiceMergeToCameraChanged;
+
   /// 天气动效开关（默认开启；关闭则停止天气查询并隐藏动效）。
   final bool weatherEffectsEnabled;
 
@@ -153,14 +162,24 @@ class _SetupScreenState extends State<SetupScreen> {
   late TextEditingController _keyPassphrase;
   late TextEditingController _localPort;
 
+  /// 隧道对端服务端口（远端 127.0.0.1 上的端口）。
+  late TextEditingController _remotePort;
+
   /// DSH Web 访问 Token（可选；新版 dsh>=0.1.2-rc.1 启用 token 鉴权时填写）。
   late TextEditingController _accessToken;
+
+  /// Zcode 服务访问 Token（Zcode 模式必填；zcode-phone-server 的访问令牌）。
+  /// 与 DSH token 相互独立、分开存储。
+  late TextEditingController _zcodeToken;
 
   /// Unsloth Studio 配置控件（实例级）。
   late TextEditingController _unslothPort;
   late TextEditingController _unslothPassword;
 
   late String _authType;
+
+  /// 当前编辑实例的服务模式（DSH / Zcode，随实例切换回填）。
+  late String _mode;
 
   /// 当前编辑实例的"默认主机资源监控"开关（实例级，随实例切换回填）。
   late bool _instanceHostMonitorEnabled;
@@ -188,6 +207,9 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// 对话区语音输入入口开关的本地状态（同上）。
   late bool _voiceControlsEnabled;
+
+  /// 语音输入并入相机按钮的本地状态（同上）。
+  late bool _voiceMergeToCamera;
 
   /// 天气动效开关的本地状态（同上）。
   late bool _weatherEffectsEnabled;
@@ -227,6 +249,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _zoomControlsEnabled = widget.zoomControlsEnabled;
     _photoControlsEnabled = widget.photoControlsEnabled;
     _voiceControlsEnabled = widget.voiceControlsEnabled;
+    _voiceMergeToCamera = widget.voiceMergeToCamera;
     _weatherEffectsEnabled = widget.weatherEffectsEnabled;
     _sunSwitchEnabled = widget.sunSwitchEnabled;
     _moonMode = widget.moonLocationMode;
@@ -334,9 +357,36 @@ class _SetupScreenState extends State<SetupScreen> {
         ],
       ),
     );
-    ctrl.dispose();
+    // 不显式 dispose：dialog 关闭动画期间 TextField 仍引用该 controller，
+    // 此时 dispose 会抛 "used after disposed"（debug 红屏）。controller 为
+    // 局部变量，dialog 关闭后无引用，由 GC 回收，无泄漏。
     if (saved == null || !mounted) return;
-    await SSHConfig.saveCategoryWords(catId, saved);
+    try {
+      await SSHConfig.saveCategoryWords(catId, saved);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('「$name」热词已保存')));
+    } catch (e) {
+      debugPrint('[DSH][asr] save hotwords error: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('保存失败：$e')));
+    }
+  }
+
+  /// 切换服务模式：未手动改过远端端口时（等于另一模式的默认值），自动回填新模式的默认端口。
+  void _applyMode(String mode) {
+    setState(() {
+      final current = int.tryParse(_remotePort.text.trim());
+      if (current == null ||
+          current == SSHConfig.defaultRemotePort ||
+          current == SSHConfig.defaultZcodeRemotePort) {
+        _remotePort.text =
+            '${mode == SSHConfig.modeZcode ? SSHConfig.defaultZcodeRemotePort : SSHConfig.defaultRemotePort}';
+      }
+      _mode = mode;
+    });
+    _scheduleAutoSave();
   }
 
   /// 把指定实例配置回填到表单控件。
@@ -350,10 +400,13 @@ class _SetupScreenState extends State<SetupScreen> {
     _privateKey = TextEditingController(text: c.privateKeyPem);
     _keyPassphrase = TextEditingController(text: c.keyPassphrase);
     _localPort = TextEditingController(text: '${c.localPort}');
+    _remotePort = TextEditingController(text: '${c.remotePort}');
     _accessToken = TextEditingController(text: c.accessToken);
+    _zcodeToken = TextEditingController(text: c.zcodeToken);
     _unslothPort = TextEditingController(text: '${c.unslothPort}');
     _unslothPassword = TextEditingController(text: c.unslothPassword);
     _authType = c.authType;
+    _mode = c.mode;
     _instanceHostMonitorEnabled = c.hostMonitorEnabled;
     _unslothEnabled = c.unslothEnabled;
     _unslothUseSsh = c.unslothUseSsh;
@@ -376,7 +429,9 @@ class _SetupScreenState extends State<SetupScreen> {
     _privateKey.dispose();
     _keyPassphrase.dispose();
     _localPort.dispose();
+    _remotePort.dispose();
     _accessToken.dispose();
+    _zcodeToken.dispose();
     _unslothPort.dispose();
     _unslothPassword.dispose();
     super.dispose();
@@ -471,24 +526,7 @@ class _SetupScreenState extends State<SetupScreen> {
         if (i == _profileIndex) continue;
         final other = widget.profiles[i];
         if (!other.hostMonitorEnabled) continue;
-        await SSHConfig.saveProfile(
-            i,
-            SSHConfig(
-              host: other.host,
-              sshPort: other.sshPort,
-              username: other.username,
-              localPort: other.localPort,
-              authType: other.authType,
-              password: other.password,
-              privateKeyPem: other.privateKeyPem,
-              keyPassphrase: other.keyPassphrase,
-              alias: other.alias,
-              hostMonitorEnabled: false,
-              unslothEnabled: other.unslothEnabled,
-              unslothPort: other.unslothPort,
-              unslothUseSsh: other.unslothUseSsh,
-              unslothPassword: other.unslothPassword,
-            ));
+        await SSHConfig.saveProfile(i, other.copyWith(hostMonitorEnabled: false));
       }
     }
     widget.onInstanceMonitorChanged?.call(on);
@@ -505,24 +543,7 @@ class _SetupScreenState extends State<SetupScreen> {
         if (i == _profileIndex) continue;
         final other = widget.profiles[i];
         if (!other.unslothEnabled) continue;
-        await SSHConfig.saveProfile(
-            i,
-            SSHConfig(
-              host: other.host,
-              sshPort: other.sshPort,
-              username: other.username,
-              localPort: other.localPort,
-              authType: other.authType,
-              password: other.password,
-              privateKeyPem: other.privateKeyPem,
-              keyPassphrase: other.keyPassphrase,
-              alias: other.alias,
-              hostMonitorEnabled: other.hostMonitorEnabled,
-              unslothEnabled: false,
-              unslothPort: other.unslothPort,
-              unslothUseSsh: other.unslothUseSsh,
-              unslothPassword: other.unslothPassword,
-            ));
+        await SSHConfig.saveProfile(i, other.copyWith(unslothEnabled: false));
       }
     }
   }
@@ -534,6 +555,11 @@ class _SetupScreenState extends State<SetupScreen> {
       sshPort: int.tryParse(_sshPort.text.trim()) ?? 22,
       username: _username.text.trim(),
       localPort: int.tryParse(_localPort.text.trim()) ?? 3081,
+      mode: _mode,
+      remotePort: int.tryParse(_remotePort.text.trim()) ??
+          (_mode == SSHConfig.modeZcode
+              ? SSHConfig.defaultZcodeRemotePort
+              : SSHConfig.defaultRemotePort),
       authType: _authType,
       password: _authType == SSHConfig.authTypePassword ? _password.text : '',
       privateKeyPem:
@@ -546,6 +572,7 @@ class _SetupScreenState extends State<SetupScreen> {
       unslothUseSsh: _unslothUseSsh,
       unslothPassword: _unslothPassword.text,
       accessToken: _accessToken.text.trim(),
+      zcodeToken: _zcodeToken.text.trim(),
     );
   }
 
@@ -725,14 +752,67 @@ class _SetupScreenState extends State<SetupScreen> {
             onChanged: (_) => _scheduleAutoSave(),
           ),
           const SizedBox(height: 12),
+          const Text('服务模式', style: TextStyle(fontSize: 16)),
+          Row(
+            children: [
+              Expanded(
+                child: RadioListTile<String>(
+                  title: const Text('DSH'),
+                  subtitle: const Text('DeepSeek Harness'),
+                  value: SSHConfig.modeDsh,
+                  groupValue: _mode,
+                  onChanged: (v) => _applyMode(v ?? SSHConfig.modeDsh),
+                ),
+              ),
+              Expanded(
+                child: RadioListTile<String>(
+                  title: const Text('Zcode'),
+                  subtitle: const Text('zcode-phone-server'),
+                  value: SSHConfig.modeZcode,
+                  groupValue: _mode,
+                  onChanged: (v) => _applyMode(v ?? SSHConfig.modeDsh),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: _remotePort,
+            keyboardType: TextInputType.number,
+            decoration: InputDecoration(
+              labelText: '远端服务端口',
+              helperText: _mode == SSHConfig.modeZcode
+                  ? '隧道对端端口：zcode-phone-server 默认 8787'
+                  : '隧道对端端口：DSH Web UI 默认 3080',
+              border: const OutlineInputBorder(),
+            ),
+            validator: _validatePort,
+            onChanged: (_) => _scheduleAutoSave(),
+          ),
+          const SizedBox(height: 12),
+          // DSH 与 Zcode 的访问 Token 分开存储：各自独立输入框、独立加密存储，
+          // 改其一不影响另一（连接时按当前模式取对应字段）。
           TextFormField(
             controller: _accessToken,
             obscureText: _obscureToken,
-            decoration: InputDecoration(
+            decoration: const InputDecoration(
               labelText: 'DSH 访问 Token（可选）',
               hintText: '粘贴 DSH 访问 Token（留空则不启用）',
               helperText: '新版 DSH(≥0.1.2) 启用 token 鉴权，首次访问需携带；'
                   '换取 30 天签名 cookie 后免 token，过期需重新填写',
+              border: OutlineInputBorder(),
+            ),
+            onChanged: (_) => _scheduleAutoSave(),
+          ),
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: _zcodeToken,
+            obscureText: _obscureToken,
+            decoration: InputDecoration(
+              labelText: 'Zcode 服务访问 Token（Zcode 模式必填）',
+              hintText: '粘贴 zcode-phone-server 的访问令牌',
+              helperText: '服务端首次启动自动生成：见 zcode-phone-server/config.json '
+                  '的 token 字段或启动控制台；不填服务端会拒绝访问',
               border: const OutlineInputBorder(),
               suffixIcon: IconButton(
                 icon: Icon(_obscureToken
@@ -1076,7 +1156,7 @@ class _SetupScreenState extends State<SetupScreen> {
           value: AsrMode.standard,
           groupValue: _asrMode,
           title: const Text('标准（推荐）'),
-          subtitle: const Text('greedy 解码，无热词；体积与现状一致'),
+          subtitle: const Text('greedy 解码；勾选/自定义热词同样生效'),
           onChanged: (v) {
             if (v == null) return;
             setState(() => _asrMode = v);
@@ -1108,8 +1188,8 @@ class _SetupScreenState extends State<SetupScreen> {
             const Padding(
               padding: EdgeInsets.only(left: 16, right: 16, bottom: 8),
               child: Text(
-                '增强档位下优先识别勾选分类的中文词；每类可单独编辑词表。'
-                '勾选越多解码越慢，建议只启用常用分类。',
+                '勾选/自定义的中文词会被优先识别（标准与增强档位均生效）；'
+                '每类可单独编辑词表。勾选越多解码越慢，建议只启用常用分类。',
                 style: TextStyle(color: Colors.grey, fontSize: 12),
               ),
             ),
@@ -1232,6 +1312,18 @@ class _SetupScreenState extends State<SetupScreen> {
             onChanged: (v) {
               setState(() => _voiceControlsEnabled = v);
               widget.onVoiceControlsChanged?.call(v);
+            },
+          ),
+          SwitchListTile(
+            title: const Text('语音输入并入相机按钮'),
+            subtitle: const Text(
+              '默认关闭；开启后隐藏右侧麦克风浮动按钮，相机图标正下方显示'
+              '麦克风图标，短按相机（拍照/传图），长按按住说话（端侧识别）',
+            ),
+            value: _voiceMergeToCamera,
+            onChanged: (v) {
+              setState(() => _voiceMergeToCamera = v);
+              widget.onVoiceMergeToCameraChanged?.call(v);
             },
           ),
           SwitchListTile(

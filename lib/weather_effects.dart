@@ -30,6 +30,11 @@ class _WeatherOverlayState extends State<WeatherOverlay>
   /// 动画总周期。雨滴/雪花速度差异由各自的 speed 相对值缩放。
   static const Duration _cycle = Duration(seconds: 10);
 
+  /// 性能：动画仍用 vsync 的 AnimationController（后台自动暂停、省电），但把
+  /// 相位 t 量化——每约 3 帧（约 20fps）才重绘一次，大幅降低主线程重绘开销、
+  /// 减少天气特效导致的界面卡顿，观感几乎不变（600 帧/周期 ÷ 3 ≈ 每 3 帧一次）。
+  static const int _quant = 200;
+
   late final AnimationController _ctrl =
       AnimationController(vsync: this, duration: _cycle)..repeat();
 
@@ -57,10 +62,17 @@ class _WeatherOverlayState extends State<WeatherOverlay>
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _ctrl,
-      builder: (context, _) => CustomPaint(
-        painter: _WeatherPainter(_config, t: _ctrl.value),
+    // RepaintBoundary 隔离天气动效重绘：不影响/不连带整个 Stack 与 WebView 图层
+    return RepaintBoundary(
+      child: AnimatedBuilder(
+        animation: _ctrl,
+        builder: (context, _) => CustomPaint(
+          painter: _WeatherPainter(
+            _config,
+            // 量化相位：跨过量化步长才触发重绘（shouldRepaint 拦截）
+            t: (_ctrl.value * _quant).floor() / _quant,
+          ),
+        ),
       ),
     );
   }
@@ -297,20 +309,26 @@ class _WeatherPainter extends CustomPainter {
     if (config.lightning) _paintLightning(canvas, size);
   }
 
-  /// 云：多个圆并成一条云形路径（nonZero 并集，整云统一透明度）。
+  /// 云：直接绘制多个同色椭圆（nonZero 并集视觉与路径一致），
+  /// 避免每帧构建 Path 对象，降低重绘开销。
   void _paintCloud(Canvas canvas, Size size, _Cloud c) {
     // 绕行：x 从 −0.3w 漂到 1.3w 后回到起点。
     final x = ((c.x0 + t * c.speed) % 1.6) - 0.3;
     final cx = x * size.width;
     final cy = c.y * size.height;
     final r = c.scale * size.width * 0.14;
-    final path = Path();
+    final paint = Paint()
+      ..color = (c.dark ? _darkCloudColor : _cloudColor)
+          .withValues(alpha: c.alpha);
     // 云形：中央大 puff + 两侧小 puff + 底部压平的宽 puff。
     void puff(double dx, double dy, double rr) {
-      path.addOval(Rect.fromCircle(
-        center: Offset(cx + dx * r, cy + dy * r),
-        radius: rr * r,
-      ));
+      canvas.drawOval(
+        Rect.fromCircle(
+          center: Offset(cx + dx * r, cy + dy * r),
+          radius: rr * r,
+        ),
+        paint,
+      );
     }
 
     puff(-0.85, 0.15, 0.62);
@@ -318,12 +336,6 @@ class _WeatherPainter extends CustomPainter {
     puff(0.30, -0.05, 0.75);
     puff(0.85, 0.18, 0.58);
     puff(0.0, 0.22, 0.80);
-    canvas.drawPath(
-      path,
-      Paint()
-        ..color = (c.dark ? _darkCloudColor : _cloudColor)
-            .withValues(alpha: c.alpha),
-    );
   }
 
   /// 雨滴：从云带下方落到区域底部的斜线段，两端渐隐。
@@ -394,21 +406,22 @@ class _WeatherPainter extends CustomPainter {
       Paint()
         ..color = Colors.white.withValues(alpha: 0.20 * strength),
     );
-    // 闪电折线（从云底劈到区域中部）。
-    final bolt = Path()
-      ..moveTo(size.width * 0.46, size.height * 0.28)
-      ..lineTo(size.width * 0.56, size.height * 0.42)
-      ..lineTo(size.width * 0.48, size.height * 0.45)
-      ..lineTo(size.width * 0.58, size.height * 0.62);
-    canvas.drawPath(
-      bolt,
-      Paint()
-        ..color = Colors.white.withValues(alpha: 0.75 * strength)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round,
-    );
+    // 闪电折线（从云底劈到区域中部）：直接画线段，不建 Path。
+    final boltPaint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.75 * strength)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    final pts = <Offset>[
+      Offset(size.width * 0.46, size.height * 0.28),
+      Offset(size.width * 0.56, size.height * 0.42),
+      Offset(size.width * 0.48, size.height * 0.45),
+      Offset(size.width * 0.58, size.height * 0.62),
+    ];
+    for (var i = 0; i + 1 < pts.length; i++) {
+      canvas.drawLine(pts[i], pts[i + 1], boltPaint);
+    }
   }
 
   @override

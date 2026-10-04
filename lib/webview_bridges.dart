@@ -491,6 +491,52 @@ const String composerBridgeJs = r'''
       } catch (e) {
         return { ok: false, error: String(e) };
       }
+    },
+    // 直接发送消息：先找明确的发送按钮点击，否则对 textarea/input 派发
+    // 发送消息：DSH 消息框是 contenteditable 富文本编辑器，发送走"发送消息"
+    // 按钮点击（或 Enter 合成键）。失败返回 {ok:false} + 诊断，由 Flutter 提示。
+    send: function() {
+      try {
+        // 策略 1：发送按钮（文本/aria/class 含"发送"/"send"，排除取消发送）
+        var candidates = document.querySelectorAll(
+            'button, [role="button"], [role="link"]');
+        var disabledBtn = null;
+        for (var i = 0; i < candidates.length; i++) {
+          var b = candidates[i];
+          var txt = (b.textContent || '').trim();
+          var aria = b.getAttribute('aria-label') || '';
+          var cls = b.className || '';
+          var label = (txt + ' ' + aria + ' ' + cls).toLowerCase();
+          if (label.indexOf('取消发送') >= 0 || label.indexOf('cancelsend') >= 0) continue;
+          if (label.indexOf('发送') >= 0 || label.indexOf('send') >= 0) {
+            if (b.disabled) {
+              if (disabledBtn === null) disabledBtn = b;
+              continue;
+            }
+            // mousedown/mouseup 提高框架合成事件命中率，再 click
+            try { b.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
+            try { b.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
+            b.click();
+            return { ok: true, via: 'button' };
+          }
+        }
+        // 策略 2：找到发送按钮但处于禁用（文本同步中/空）→ 明确提示
+        if (disabledBtn !== null) {
+          return { ok: false, error: '发送按钮暂不可用（文本同步中），请稍候或手动发送' };
+        }
+        // 策略 3：contenteditable 富文本 → 派发 Enter 合成键（尽力而为）
+        var el = findComposer();
+        if (el) {
+          el.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+            bubbles: true, cancelable: true
+          }));
+          return { ok: true, via: 'enter' };
+        }
+        return { ok: false, error: '未找到消息输入框/发送按钮' };
+      } catch (e) {
+        return { ok: false, error: String(e) };
+      }
     }
   };
 })();

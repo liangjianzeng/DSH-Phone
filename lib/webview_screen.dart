@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -88,6 +89,10 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 对话区右侧语音输入入口的开关键（持久化，默认开启）。
   static const String _voiceControlsPrefKey = 'webview_voice_controls_enabled';
 
+  /// 语音输入并入相机按钮的开关（持久化，默认关闭）：开启后隐藏右侧麦克风
+  /// 浮动按钮，相机按钮叠加麦克风角标，短按相机（拍照/传图）、长按按住说话。
+  static const String _voiceMergePrefKey = 'webview_voice_merge_to_camera';
+
   /// 天气动效开关（持久化，默认开启；WeatherService.enabled 同步启停查询）。
   static const String _weatherEffectsPrefKey = 'weather_effects_enabled';
 
@@ -112,6 +117,10 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 对话区右侧语音输入入口是否显示（默认开启，由设置页开关控制）。
   bool _voiceControlsEnabled = true;
 
+  /// 语音输入并入相机按钮（默认关闭，由设置页开关控制）：开启后隐藏右侧
+  /// 麦克风按钮，相机按钮叠加麦克风角标，短按相机/长按说话。
+  bool _voiceMergeToCamera = false;
+
   /// 天气动效是否显示（默认开启，由设置页开关控制）。
   bool _weatherEffectsEnabled = true;
 
@@ -131,18 +140,45 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 相机入口顶边 Y（相对 Stack，px），默认底部往上约六分之一处。
   double _photoControlsTop = 0;
 
+  /// 相机入口是否吸附在左侧边缘（false = 右侧）；松手时按水平位置吸附，
+  /// 方便左右手操作（与语音入口一致）。
+  bool _photoControlsOnLeft = true;
+
+  /// 拖拽中相机入口的临时左侧 X（相对 Stack）；非拖拽时为 null。
+  double? _photoControlsDragLeft;
+
   /// 语音入口顶边 Y（相对 Stack，px），默认与相机入口同高（右侧对称位置）。
   double _voiceControlsTop = 0;
 
-  /// 拖拽抓手偏移：pan 起始时“手指 Y − 控件顶边 Y”，使控件顶边始终跟随手指。
+  /// 语音入口是否吸附在左侧边缘（false = 右侧）；松手时按水平位置吸附，
+  /// 方便左右手操作。
+  bool _voiceControlsOnLeft = false;
+
+  /// 拖拽中语音入口的临时左侧 X（相对 Stack）；非拖拽时为 null。
+  double? _voiceControlsDragLeft;
+
+  /// 拖拽抓手偏移：pan 起始时“手指 − 控件顶边/左边”，使控件始终跟随手指。
   double _zoomGripOffset = 0;
   double _photoGripOffset = 0;
+  double _photoGripOffsetX = 0;
   double _voiceGripOffset = 0;
+  double _voiceGripOffsetX = 0;
 
   /// 控件拖拽时顶边允许的最大值（Stack 高度 − 控件高度），保证不滑出屏外。
   static const double _zoomControlHeight = 120; // 3 图标 + 2 分隔，近似
   static const double _photoControlHeight = 48; // 圆形按钮 48×48
+  static const double _photoControlWidth = 48; // 圆形按钮 48×48
   static const double _voiceControlHeight = 48; // 圆形麦克风按钮 48×48
+  static const double _voiceControlWidth = 48; // 圆形麦克风按钮 48×48
+  static const double _edgeGap = 8; // 吸附后距屏幕边缘的间距
+
+  /// 相机入口当前左侧 X（非拖拽时按吸附侧取固定边距；拖拽中取临时值）。
+  double _currentPhotoLeft(double stackWidth) => _photoControlsDragLeft ??
+      (_photoControlsOnLeft ? _edgeGap : stackWidth - _photoControlWidth - _edgeGap);
+
+  /// 语音入口当前左侧 X（非拖拽时按吸附侧取固定边距；拖拽中取临时值）。
+  double _currentVoiceLeft(double stackWidth) => _voiceControlsDragLeft ??
+      (_voiceControlsOnLeft ? _edgeGap : stackWidth - _voiceControlWidth - _edgeGap);
 
   // ---- WebView 页面加载状态 ----
   bool _pageLoading = false; // 远程页面加载中（隧道已通，页面未就绪）
@@ -208,6 +244,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     _loadZoomControls();
     _loadPhotoControls();
     _loadVoiceControls();
+    _loadVoiceMerge();
     _loadToolSwitches();
     // 监控采样定时器常驻，内部仅在隧道 connected 时旁路采集。
     HostMonitor.instance.start();
@@ -404,6 +441,23 @@ class _WebViewScreenState extends State<WebViewScreen>
     );
   }
 
+  /// 读取持久化的"语音输入并入相机按钮"开关。
+  Future<void> _loadVoiceMerge() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool(_voiceMergePrefKey) ?? false;
+    if (!mounted) return;
+    setState(() => _voiceMergeToCamera = enabled);
+  }
+
+  /// 保存并应用"语音输入并入相机按钮"开关（默认关闭）。
+  void _setVoiceMergeToCamera(bool enabled) {
+    if (!mounted) return;
+    setState(() => _voiceMergeToCamera = enabled);
+    SharedPreferences.getInstance().then(
+      (prefs) => prefs.setBool(_voiceMergePrefKey, enabled),
+    );
+  }
+
   /// 读取天气动效开关（默认开启）。
   Future<void> _loadWeatherEffects() async {
     final prefs = await SharedPreferences.getInstance();
@@ -454,35 +508,75 @@ class _WebViewScreenState extends State<WebViewScreen>
     }
   }
 
-  /// 相机入口拖拽：更新归一化顶边（相对 Stack，px）。
-  void _onPhotoControlsPanStart(DragStartDetails details, double stackHeight) {
+  /// 相机入口拖拽开始：记录上下/左右抓手偏移（相对 Stack）。
+  void _onPhotoControlsPanStart(DragStartDetails details, double stackHeight,
+      double stackWidth) {
     _photoGripOffset = details.globalPosition.dy - _photoControlsTop;
+    _photoGripOffsetX =
+        details.globalPosition.dx - _currentPhotoLeft(stackWidth);
   }
 
-  void _onPhotoControlsPanUpdate(
-      DragUpdateDetails details, double stackHeight) {
+  /// 相机入口拖拽：顶边跟随手指上下移动，左侧 X 跟随手指左右移动。
+  void _onPhotoControlsPanUpdate(DragUpdateDetails details, double stackHeight,
+      double stackWidth) {
     final newTop = (details.globalPosition.dy - _photoGripOffset)
         .clamp(0.0, stackHeight - _photoControlHeight);
     if ((newTop - _photoControlsTop).abs() > 1.0) {
       setState(() => _photoControlsTop = newTop);
     }
+    final newLeft = (details.globalPosition.dx - _photoGripOffsetX)
+        .clamp(0.0, stackWidth - _photoControlWidth);
+    if ((_photoControlsDragLeft == null ||
+        (newLeft - _photoControlsDragLeft!).abs() > 1.0)) {
+      setState(() => _photoControlsDragLeft = newLeft);
+    }
   }
 
-  /// 语音入口拖拽：更新顶边（相对 Stack，px）。
+  /// 相机入口松手：按水平位置吸附到最近边缘（左半 → 左边缘，右半 → 右边缘）。
+  void _onPhotoControlsPanEnd(double stackWidth) {
+    final dragLeft = _photoControlsDragLeft;
+    if (dragLeft == null) return;
+    setState(() {
+      _photoControlsOnLeft = dragLeft < stackWidth / 2;
+      _photoControlsDragLeft = null;
+    });
+  }
+
+  /// 语音入口拖拽：更新顶边与水平位置（相对 Stack，px）。
   /// 按住说话期间不拖拽（长按赢得手势竞技场后拖拽本就不会触发，此处双保险）。
-  void _onVoiceControlsPanStart(DragStartDetails details, double stackHeight) {
+  void _onVoiceControlsPanStart(DragStartDetails details, double stackHeight,
+      double stackWidth) {
     if (_holdSession != null) return;
     _voiceGripOffset = details.globalPosition.dy - _voiceControlsTop;
+    _voiceGripOffsetX =
+        details.globalPosition.dx - _currentVoiceLeft(stackWidth);
   }
 
-  void _onVoiceControlsPanUpdate(
-      DragUpdateDetails details, double stackHeight) {
+  void _onVoiceControlsPanUpdate(DragUpdateDetails details, double stackHeight,
+      double stackWidth) {
     if (_holdSession != null) return;
     final newTop = (details.globalPosition.dy - _voiceGripOffset)
         .clamp(0.0, stackHeight - _voiceControlHeight);
     if ((newTop - _voiceControlsTop).abs() > 1.0) {
       setState(() => _voiceControlsTop = newTop);
     }
+    // 水平跟随手指；松手时按位置吸附到左/右边缘。
+    final newLeft = (details.globalPosition.dx - _voiceGripOffsetX)
+        .clamp(0.0, stackWidth - _voiceControlWidth);
+    if ((_voiceControlsDragLeft == null ||
+        (newLeft - _voiceControlsDragLeft!).abs() > 1.0)) {
+      setState(() => _voiceControlsDragLeft = newLeft);
+    }
+  }
+
+  /// 语音入口松手：按水平位置吸附到最近边缘（左半 → 左边缘，右半 → 右边缘）。
+  void _onVoiceControlsPanEnd(double stackWidth) {
+    final dragLeft = _voiceControlsDragLeft;
+    if (dragLeft == null) return;
+    setState(() {
+      _voiceControlsOnLeft = dragLeft < stackWidth / 2;
+      _voiceControlsDragLeft = null;
+    });
   }
 
   // ---- 按住说话（长按右侧语音按钮 → 端侧流式识别） ----
@@ -545,7 +639,8 @@ class _WebViewScreenState extends State<WebViewScreen>
         details.offsetFromOrigin.dy < -HoldToTalkSession.cancelSlop;
   }
 
-  /// 长按结束（松手/系统取消）：取终稿注入消息输入框（不自动发送）。
+  /// 长按结束（松手/系统取消）：取终稿注入消息输入框并自动发送，
+  /// 减少一次"确认发送"点击。
   /// 引擎尚未就绪（加载中松手）→ 标记取消，由 start 完成侧收尾。
   Future<void> _onVoiceLongPressEnd({bool cancelled = false}) async {
     _voiceLongPressActive = false; // 弹窗期间的收尾判断依赖此标记
@@ -559,7 +654,13 @@ class _WebViewScreenState extends State<WebViewScreen>
     final discard = cancelled || session.cancelMode.value;
     final text = await session.end(cancelled: discard);
     if (discard || text.isEmpty || !mounted) return;
-    await _injectComposerText(text);
+    final ok = await _injectComposerTextAndSend(text);
+    if (!mounted) return;
+    if (ok) {
+      _snack('已发送');
+    } else {
+      _snack('已注入，请点发送');
+    }
   }
 
   /// 月相观测位置设置变更：持久化并重新解析（observer 变化自动触发重绘）。
@@ -711,6 +812,42 @@ class _WebViewScreenState extends State<WebViewScreen>
     _connect();
   }
 
+  /// 顶栏模式一键切换：同实例内翻转 DSH/Zcode。端口若仍是另一模式的默认值
+  /// 则落到本模式默认值（自定义端口保留），持久化后重载页面。
+  ///
+  /// 同一台服务器的两种模式只是转发目标端口不同（DSH 3080 / Zcode 8787），
+  /// SSH 会话原样保留——转发通道按连接逐条拨号 _activeConfig.remotePort，
+  /// 就地更新内存配置后新连接自动走新端口，无需断开重连。
+  Future<void> _toggleMode() async {
+    final newMode =
+        _config.isZcodeMode ? SSHConfig.modeDsh : SSHConfig.modeZcode;
+    var newPort = _config.remotePort;
+    if (newMode == SSHConfig.modeZcode &&
+        newPort == SSHConfig.defaultRemotePort) {
+      newPort = SSHConfig.defaultZcodeRemotePort;
+    } else if (newMode == SSHConfig.modeDsh &&
+        newPort == SSHConfig.defaultZcodeRemotePort) {
+      newPort = SSHConfig.defaultRemotePort;
+    }
+    final updated = _config.copyWith(mode: newMode, remotePort: newPort);
+    await SSHConfig.saveProfile(_activeIndex, updated);
+    if (!mounted) return;
+    setState(() {
+      _profiles[_activeIndex] = updated;
+      _config = updated;
+    });
+    TunnelService.instance
+        .updateActiveConfig(updated, profileIndex: _activeIndex);
+    final modeName = newMode == SSHConfig.modeZcode ? "Zcode" : "DSH";
+    if (TunnelService.instance.status == TunnelStatus.connected) {
+      _snack('已切换到 $modeName 模式');
+      await _loadTargetUrl();
+    } else {
+      _snack('已切换到 $modeName 模式，连接中…');
+      _manualConnect();
+    }
+  }
+
   Future<void> _connect() async {
     // 已连接则跳过，避免冗余重连造成界面闪烁/循环
     if (TunnelService.instance.status == TunnelStatus.connected) return;
@@ -726,10 +863,19 @@ class _WebViewScreenState extends State<WebViewScreen>
       if (!mounted) return;
       _reconnectCount = 0; // 连接成功：重置重连计数
       setState(() => _tunnelStatus = TunnelStatus.connected);
-      // 注意：这里不手动 loadUrl。WebView 每次在 body 重建时都会用
-      // initialUrlRequest（即当前 _targetUrl）加载，切换实例/重连后
-      // 会自动加载新地址；手动调用会用到尚未就绪/过期的 controller，
-      // 触发 MissingPluginException。
+      // WebView 只在 body 重建时用 initialUrlRequest 加载；同一实例内改
+      // 模式/端口（设置保存返回，body 不重建）时页面仍是旧地址——曾因此
+      // 在 Zcode 模式下残留 DSH 页面。校验实际地址，不一致就强制重载。
+      try {
+        final c = _controller;
+        final current = (await c?.getUrl())?.toString();
+        if (c != null && current != null && current != _targetUrl) {
+          debugPrint('[DSH] page url mismatch ($current != ${_targetUrl.replaceAll(RegExp(r'token=[^&]+'), 'token=***')}), reloading');
+          await _loadTargetUrl();
+        }
+      } catch (_) {
+        // controller 未就绪：body 重建路径会自行加载
+      }
     } catch (e) {
       if (!mounted) return;
       _handleConnectFailure('$e');
@@ -865,6 +1011,8 @@ class _WebViewScreenState extends State<WebViewScreen>
           onPhotoControlsChanged: _setPhotoControlsEnabled,
           voiceControlsEnabled: _voiceControlsEnabled,
           onVoiceControlsChanged: _setVoiceControlsEnabled,
+          voiceMergeToCamera: _voiceMergeToCamera,
+          onVoiceMergeToCameraChanged: _setVoiceMergeToCamera,
           weatherEffectsEnabled: _weatherEffectsEnabled,
           onWeatherEffectsChanged: _setWeatherEffectsEnabled,
           sunSwitchEnabled: _sunSwitchEnabled,
@@ -925,6 +1073,10 @@ class _WebViewScreenState extends State<WebViewScreen>
           a.sshPort != b.sshPort ||
           a.username != b.username ||
           a.localPort != b.localPort ||
+          // remotePort（远端服务端口）与 mode（DSH/Zcode 转发目标）也走
+          // 隧道转发：漏比会导致设置页改完返回"无变化"不重连，旧目标继续用
+          a.remotePort != b.remotePort ||
+          a.mode != b.mode ||
           a.authType != b.authType ||
           a.password != b.password ||
           a.privateKeyPem != b.privateKeyPem ||
@@ -935,19 +1087,23 @@ class _WebViewScreenState extends State<WebViewScreen>
           a.unslothPort != b.unslothPort ||
           a.unslothUseSsh != b.unslothUseSsh ||
           a.unslothPassword != b.unslothPassword ||
-          a.accessToken != b.accessToken) {
+          a.accessToken != b.accessToken ||
+          a.zcodeToken != b.zcodeToken) {
         return true;
       }
     }
     return false;
   }
 
-  /// DSH 入口 URL。配置了访问 Token 时拼上 `?token=`，让新版 DSH
-  /// (>=0.1.2-rc.1) 在首次访问完成鉴权并下发 30 天签名 cookie；
-  /// 未配置 Token（旧版服务 / 已换过 cookie）则保持裸地址直连。
+  /// 入口 URL（按当前模式取对应 Token）。
+  /// DSH：配置了访问 Token 时拼上 `?token=`，让新版 DSH (>=0.1.2-rc.1)
+  /// 在首次访问完成鉴权并下发 30 天签名 cookie；未配置则裸地址直连。
+  /// Zcode：zcode-phone-server 对每个请求校验 Token，必须携带。
   String get _targetUrl {
     final base = 'http://127.0.0.1:${_config.localPort}';
-    final token = _config.accessToken.trim();
+    final token =
+        (_config.isZcodeMode ? _config.zcodeToken : _config.accessToken)
+            .trim();
     if (token.isEmpty) return base;
     return '$base/?token=${Uri.encodeQueryComponent(token)}';
   }
@@ -957,7 +1113,16 @@ class _WebViewScreenState extends State<WebViewScreen>
     // 隧道未连接或 controller 已失效时跳过，避免 MissingPluginException
     if (c == null || _tunnelStatus != TunnelStatus.connected) return;
     try {
-      await c.loadUrl(urlRequest: URLRequest(url: WebUri(_targetUrl)));
+      await c.loadUrl(
+        urlRequest: URLRequest(
+          url: WebUri(_targetUrl),
+          // 主文档必须绕过缓存：DSH/Zcode 的 token 只出现在主文档 URL 上，
+          // 命中旧缓存会跳过「token→303→Set-Cookie」鉴权链，SPA 的 XHR
+          // 带着旧签名 cookie 全部报「token 无效」（模式热切换实测复现，
+          // 冷启动因缓存冷恰好走了鉴权链而正常）。
+          headers: {'Cache-Control': 'no-cache'},
+        ),
+      );
     } catch (_) {
       // controller 可能已失效，忽略
     }
@@ -1231,17 +1396,32 @@ class _WebViewScreenState extends State<WebViewScreen>
     }
   }
 
-  /// 文本注入 DSH 消息输入框（composer 桥，不自动发送），失败提示。
-  Future<void> _injectComposerText(String text) async {
+  /// 文本注入后自动发送（语音松手场景）。返回是否成功发送。
+  /// 注入失败或找不到发送入口时返回 false（文本已注入，用户可手动发送）。
+  Future<bool> _injectComposerTextAndSend(String text) async {
     final c = _controller;
-    if (c == null) return;
-    final js = "window.__dshComposerBridge.insertText(${jsonEncode(text)})";
-    final result = await c.evaluateJavascript(source: js) as Object?;
-    if (result is Map && result['ok'] == false) {
-      _snack('文本注入失败：${result['error'] ?? '未知错误'}');
-    } else {
-      debugPrint('[DSH] composer text injected: ${text.length} chars');
+    if (c == null) return false;
+    // 先注入文本
+    final inj = await c.evaluateJavascript(
+        source: "window.__dshComposerBridge.insertText(${jsonEncode(text)})")
+        as Object?;
+    if (inj is Map && inj['ok'] == false) {
+      _snack('文本注入失败：${inj['error'] ?? '未知错误'}');
+      return false;
     }
+    debugPrint('[DSH] composer text injected: ${text.length} chars');
+    // 等 React 同步文本、发送按钮变为可点（DSH 富文本编辑器异步更新）
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    if (!mounted) return false;
+    // 再触发发送
+    final send = await c.evaluateJavascript(
+        source: "window.__dshComposerBridge.send()") as Object?;
+    if (send is Map && send['ok'] == true) {
+      debugPrint('[DSH] composer text sent via ${send['via']}');
+      return true;
+    }
+    debugPrint('[DSH] composer send failed: ${(send as Map?)?['error']}');
+    return false;
   }
 
   /// 依据文件名判断 DSH 附件可接受的图片 MIME（png/jpeg/webp/gif）。
@@ -1516,11 +1696,13 @@ class _WebViewScreenState extends State<WebViewScreen>
     });
   }
 
-  /// 保存内嵌输入的新 Token 到当前实例配置，并带新 Token 重载页面。
+  /// 保存内嵌输入的新 Token 到当前实例配置（按模式存对应字段），并重载页面。
   Future<void> _saveTokenAndReload() async {
     final token = _tokenCtrl.text.trim();
     if (token.isEmpty) return;
-    final updated = _config.copyWith(accessToken: token);
+    final updated = _config.isZcodeMode
+        ? _config.copyWith(zcodeToken: token)
+        : _config.copyWith(accessToken: token);
     await SSHConfig.saveProfile(_activeIndex, updated);
     if (!mounted) return;
     setState(() {
@@ -1603,17 +1785,27 @@ class _WebViewScreenState extends State<WebViewScreen>
                         ),
                       ),
                     ),
-                  // 文字半透明底：曲线透出时仍清晰
+                  // 文字半透明底：曲线透出时仍清晰。
+                  // 顶栏名称跟随当前连接模式：Zcode 模式显示 ZCode-Phone。
                   Container(
                     color: theme.colorScheme.surface.withValues(alpha: 0.7),
                     padding: const EdgeInsets.symmetric(vertical: 2),
-                    child:
-                        Text('DSH-Phone', style: theme.textTheme.titleMedium),
+                    child: Text(
+                      _config.isZcodeMode ? 'ZCode-Phone' : 'DSH-Phone',
+                      style: theme.textTheme.titleMedium,
+                    ),
                   ),
                 ],
               ),
             ),
             const Spacer(),
+            // 模式一键切换：与顶栏其它图标同款样式的 IconButton（点击翻转
+            // DSH/Zcode 并自动重连）。
+            IconButton(
+              tooltip: _config.isZcodeMode ? '切换到 DSH 模式' : '切换到 Zcode 模式',
+              icon: const Icon(Icons.swap_horiz, color: Colors.green),
+              onPressed: _toggleMode,
+            ),
             _buildInstanceSwitcher(context),
             // Unsloth 入口：全部实例未启用时隐藏（首页无意义）
             if (_unslothAvailable)
@@ -1711,16 +1903,24 @@ class _WebViewScreenState extends State<WebViewScreen>
         return LayoutBuilder(
           builder: (context, constraints) {
             final stackHeight = constraints.maxHeight;
+            final stackWidth = constraints.maxWidth;
             if (_bodyHeight == 0) {
               _bodyHeight = stackHeight;
               _zoomControlsTop = stackHeight * 0.5; // 默认屏幕中央
               _photoControlsTop = stackHeight * (1 - 1 / 6); // 底部往上约六分之一
-              // 右侧语音按钮：比相机入口略高一点（视觉上不对齐成一条线，
-              // 也避免与月相/天气动效拥挤）。
+              // 语音按钮默认吸附右侧、比相机入口略高一点（视觉上不对齐成一
+              // 条线，也避免与月相/天气动效拥挤）；可拖到左/右边缘吸附。
               _voiceControlsTop =
                   (_photoControlsTop - 16).clamp(0.0, stackHeight);
             } else if ((stackHeight - _bodyHeight).abs() > 1) {
-              // 容器高度变化（键盘/旋转等）时同步基准高度
+              // 容器高度变化（键盘弹出/收起、旋转等）：按高度比例上推/下拉
+              // 浮动控件，让相机/语音/缩放按钮跟随页面内容一起移动——键盘
+              // 上推页面时相机不会留在原地被键盘遮挡，天气动效锚定相机故
+              // 一并移动。
+              final ratio = stackHeight / _bodyHeight;
+              _zoomControlsTop = _zoomControlsTop * ratio;
+              _photoControlsTop = _photoControlsTop * ratio;
+              _voiceControlsTop = _voiceControlsTop * ratio;
               _bodyHeight = stackHeight;
             }
             return Stack(
@@ -1729,8 +1929,11 @@ class _WebViewScreenState extends State<WebViewScreen>
                 InAppWebView(
                   initialUrlRequest: URLRequest(url: WebUri(_targetUrl)),
                   initialSettings: InAppWebViewSettings(
-                    // 本地缓存加速：优先用缓存，缺时才走网络
-                    cacheMode: CacheMode.LOAD_CACHE_ELSE_NETWORK,
+                    // 缓存策略：LOAD_DEFAULT 尊重 HTTP 缓存头——zcode-phone-server
+                    // 对 HTML 发 no-store，保证页面代码始终最新。曾因
+                    // LOAD_CACHE_ELSE_NETWORK（哪怕过期也吃缓存）长期加载旧页面，
+                    // 服务端修复全部无法到达手机；DSH 静态资源仍按其缓存头命中
+                    cacheMode: CacheMode.LOAD_DEFAULT,
                     // DSH 是含 WebSocket 的 SPA
                     javaScriptEnabled: true,
                     transparentBackground: false,
@@ -1784,10 +1987,17 @@ class _WebViewScreenState extends State<WebViewScreen>
                     // 页面就绪：消费冷启动/排队中的分享内容
                     _processPendingShares();
                   },
-                  onReceivedError: (controller, request, error) => _onPageError(
-                    '加载失败：${error.description}\n'
-                    '（${error.type}）',
-                  ),
+                  onReceivedError: (controller, request, error) {
+                    // 只有主框架加载失败才升级为整页错误。子资源/XHR/SSE 的
+                    // 瞬时失败（EventSource 断开重连、切会话关闭旧流、轮询
+                    // 抖动等）在长连接页面里是常态，整页报错会反复打断使用
+                    // （表现为一点会话切换就「无法加载远程界面 net::ERR_FAILED」）。
+                    if (request.isForMainFrame != true) return;
+                    _onPageError(
+                      '加载失败：${error.description}\n'
+                      '（${error.type}）',
+                    );
+                  },
                   onReceivedHttpError: (controller, request, errorResponse) {
                     // 只处理主文档响应；子资源（图标等）的 401/404 不打扰页面
                     if (request.isForMainFrame != true) return;
@@ -1810,24 +2020,28 @@ class _WebViewScreenState extends State<WebViewScreen>
                 // 默认关闭，仅在设置页开启后显示。
                 if (_zoomControlsEnabled && !_pageLoading && _pageError == null)
                   _buildZoomControls(context, stackHeight),
-                // 相机入口浮动按钮：对话区左侧靠屏幕边，可拖拽上下移动，默认开启。
+                // 相机入口浮动按钮：默认对话区左侧靠屏幕边，可拖拽上下/左右
+                // 移动并吸附到最近边缘（方便左右手操作），默认开启。
                 if (_photoControlsEnabled &&
                     !_pageLoading &&
                     _pageError == null)
-                  _buildPhotoControls(context, stackHeight),
+                  _buildPhotoControls(context, stackHeight, stackWidth),
                 // 语音输入浮动按钮：对话区右侧靠屏幕边（与相机入口对称），
                 // 可拖拽上下移动，长按按住说话，默认开启。
+                // 语音并入相机开启时隐藏右侧麦克风按钮（相机按钮承担语音）。
                 if (_voiceControlsEnabled &&
+                    !_voiceMergeToCamera &&
                     !_pageLoading &&
                     _pageError == null)
-                  _buildVoiceControls(context, stackHeight),
-                // 天气动效：云/雨/雪/雾/雷锚定相机按钮当前位置（拖拽跟随），
-                // 绘制在按钮上层、低不透明度且不拦截触摸；相机入口隐藏时一并隐藏。
+                  _buildVoiceControls(context, stackHeight, stackWidth),
+                // 天气动效：云/雨/雪/雾/雷锚定相机按钮当前位置（拖拽上下/左右
+                // 均跟随），绘制在按钮上层、低不透明度且不拦截触摸；相机入口
+                // 隐藏时一并隐藏。
                 if (_photoControlsEnabled &&
                     _weatherEffectsEnabled &&
                     !_pageLoading &&
                     _pageError == null)
-                  _buildWeatherOverlay(context),
+                  _buildWeatherOverlay(context, stackWidth),
                 // 侧边栏终端按键条：xterm 面板可见时显示在底部中央
                 //（手机软键盘没有 Esc/Ctrl/方向键，这些是终端刚需）
                 if (_terminalVisible && !_pageLoading && _pageError == null)
@@ -2008,42 +2222,67 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 相机入口浮动按钮：对话区左侧、屏幕底部往上约六分之一处（避开底部安全区与
   /// 键盘、缩放控件）。按钮呈现为**真实观测的月相**（夜间）或**全亮日光模式**
   /// （白天，日出日落联动开启时）——细节见 [_MoonCameraButton]。
-  Widget _buildPhotoControls(BuildContext context, double stackHeight) {
+  Widget _buildPhotoControls(BuildContext context, double stackHeight,
+      double stackWidth) {
+    final mergeVoice = _voiceMergeToCamera;
+    final dragLeft = _photoControlsDragLeft;
     return Positioned(
-      left: 6,
       top: _photoControlsTop,
-      // 可拖拽自由上下移动：占满命中区域捕获拖拽，点击透传给内部相机按钮
+      // 可拖拽左右移动并吸附到左/右边缘（方便左右手操作）：
+      // 拖拽中用临时左侧 X，非拖拽时按吸附侧用 left/right 固定边距。
+      left: dragLeft ?? (_photoControlsOnLeft ? _edgeGap : null),
+      right: (dragLeft == null && !_photoControlsOnLeft) ? _edgeGap : null,
+      // 占满命中区域捕获拖拽，点击透传给内部相机按钮。
+      // 语音并入相机开启时：长按 = 按住说话（端侧识别，同右侧麦克风按钮），
+      // 短按仍为相机（拍照/传图）；关闭时相机按钮不承担长按说话。
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onPanStart: (details) => _onPhotoControlsPanStart(details, stackHeight),
+        onPanStart: (details) =>
+            _onPhotoControlsPanStart(details, stackHeight, stackWidth),
         onPanUpdate: (details) =>
-            _onPhotoControlsPanUpdate(details, stackHeight),
+            _onPhotoControlsPanUpdate(details, stackHeight, stackWidth),
+        onPanEnd: (_) => _onPhotoControlsPanEnd(stackWidth),
+        onLongPressStart:
+            mergeVoice ? (_) => _onVoiceLongPressStart() : null,
+        onLongPressMoveUpdate: mergeVoice ? _onVoiceLongPressMoveUpdate : null,
+        onLongPressEnd: mergeVoice ? (_) => _onVoiceLongPressEnd() : null,
+        onLongPressCancel:
+            mergeVoice ? () => _onVoiceLongPressEnd(cancelled: true) : null,
         child: _MoonCameraButton(
           sunSwitchEnabled: _sunSwitchEnabled,
+          showMicBadge: mergeVoice,
           onPressed: _pickAndSendImage,
         ),
       ),
     );
   }
 
-  /// 语音输入浮动按钮：对话区**右侧**、默认比相机入口略高一点，可拖拽上下
-  /// 移动。长按按住说话（端侧流式识别，微信式交互）：上滑取消、松手把转写
-  /// 文本注入消息输入框；点击无动作（拖拽/长按两个手势，避免与注入动作误触）。
+  /// 语音输入浮动按钮：默认吸附**右侧**（比相机入口略高一点），可拖拽到
+  /// 左/右屏幕边缘吸附（松手按水平位置吸附最近边缘，方便左右手操作），
+  /// 也可上下移动。长按按住说话（端侧流式识别，微信式交互）：上滑取消、
+  /// 松手把转写文本注入消息输入框并自动发送；点击无动作（拖拽/长按两个
+  /// 手势，避免与注入动作误触）。
   ///
   /// 视觉上**只画麦克风图标本身**（无圆圈底/边框，用户要求：小一点也知道是
   /// 干什么）；命中区域仍占满 48×48，保证拖拽与长按好按。按住说话期间图标
   /// 播放声纹扩散动效（[_VoiceMicButton]），上滑取消时变红——让用户一眼
   /// 知道正在监听。
-  Widget _buildVoiceControls(BuildContext context, double stackHeight) {
+  Widget _buildVoiceControls(BuildContext context, double stackHeight,
+      double stackWidth) {
+    // 拖拽中用临时左侧 X；非拖拽时按吸附侧用 left/right 固定边距。
+    final dragLeft = _voiceControlsDragLeft;
     return Positioned(
-      right: 8,
       top: _voiceControlsTop,
+      left: dragLeft ?? (_voiceControlsOnLeft ? _edgeGap : null),
+      right: (dragLeft == null && !_voiceControlsOnLeft) ? _edgeGap : null,
       // 占满命中区域捕获拖拽与长按；无内部按钮，点击不产生动作
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onPanStart: (details) => _onVoiceControlsPanStart(details, stackHeight),
+        onPanStart: (details) =>
+            _onVoiceControlsPanStart(details, stackHeight, stackWidth),
         onPanUpdate: (details) =>
-            _onVoiceControlsPanUpdate(details, stackHeight),
+            _onVoiceControlsPanUpdate(details, stackHeight, stackWidth),
+        onPanEnd: (_) => _onVoiceControlsPanEnd(stackWidth),
         onLongPressStart: (_) => _onVoiceLongPressStart(),
         onLongPressMoveUpdate: _onVoiceLongPressMoveUpdate,
         onLongPressEnd: (_) => _onVoiceLongPressEnd(),
@@ -2056,7 +2295,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 天气动效层：锚定相机按钮当前位置（拖拽跟随移动），宽度约 120dp 的
   /// 左侧窄条——不大面积遮挡对话区；整层 IgnorePointer 不拦截触摸。
   /// 天气未知（未查到/已关闭）或晴朗时不绘制任何内容。
-  Widget _buildWeatherOverlay(BuildContext context) {
+  Widget _buildWeatherOverlay(BuildContext context, double stackWidth) {
     return ValueListenableBuilder<WeatherInfo?>(
       valueListenable: WeatherService.current,
       builder: (context, weather, _) {
@@ -2071,10 +2310,19 @@ class _WebViewScreenState extends State<WebViewScreen>
             (_bodyHeight - height).clamp(0.0, double.infinity);
         final top = (_photoControlsTop + _photoControlHeight / 2 - height * 0.45)
             .clamp(0.0, maxTop);
+        // 水平锚定：天气正对相机正上方——动效区中心对齐相机按钮中心，跟随按钮
+        // 左右拖拽/边缘吸附。相机吸附到左/右边缘时动效区宽度收窄（最多收窄到
+        // 约按钮宽度），使动效区保持居中且不越出屏幕，避免旧代码把动效区推向
+        // 屏幕中心导致天气偏左/偏右偏离相机。
+        final photoLeft = _currentPhotoLeft(stackWidth);
+        final centerX = photoLeft + _photoControlWidth / 2;
+        final effectiveWidth = math.min(
+            width, math.min(2 * centerX, 2 * (stackWidth - centerX)));
+        final left = centerX - effectiveWidth / 2;
         return Positioned(
-          left: 0,
+          left: left,
           top: top,
-          width: width,
+          width: effectiveWidth,
           height: height,
           child: IgnorePointer(
             child: WeatherOverlay(kind: weather.kind),
@@ -2104,7 +2352,8 @@ class _InstanceChip extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.only(right: 4),
       child: Chip(
-        avatar: Icon(Icons.swap_horiz, size: 16, color: color),
+        // 服务器图标标识"实例/主机"，避免与顶栏绿色模式切换图标撞脸
+        avatar: Icon(Icons.dns_outlined, size: 16, color: color),
         label: Text(
           label,
           style: const TextStyle(fontSize: 12),
@@ -2132,12 +2381,17 @@ class _MoonCameraButton extends StatefulWidget {
   const _MoonCameraButton({
     required this.sunSwitchEnabled,
     required this.onPressed,
+    this.showMicBadge = false,
   });
 
   /// 日出日落联动开关（设置页可关；关闭 = 始终真实月相）。
   final bool sunSwitchEnabled;
 
   final VoidCallback onPressed;
+
+  /// 是否显示麦克风图标（语音并入相机开启时显示，放在相机图标正下方，
+  /// 提示该按钮支持长按说话）。
+  final bool showMicBadge;
 
   @override
   State<_MoonCameraButton> createState() => _MoonCameraButtonState();
@@ -2179,6 +2433,8 @@ class _MoonCameraButtonState extends State<_MoonCameraButton> {
     final sun = widget.sunSwitchEnabled
         ? SunTimes.compute(nowUtc, MoonLocation.observer.value)
         : null;
+    // 月相/日照提示文案；语音并入相机开启时禁用 tooltip（长按=语音），
+    // 避免长按弹出月相提示干扰按住说话。
     final tooltip = dayMode
         ? '添加图片/拍照（视觉工具）·白天·日光模式'
             '${_hm(sun?.sunriseUtc)}~${_hm(sun?.sunsetUtc)}'
@@ -2187,7 +2443,6 @@ class _MoonCameraButtonState extends State<_MoonCameraButton> {
             '·照明 ${(obs.illumination * 100).round()}%'
             '·农历${_lunarDayOf(now)}'
             '·观测${MoonLocation.observerLabel}';
-    // 月相按钮不承担长按说话（入口在右侧语音按钮），tooltip 可放心使用。
     return SizedBox(
       width: 48,
       height: 48,
@@ -2212,18 +2467,44 @@ class _MoonCameraButtonState extends State<_MoonCameraButton> {
         ),
         child: CustomPaint(
           painter: MoonPhasePainter(phase, tilt),
+          // 相机图标居中；语音并入相机时麦克风放在相机图标正下方，
+          // 不加彩色圆底、颜色与相机图标一致（随月相亮暗切换），合二为一。
           child: Center(
-            child: IconButton(
-              tooltip: tooltip,
-              icon: Icon(
-                Icons.camera_alt_outlined,
-                color: lit >= 0.5
-                    ? const Color(0xFF1565C0) // 亮面：深蓝图标
-                    : Colors.white, // 暗面：白色图标
+            child: SizedBox(
+              width: 48,
+              height: 48,
+              child: Stack(
+                clipBehavior: Clip.none,
+                alignment: Alignment.center,
+                children: [
+                  IconButton(
+                    // 语音并入相机时禁用 tooltip：长按留给语音，不弹月相提示。
+                    tooltip: widget.showMicBadge ? null : tooltip,
+                    icon: Icon(
+                      Icons.camera_alt_outlined,
+                      color: lit >= 0.5
+                          ? const Color(0xFF1565C0) // 亮面：深蓝图标
+                          : Colors.white, // 暗面：白色图标
+                    ),
+                    iconSize: 22,
+                    visualDensity: VisualDensity.compact,
+                    onPressed: widget.onPressed,
+                  ),
+                  // 麦克风直接放在相机图标正下方：只画图标本身（无彩色圆底），
+                  // 颜色与相机图标一致、随月相亮暗切换，与相机合二为一。
+                  if (widget.showMicBadge)
+                    Positioned(
+                      top: 35,
+                      child: Icon(
+                        Icons.mic,
+                        size: 12,
+                        color: lit >= 0.5
+                            ? const Color(0xFF1565C0)
+                            : Colors.white,
+                      ),
+                    ),
+                ],
               ),
-              iconSize: 22,
-              visualDensity: VisualDensity.compact,
-              onPressed: widget.onPressed,
             ),
           ),
         ),
