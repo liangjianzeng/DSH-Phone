@@ -1073,6 +1073,10 @@ class _WebViewScreenState extends State<WebViewScreen>
           a.sshPort != b.sshPort ||
           a.username != b.username ||
           a.localPort != b.localPort ||
+          // remotePort（远端服务端口）与 mode（DSH/Zcode 转发目标）也走
+          // 隧道转发：漏比会导致设置页改完返回"无变化"不重连，旧目标继续用
+          a.remotePort != b.remotePort ||
+          a.mode != b.mode ||
           a.authType != b.authType ||
           a.password != b.password ||
           a.privateKeyPem != b.privateKeyPem ||
