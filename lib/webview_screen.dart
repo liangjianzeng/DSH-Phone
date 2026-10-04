@@ -1446,14 +1446,27 @@ class _WebViewScreenState extends State<WebViewScreen>
     // 等 React 同步文本、发送按钮变为可点（DSH 富文本编辑器异步更新）
     await Future<void>.delayed(const Duration(milliseconds: 400));
     if (!mounted) return false;
-    // 再触发发送
-    final send = await c.evaluateJavascript(
-        source: "window.__dshComposerBridge.send()") as Object?;
-    if (send is Map && send['ok'] == true) {
-      debugPrint('[DSH] composer text sent via ${send['via']}');
-      return true;
+    // 再触发发送；按钮暂不可用（页面文本同步慢）时再等一拍重试一次
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final send = await c.evaluateJavascript(
+          source: "window.__dshComposerBridge.send()") as Object?;
+      if (send is Map && send['ok'] == true) {
+        debugPrint('[DSH] composer text sent via ${send['via']}');
+        return true;
+      }
+      // 空 Map（无 ok/error 键）：页面自带 async send 的 Promise 被 Android
+      // WebView 序列化为 {}——发送副作用已同步启动，按已发送处理。
+      if (send is Map && send.containsKey('ok') == false) {
+        debugPrint('[DSH] composer send promise (async page bridge)');
+        return true;
+      }
+      final err = (send as Map?)?['error']?.toString() ?? '';
+      final busy = err.contains('暂不可用');
+      debugPrint('[DSH] composer send failed: $err');
+      if (!busy || attempt == 1) return false;
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+      if (!mounted) return false;
     }
-    debugPrint('[DSH] composer send failed: ${(send as Map?)?['error']}');
     return false;
   }
 
