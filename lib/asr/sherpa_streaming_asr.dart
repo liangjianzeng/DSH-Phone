@@ -10,6 +10,7 @@ import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 import '../config.dart';
 import 'asr_engine.dart';
 import 'asr_model_manager.dart';
+import 'hotword_corrector.dart';
 
 /// 端侧流式识别引擎：sherpa-onnx 流式 Zipformer（zh int8，chunk-16）。
 ///
@@ -19,15 +20,16 @@ import 'asr_model_manager.dart';
 ///   经 [partialText] 广播（endpoint 静音断句后自动定稿并继续监听）。
 /// - 输出无标点（流式 transducer 特性），注入后可再编辑。
 ///
-/// 识别增强档位（[ensureLoaded] 的 [enhanced]）：
+/// 识别增强档位（[ensureLoaded] 的 [enhanced]）与热词：
 /// - sherpa-onnx 流式（Online）API 不支持 LM（LM 仅在离线 API 可用），
-///   因此增强档位在同一模型上启用 beam search + 热词 + blankPenalty：
+///   因此增强档位在同一模型上启用 beam search + blankPenalty：
 ///   - 解码 greedy_search → modified_beam_search（maxActivePaths 加大）；
-///   - 热词：每次按住说话从设置读取热词表（[SSHConfig.loadHotwords]），
-///     经 per-stream [sherpa.OnlineRecognizer.createStream] 传入解码器；
 ///   - blankPenalty 抑制静音过度吞字。
-///   不新增下载、体积不变、流式实时出字不变。切换档位会重载识别器；
-///   修改热词表即时生效（下次按住说话即用新热词，无需重载）。
+/// - 热词两路（详见 [HotwordCorrector]）：词表内热词经 per-stream
+///   [sherpa.OnlineRecognizer.createStream] 交 ContextGraph 偏置（需 beam，
+///   故有词表内热词时标准档也自动切 beam）；词表外生僻字热词（模型打不出
+///   的字）在输出端做同音后校正。每次按住说话从设置读最新热词表，改热词
+///   即时生效。
 class SherpaStreamingAsr implements StreamingAsrEngine {
   SherpaStreamingAsr._(this.modelDir, this.enhanced);
 
@@ -38,12 +40,15 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
 
   static sherpa.OnlineRecognizer? _recognizer;
 
-  /// 已加载识别器对应的增强档位（切换档位时据此重载）。
-  static bool? _loadedEnhanced;
+  /// 已加载识别器的形态签名（enhanced/hotwords/greedy，见 ensureLoaded）。
+  static String? _loadedSignature;
 
   final AudioRecorder _recorder = AudioRecorder();
   StreamSubscription<Uint8List>? _pcmSub;
   sherpa.OnlineStream? _stream;
+
+  /// 词表外生僻字热词的同音后校正器（start 时按最新热词表配置）。
+  final HotwordCorrector _corrector = HotwordCorrector();
 
   /// endpoint 静音断句后已定稿的文本（多次断句顺序拼接）。
   final StringBuffer _segments = StringBuffer();
@@ -59,12 +64,17 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
   /// 否则抛 [StateError]。同档位幂等（进程内一次）；切换 [enhanced] 档位
   /// 会释放旧识别器并重新加载。
   static Future<void> ensureLoaded(String modelDir,
-      {bool enhanced = false}) async {
-    if (_recognizer != null && _loadedEnhanced == enhanced) return;
+      {bool enhanced = false, bool hotwordsActive = false}) async {
+    // 加载形态签名：仅增强 / 仅热词（也需 beam）/ 纯贪心。任一变化重载，
+    // 相同签名幂等——start() 每次可放心调用做档位对齐。
+    final signature =
+        enhanced ? 'enhanced' : (hotwordsActive ? 'hotwords' : 'greedy');
+    if (_recognizer != null && _loadedSignature == signature) return;
     // FFI 绑定必须先初始化（Flutter 走 DynamicLibrary.process()），
     // 否则 OnlineRecognizer 抛 "Please initialize sherpa-onnx first"。
     sherpa.initBindings();
     final sw = Stopwatch()..start();
+    final beam = enhanced || hotwordsActive;
     final recognizer = sherpa.OnlineRecognizer(sherpa.OnlineRecognizerConfig(
       model: sherpa.OnlineModelConfig(
         transducer: sherpa.OnlineTransducerModelConfig(
@@ -73,15 +83,19 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
           joiner: '$modelDir/joiner.int8.onnx',
         ),
         tokens: '$modelDir/tokens.txt',
+        // 热词编码单元：本模型词表为字符级（含 byte fallback），cjkchar 让
+        // EncodeHotwords 把热词逐字切分成 token；缺省空串会让热词编码直接
+        // 失败（1.13.8 EncodeHotwords 实测）。
+        modelingUnit: 'cjkchar',
         numThreads: 2,
         provider: 'cpu',
         debug: false,
       ),
-      // 增强档位：beam search + 热词 + blankPenalty；标准档位保持 greedy。
-      // 热词不在此配置（文件热词），改为每次按住说话 per-stream 传入，
-      // 这样设置里改热词即时生效、无需重载识别器。
-      decodingMethod: enhanced ? 'modified_beam_search' : 'greedy_search',
-      maxActivePaths: enhanced ? 16 : 4,
+      // 热词（ContextGraph 偏置）只在 modified_beam_search 下生效（1.13.8
+      // 源码 InitOnlineStream 实测，greedy 静默忽略）——因此"有词表内热词"
+      // 的标准档位同样切 beam（8 路，开销可控）。
+      decodingMethod: beam ? 'modified_beam_search' : 'greedy_search',
+      maxActivePaths: enhanced ? 16 : 8,
       hotwordsScore: 3.0,
       blankPenalty: enhanced ? 0.5 : 0.0,
       enableEndpoint: true,
@@ -92,8 +106,8 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
     ));
     _recognizer?.free();
     _recognizer = recognizer;
-    _loadedEnhanced = enhanced;
-    debugPrint('[DSH][asr] recognizer loaded (enhanced=$enhanced) '
+    _loadedSignature = signature;
+    debugPrint('[DSH][asr] recognizer loaded ($signature) '
         'in ${sw.elapsedMilliseconds}ms');
   }
 
@@ -138,18 +152,25 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
 
   @override
   Future<void> start() async {
+    _stopped = false;
+    _segments.clear();
+    // 从设置读取热词表（改动即时生效，无需重载识别器），归一化后分流
+    // （sherpa 按换行切分每个热词，逗号连写会被当成一个整体热词而失效）：
+    // - 词表内热词 → beam 解码器 ContextGraph 偏置（识别器若是 greedy，
+    //   按 hotwords 档位自动重载，标准档也会升级为轻量 beam）；
+    // - 词表外生僻字热词（如「彤/熠」等名字用字，模型物理打不出）→
+    //   识别输出做同音后校正（见 HotwordCorrector）。
+    final hotwordList = _normalizeHotwords(await SSHConfig.loadHotwords());
+    await _corrector.configure(modelDir, hotwordList);
+    await ensureLoaded(modelDir,
+        enhanced: enhanced,
+        hotwordsActive: _corrector.decoderHotwords.isNotEmpty);
     final recognizer = _recognizer;
     if (recognizer == null) {
       throw StateError('sherpa recognizer not loaded');
     }
-    _stopped = false;
-    _segments.clear();
-    // 从设置读取热词表，per-stream 传给解码器（改热词即时生效）：
-    // 标准与增强档位都会应用勾选/自定义的热词，保证自定义人名等词优先识别。
-    // 热词归一化为逐词换行分隔（sherpa 按换行切分每个热词，逗号连写会被
-    // 当成一个整体热词而失效）；空表则走默认无热词路径。
-    final hotwordList = _normalizeHotwords(await SSHConfig.loadHotwords());
-    _stream = recognizer.createStream(hotwords: hotwordList.join('\n'));
+    _stream = recognizer.createStream(
+        hotwords: _corrector.decoderHotwords.join('\n'));
     final pcmStream = await _recorder.startStream(const RecordConfig(
       encoder: AudioEncoder.pcm16bits,
       sampleRate: 16000,
@@ -182,7 +203,9 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
       text = _segments.toString();
       debugPrint('[DSH][asr] endpoint, segment=$segment');
     }
-    if (!_partialCtrl.isClosed) _partialCtrl.add(text.trim());
+    if (!_partialCtrl.isClosed) {
+      _partialCtrl.add(_corrector.apply(text).trim());
+    }
   }
 
   void _decodeDrain(sherpa.OnlineRecognizer recognizer,
@@ -214,8 +237,9 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
       stream.free();
     }
     _stream = null;
-    debugPrint('[DSH][asr] session stop, final=${finalText.length} chars');
-    return finalText.trim();
+    final corrected = _corrector.apply(finalText).trim();
+    debugPrint('[DSH][asr] session stop, final=${corrected.length} chars');
+    return corrected;
   }
 
   @override
@@ -227,13 +251,13 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
   /// 静态文本快照（浮层展示当前累计文本用）。
   String get currentText => _segments.toString();
 
-  /// 把热词表归一化为逐词换行分隔：兼容用户以逗号/换行/全角逗号混填的词表，
-  /// 去掉空串与重复项——sherpa 按换行切分每个热词，逗号连写会被当成一个
-  /// 整体热词导致不生效。
+  /// 把热词表归一化为逐词列表：兼容用户以逗号/斜杠/换行/全角逗号混填的词表，
+  /// 去掉空串与重复项——sherpa 按换行（含 '/'，CreateStream 会把斜杠转义成
+  /// 换行）切分每个热词，逗号连写会被当成一个整体热词导致不生效。
   static List<String> _normalizeHotwords(String raw) {
     final seen = <String>{};
     final out = <String>[];
-    for (final w in raw.split(RegExp(r'[,，\n\r]'))) {
+    for (final w in raw.split(RegExp(r'[,，/\n\r]'))) {
       final t = w.trim();
       if (t.isNotEmpty && seen.add(t)) out.add(t);
     }

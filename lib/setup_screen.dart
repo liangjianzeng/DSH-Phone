@@ -1189,7 +1189,9 @@ class _SetupScreenState extends State<SetupScreen> {
               padding: EdgeInsets.only(left: 16, right: 16, bottom: 8),
               child: Text(
                 '勾选/自定义的中文词会被优先识别（标准与增强档位均生效）；'
-                '每类可单独编辑词表。勾选越多解码越慢，建议只启用常用分类。',
+                '含模型词表外生僻字（如人名用字「彤/熠」）的热词自动做同音'
+                '校正：识别出同音词（如「大同小异」）时输出替换为热词。'
+                '勾选越多解码越慢，建议只启用常用分类。',
                 style: TextStyle(color: Colors.grey, fontSize: 12),
               ),
             ),

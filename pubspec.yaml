@@ -72,6 +72,10 @@ dependencies:
   share_plus: ^11.0.0
   # 下载保存文件名：当前时间 MD5 后 6 位指纹（避免同名覆盖）。
   crypto: ^3.0.3
+  # 热词同音校正：词表外生僻字热词（如人名用字）按拼音匹配替换识别结果。
+  lpinyin: ^2.0.3
+  # 按字素切分字符串（热词逐字处理，emoji/代理对安全）。
+  characters: ^1.3.0
 
 dependency_overrides:
   # 本地 fork 的 dartssh2：优化解密（processAll 批处理）+ 启用 zlib 压缩，

@@ -495,36 +495,67 @@ const String composerBridgeJs = r'''
     // 直接发送消息：先找明确的发送按钮点击，否则对 textarea/input 派发
     // 发送消息：DSH 消息框是 contenteditable 富文本编辑器，发送走"发送消息"
     // 按钮点击（或 Enter 合成键）。失败返回 {ok:false} + 诊断，由 Flutter 提示。
+    //
+    // 匹配纪律（真机踩坑 2026-10-04）：绝不能拿任意按钮的 textContent 子串
+    // 匹配"发送/send"——zcode 页面的 #todoBar（role=button，任务计划条）正文
+    // 含动态 todo 文本，todo 里出现过 "send-now 端点" 就会让语音发送误点它
+    // （todoBar 在 DOM 中排在发送按钮之前），消息留在输入框不发、App 还收到
+    // {ok:true}。因此：id/aria 可靠（发送按钮 id=btnSend、aria=发送），短文本
+    // 匹配仅限真实 <button>；role=button 容器只认 id/aria。
     send: function() {
       try {
-        // 策略 1：发送按钮（文本/aria/class 含"发送"/"send"，排除取消发送）
+        function visible(el) {
+          return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+        }
         var candidates = document.querySelectorAll(
             'button, [role="button"], [role="link"]');
         var disabledBtn = null;
+        var byIdOrAria = null;
+        var byShortText = null;
         for (var i = 0; i < candidates.length; i++) {
           var b = candidates[i];
-          var txt = (b.textContent || '').trim();
+          var id = b.id || '';
           var aria = b.getAttribute('aria-label') || '';
-          var cls = b.className || '';
-          var label = (txt + ' ' + aria + ' ' + cls).toLowerCase();
-          if (label.indexOf('取消发送') >= 0 || label.indexOf('cancelsend') >= 0) continue;
-          if (label.indexOf('发送') >= 0 || label.indexOf('send') >= 0) {
-            if (b.disabled) {
-              if (disabledBtn === null) disabledBtn = b;
-              continue;
-            }
-            // mousedown/mouseup 提高框架合成事件命中率，再 click
-            try { b.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
-            try { b.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
-            b.click();
-            return { ok: true, via: 'button' };
+          var txt = (b.textContent || '').trim();
+          var cls = typeof b.className === 'string' ? b.className : '';
+          // 打断/取消/停止类控件永不作为发送目标（运行中误点会杀掉当前回合）
+          var allLabel = (id + ' ' + aria + ' ' + txt).toLowerCase();
+          if (allLabel.indexOf('取消发送') >= 0 || allLabel.indexOf('cancelsend') >= 0 ||
+              allLabel.indexOf('停止') >= 0 || allLabel.indexOf('打断') >= 0) continue;
+          // 不可见元素跳过：隐藏面板里残留的旧文本同样会误匹配
+          if (!visible(b)) continue;
+          var hitIdOrAria = /send/i.test(id) ||
+              aria.indexOf('发送') >= 0 || /send/i.test(aria);
+          // 短文本命中仅限真实 <button>（todoBar 这类 role=button 容器的
+          // textContent 是任意动态正文，不可作为匹配依据）
+          var isRealButton = (b.tagName || '').toUpperCase() === 'BUTTON';
+          var shortText = txt.length <= 16 && txt.indexOf('\n') < 0;
+          var hitShortText = isRealButton && shortText &&
+              (txt.indexOf('发送') >= 0 || /send/i.test(txt) || /send/i.test(cls));
+          if (!hitIdOrAria && !hitShortText) continue;
+          if (b.disabled) {
+            if (disabledBtn === null) disabledBtn = b;
+            continue;
+          }
+          if (hitIdOrAria) {
+            if (byIdOrAria === null) byIdOrAria = b;
+          } else if (byShortText === null) {
+            byShortText = b;
           }
         }
-        // 策略 2：找到发送按钮但处于禁用（文本同步中/空）→ 明确提示
+        var target = byIdOrAria || byShortText;
+        if (target !== null) {
+          // mousedown/mouseup 提高框架合成事件命中率，再 click
+          try { target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); } catch (e) {}
+          try { target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (e) {}
+          target.click();
+          return { ok: true, via: 'button' };
+        }
+        // 找到发送按钮但处于禁用（文本同步中/空）→ 明确提示
         if (disabledBtn !== null) {
           return { ok: false, error: '发送按钮暂不可用（文本同步中），请稍候或手动发送' };
         }
-        // 策略 3：contenteditable 富文本 → 派发 Enter 合成键（尽力而为）
+        // contenteditable 富文本 → 派发 Enter 合成键（尽力而为）
         var el = findComposer();
         if (el) {
           el.dispatchEvent(new KeyboardEvent('keydown', {
