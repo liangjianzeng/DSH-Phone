@@ -78,6 +78,13 @@ class TunnelService {
   /// 当前激活实例的配置（用于上传目录等需要用户名的回退策略）。
   SSHConfig? _activeConfig;
 
+  /// 已建立的转发连接（本地侧 Socket）。模式切换时必须全部销毁：WebView
+  /// 按 127.0.0.1:<localPort> 复用 HTTP keep-alive 连接，而每条 TCP 连接在
+  /// 建立时已固定转发到"当时"的远端端口——不销毁的话，切换后复用的旧连接
+  /// 会把请求送到另一台服务上（DSH⇄Zcode token 互不认，报「token 无效」，
+  /// 多切几次连接池里全是错配连接，必现）。
+  final Set<Socket> _forwardConns = {};
+
   TunnelStatus _status = TunnelStatus.idle;
   TunnelStatus get status => _status;
 
@@ -253,6 +260,8 @@ class TunnelService {
     final server = _server;
     _server = null;
     server?.close();
+    // 已建立的转发连接随 SSH channel 关闭自然结束，集合显式清空防残留
+    _forwardConns.clear();
 
     _setStatus(failed ? TunnelStatus.failed : TunnelStatus.disconnected);
   }
@@ -265,13 +274,23 @@ class TunnelService {
   /// 就地更新当前隧道的转发目标配置（不重建 SSH 会话）。
   ///
   /// 转发通道按连接逐条拨号 [_activeConfig.remotePort]（见 _handleForward），
-  /// 因此同实例内切换服务模式（DSH 3080 ⇄ Zcode 8787）只需更新内存配置，
-  /// 新连接即走新端口，无需断开重连。仅当 [profileIndex] 与当前激活实例
-  /// 一致时生效，防止迟到的旧实例调用串线。
+  /// 因此同实例内切换服务模式（DSH 3080 ⇄ Zcode 8787）只需更新内存配置。
+  /// 但已建立的连接仍固定转发到旧端口，必须全部销毁，迫使 WebView 用新
+  /// 端口重建连接，否则复用的 keep-alive 连接会把请求送到旧服务上。
+  /// 仅当 [profileIndex] 与当前激活实例一致时生效，防止迟到的旧实例调用串线。
   void updateActiveConfig(SSHConfig config, {int? profileIndex}) {
-    if (_client == null) return;
     if (profileIndex != null && profileIndex != _activeProfileIndex) return;
     _activeConfig = config;
+    if (_client == null) return;
+    var killed = 0;
+    for (final s in Set<Socket>.of(_forwardConns)) {
+      s.destroy();
+      killed++;
+    }
+    _forwardConns.clear();
+    if (killed > 0) {
+      debugPrint('[DSH] mode switch: destroyed $killed stale forward conn(s)');
+    }
   }
 
   Future<void> _handleForward(Socket local) async {
@@ -280,6 +299,10 @@ class TunnelService {
       local.destroy();
       return;
     }
+    _forwardConns.add(local);
+    unawaited(local.done
+        .whenComplete(() => _forwardConns.remove(local))
+        .catchError((Object _) => _forwardConns.remove(local)));
     try {
       // 远端服务监听 127.0.0.1:<remotePort>（DSH Web UI=3080 / zcode-phone-server=8787）
       final forward = await client
