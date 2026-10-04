@@ -78,6 +78,25 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 
 ---
 
+## zcode-phone-server 位置（2026-10-04 迁移）
+
+- **桥接服务已迁入本项目**：`E:\DTXY\DSH-Phone\zcode-phone-server\`（原来是 `E:\DTXY\zcode-phone-server`，旧路径已不存在）。
+- 它是**独立 git 仓库**（嵌套在 DSH-Phone 下），已加入 DSH-Phone `.gitignore`（`/zcode-phone-server/`），不要在 DSH-Phone 仓库里提交它。
+- 启动：`cd E:\DTXY\DSH-Phone\zcode-phone-server && node server.mjs`（监听 `127.0.0.1:8787`，token 见启动日志/配置）。也可用 `start.bat`。
+- 其提交记录在 zcode-phone-server 自己的仓库里（如 PAGE_BUILD '2026-10-04.10' 等前端改动），不要去 DSH-Phone 仓库找。
+- 手机的 WebView 页面缓存是**刻意保留的**（用户明确要求），主文档带 `Cache-Control: no-cache` 请求头保证鉴权链路不缓存。
+
+---
+
+## 语音自动发送踩坑：发送按钮匹配纪律（2026-10-04，commit 13b65a0）
+
+- **现象**：语音松手后消息留在 ZCode 输入框不发送，App 却提示「已发送」。
+- **根因**：`webview_bridges.dart` composerBridgeJs 的 `send()` 曾对页面**所有** button/[role=button] 按 `textContent` 子串匹配「发送/send」并点击第一个命中。zcode 页面 `#todoBar`（role=button 任务计划条，DOM 顺序先于 `#btnSend`）正文是动态 todo 文本——todo 出现 "send-now 端点" 即被误点（展开/收起 todos），且桥返回 `{ok:true, via:'button'}`。
+- **修复纪律**：匹配只认 `id`/`aria-label`（btnSend/aria=发送）；短文本(≤16字)命中仅限真实 `<button>` 标签，role=button 容器绝不按正文匹配；排除「停止/打断/取消发送」；隐藏元素（offsetWidth/Height/ClientRects 全 0）跳过。
+- **验证手段**：puppeteer-core + 本机 zcode-phone-server(8787) 加载真实页面，注入 Dart 源里提取的桥 JS，监听 capture 阶段 click 落点 + 拦截 /api 请求——比静态读代码可靠，前端桥逻辑改动建议沿用此法（测试脚本在 /tmp/bridgetest）。
+
+---
+
 ## 质量整改记录（2026-09 体检整改，commit 2360f85）
 
 - **主机密钥 TOFU**：`tunnel_service.dart` 不再无条件信任主机密钥。指纹按 `host:port+算法` 存 SharedPreferences（键 `ssh_hostkey_*`）；首次记录、后续比对、不匹配拒绝并提示。服务器重装/换密钥后：设置页「清除指纹」按钮（`TunnelService.clearHostKeyFingerprints()`）清除后重新记录。
