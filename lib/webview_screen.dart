@@ -1832,7 +1832,7 @@ class _WebViewScreenState extends State<WebViewScreen>
       tooltip: '切换连接实例',
       onSelected: _switchInstance,
       child: _InstanceChip(
-        label: '${_activeIndex + 1} · ${_config.label}',
+        label: _config.label,
         status: _tunnelStatus,
       ),
       itemBuilder: (context) => [
@@ -1849,7 +1849,7 @@ class _WebViewScreenState extends State<WebViewScreen>
                 ),
                 const SizedBox(width: 8),
                 Expanded(
-                  child: Text('实例${i + 1} · ${_profiles[i].label}'),
+                  child: Text(_profiles[i].label),
                 ),
               ],
             ),
