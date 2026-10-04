@@ -1109,7 +1109,16 @@ class _WebViewScreenState extends State<WebViewScreen>
     // 隧道未连接或 controller 已失效时跳过，避免 MissingPluginException
     if (c == null || _tunnelStatus != TunnelStatus.connected) return;
     try {
-      await c.loadUrl(urlRequest: URLRequest(url: WebUri(_targetUrl)));
+      await c.loadUrl(
+        urlRequest: URLRequest(
+          url: WebUri(_targetUrl),
+          // 主文档必须绕过缓存：DSH/Zcode 的 token 只出现在主文档 URL 上，
+          // 命中旧缓存会跳过「token→303→Set-Cookie」鉴权链，SPA 的 XHR
+          // 带着旧签名 cookie 全部报「token 无效」（模式热切换实测复现，
+          // 冷启动因缓存冷恰好走了鉴权链而正常）。
+          headers: {'Cache-Control': 'no-cache'},
+        ),
+      );
     } catch (_) {
       // controller 可能已失效，忽略
     }
