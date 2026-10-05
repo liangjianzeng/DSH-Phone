@@ -70,3 +70,6 @@ apk/
 analyze_out.txt
 screen1.png
 build_release_log.txt
+
+# zcode-phone-server 桥接服务（独立 git 仓库，嵌套在本项目下）
+/zcode-phone-server/

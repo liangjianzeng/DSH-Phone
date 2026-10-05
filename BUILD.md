@@ -14,6 +14,8 @@
 
 ## 版本记录
 
+- **v0.2.1（build 17）**：DSH ⇄ Zcode 双服务模式 + 语音/相机/天气体验与稳定性。
+- **v0.2.0（build 16）**：语音输入重构为端侧流式 ASR（sherpa-onnx 流式 Zipformer）。
 - **v0.1.8（build 14）**：Unsloth Studio 远程加载 + DSH Token 鉴权适配。
 - **v0.1.7（build 13）**：真实月相天文模型 + 锁屏任务通知。
 - **v0.1.6（build 12）**：图片直传（视觉工具入口）。

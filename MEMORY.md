@@ -104,3 +104,21 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 - **APK 不再提交 Git**：`apk/` 已入 `.gitignore`，历史版本上传 GitHub Releases；本地构建产物仍为 `build/app/outputs/flutter-apk/app-release.apk`。
 - **测试与 CI**：`test/` 有 4 个单元测试（artifact_recognizer / moon_astronomy / config / download）；`.github/workflows/ci.yml` 跑 analyze+test（Flutter 3.27.0/stable 矩阵），打 tag 自动构建 APK 并上传 Releases。
 - **版本号（单一来源）**：`pubspec.yaml` 的 `version` 是唯一版本来源（构建 versionName/versionCode）。「关于」对话框经 `package_info_plus` 运行时读取构建产物显示（如 `v0.1.9 (build 15)`），不再手工维护常量；`lib/config.dart` 的 `fallbackAppVersion` 仅在读取失败时兜底。发版时同步：pubspec `version` + README 顶部「当前版本」+ config `fallbackAppVersion`（兜底，正常 release 可不动）。
+
+---
+
+## 手机端"看不见智能体在做什么"：完成态工具行摘要被 CSS 藏掉（2026-10-04）
+
+- **现象**：手机会话页一回合只剩「终端✓ / 思考」占位行，用户完全看不出执行了什么；提问行只剩红色「AskUserQuestion」连问题文本都没有。
+- **根因**：`zcode-phone-server/public/index.html` 此前为避免"命令行夹杂"观感，用 `.tool.completed .tdesc { display:none }` 有意隐藏了完成态摘要（inputSummary 数据一直在，只是被藏）；且 `inputSummary` 不认识 AskUserQuestion 的 `questions[].question`，提问行 desc 为空。
+- **修复**：完成态恢复摘要（压暗 var(--faint) + 省略号截断，完整输入仍在展开卡片）；删除 setToolStatus 里配套的"摘要补进详情体首行"补偿逻辑；`inputSummary` 增加 `questions[0].question` 兜底。
+- **验证/部署注意**：server.mjs 对 `/` 每次请求都 `fs.readFileSync` index.html（约 :1700），改页面**无需重启**；页面经 /api/state 的构建指纹（md5 前 8 位）比对自动 reload，手机端下一次轮询即生效。
+
+---
+
+## 对话过程大量重复输出：正文"直播块 vs 落库副本"双路渲染无去重（2026-10-04）
+
+- **现象**：回合进行中同一段回复正文出现两块、同步增长，直到回合结束才合并——用户看到"很多重复的输出"。
+- **根因**：引擎（zcode.cjs）对同一回合**同时**发 `model.streaming`（token 直播）与 `part.upserted/part.delta`（部件落库）两类事件（引擎源码 grep 坐实）。页面把直播 token 画进 `__live-text` 累积块、把落库部件画成真实 partId 元素，两路都渲染。思考行早有"落库追平直播才交接"的去重（upserted 分支 + renderTail 长度比较），**正文 text 漏了同款处理**。
+- **修复**：新增 `settleLiveText(m)`（落库文本总长追平直播块前只记数据不渲染副本，追平即移除直播块）；挂在 part.upserted/part.delta/renderTail 三个正文入口；`model.streaming` 增加 hasReal 守卫（真实部件已接管就不再重建直播块，思考/正文同款）；part.delta 的 reasoning `!pe` 分支补上与 upserted 同款的直播去重。
+- **教训**：给"直播+落库"双通道页面加渲染路径时，两条通道必须同一时刻只渲染一份——新增部件类型（text/reasoning/tool）都要过一遍 settle 去重，漏一个就是"重复输出"类用户报告。
