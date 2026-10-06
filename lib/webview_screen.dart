@@ -199,6 +199,11 @@ class _WebViewScreenState extends State<WebViewScreen>
   String? _pageError; // 页面加载错误（区别于隧道错误 _error）
   Timer? _loadTimeoutTimer;
 
+  /// 页面处于错误态、待隧道恢复后需要重载。隧道不在位时页面重试必然
+  /// 再失败（ERR_CONNECTION_REFUSED 烧完重试次数只留死错误页），故把
+  /// 「重载」挂到隧道重连成功的事件上，而不是按固定间隔硬重试。
+  bool _pageNeedsReload = false;
+
   /// 鉴权错误（HTTP 401/403）：服务端 Token 鉴权未通过。此时不再自动重试，
   /// 错误页内嵌 Token 输入框，填完保存即重载（_targetUrl 会带上新 Token）。
   bool _authError = false;
@@ -384,8 +389,58 @@ class _WebViewScreenState extends State<WebViewScreen>
             'backgroundedMs=${bg == null ? '?' : DateTime.now().difference(bg).inMilliseconds}, '
             'tunnel=${TunnelService.instance.status}');
         _backgroundedAt = null;
+        // 后台期间系统随时可能掐断 SSH socket（甚至冻结整个进程）：
+        // 回前台先做健康检查，断了/僵死了就自动重建并重载页面，
+        // 而不是把 ERR_CONNECTION_REFUSED 死错误页留给用户手动重试。
+        unawaited(_recoverAfterResume());
       case AppLifecycleState.detached:
         break;
+    }
+  }
+
+  /// 回前台自愈：后台期间隧道断开/僵死时自动重建，页面错误态自动补载。
+  ///
+  /// 三个入口对应三种状态：
+  /// - 隧道已断/失败（自动重连次数可能已在后台烧完）：重置计数重新连接；
+  ///   重连成功 → `_onTunnelStatus` connected 分支自动重载错误页；
+  /// - 隧道重连进行中：什么都不做，成功/失败事件自会驱动后续；
+  /// - 隧道自称 connected 但 socket 可能已死（后台被系统冻结后
+  ///   ERR_CONNECTION_REFUSED 的典型来源）：探测本地转发端口，
+  ///   探不通强制重建；探得通只补载页面错误态。
+  Future<void> _recoverAfterResume() async {
+    final status = TunnelService.instance.status;
+    if (status == TunnelStatus.connecting) return; // 重连已在路上
+    if (status != TunnelStatus.connected) {
+      _manualConnect();
+      return;
+    }
+    final alive = await _probeLocalPort();
+    if (!mounted) return;
+    if (!alive) {
+      debugPrint('[DSH] resume probe: 本地转发端口探不通，强制重建隧道');
+      await TunnelService.instance.disconnect();
+      if (!mounted) return;
+      _manualConnect();
+    } else if (_pageError != null) {
+      _retryLoad();
+    }
+  }
+
+  /// 探测本地转发端口是否真的可连：隧道状态可能滞留 connected 而底层
+  /// socket 已死。任何 HTTP 响应（含 303/401 鉴权跳转）都算隧道活着。
+  Future<bool> _probeLocalPort() async {
+    final client = HttpClient();
+    client.connectionTimeout = const Duration(seconds: 4);
+    try {
+      final req = await client.getUrl(Uri.parse(_targetUrl));
+      final res = await req.close().timeout(const Duration(seconds: 4));
+      await res.drain<void>();
+      return true;
+    } catch (e) {
+      debugPrint('[DSH] resume probe failed: $e');
+      return false;
+    } finally {
+      client.close(force: true);
     }
   }
 
@@ -787,6 +842,12 @@ class _WebViewScreenState extends State<WebViewScreen>
     if (!_switching && isBreak) {
       _scheduleReconnect();
     }
+    // 隧道重连成功而页面还停在错误态（后台断连期间的
+    // ERR_CONNECTION_REFUSED / 加载超时）：立即重载，避免"回到前台
+    // 面对死错误页手动点重试"。
+    if (s == TunnelStatus.connected && _pageError != null) {
+      unawaited(_retryLoad());
+    }
   }
 
   /// 带守卫的自动重连：避免重复/并发重连造成死循环；连续失败达到
@@ -899,11 +960,16 @@ class _WebViewScreenState extends State<WebViewScreen>
       // WebView 只在 body 重建时用 initialUrlRequest 加载；同一实例内改
       // 模式/端口（设置保存返回，body 不重建）时页面仍是旧地址——曾因此
       // 在 Zcode 模式下残留 DSH 页面。校验实际地址，不一致就强制重载。
+      // 页面此前处于错误态（后台断连）也一并补载。
       try {
         final c = _controller;
         final current = (await c?.getUrl())?.toString();
-        if (c != null && current != null && current != _targetUrl) {
-          debugPrint('[DSH] page url mismatch ($current != ${_targetUrl.replaceAll(RegExp(r'token=[^&]+'), 'token=***')}), reloading');
+        if (c != null && current != null &&
+            (current != _targetUrl || _pageNeedsReload)) {
+          debugPrint('[DSH] page reload after connect '
+              '(urlMismatch=${current != _targetUrl}, pageNeedsReload=$_pageNeedsReload, '
+              'url=${current.replaceAll(RegExp(r'token=[^&]+'), 'token=***')})');
+          _pageNeedsReload = false;
           await _loadTargetUrl();
         }
       } catch (_) {
@@ -1707,6 +1773,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   void _onPageLoadStop() {
     _loadTimeoutTimer?.cancel();
     _pageRetryCount = 0;
+    _pageNeedsReload = false;
     if (!mounted) return;
     setState(() {
       _pageLoading = false;
@@ -1724,7 +1791,12 @@ class _WebViewScreenState extends State<WebViewScreen>
       _authError = false;
       _pageError = _appendQosHintIfTimeout(message);
     });
-    // 有限次自动重试：隧道若刚断连会自动重连，页面重载后自愈
+    _pageNeedsReload = true;
+    // 隧道不在位（断开/重连中）时页面重试必然再失败——连接被拒的错误页
+    // 就是这么留下来的。不烧重试次数，等隧道重连成功（_onTunnelStatus 的
+    // connected 分支 / _connect 成功路径）自动重载页面。
+    if (TunnelService.instance.status != TunnelStatus.connected) return;
+    // 有限次自动重试：隧道在位但页面偶发失败（HTTP 5xx/资源超时）可自愈
     _schedulePageRetry();
   }
 

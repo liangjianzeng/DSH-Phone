@@ -97,6 +97,29 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 
 ---
 
+## zcode 页面相机/上传注入失效：原生桥必须钉死防覆盖（2026-10-06）
+
+- **现象**：zcode 模式下相机控件拍照/传图毫无反应（App 侧桥还返回 `{ok:true}` 不报错），上传路径注入同受影响。
+- **根因**：zcode 页面（`zcode-phone-server/public/index.html`）本来就内置 `__dshComposerBridge`/`__dshPhotoBridge` 原生实现（拍照直进待发附件槽 `pendingImage`）；但 App 在每次 onLoadStop 无条件注入 DSH 通用版同名桥（photoBridgeJs 裸赋值覆盖），通用版拍照走「document 合成 drop」——DSH 页面有 drop 监听而 zcode 页面没有，事件落空且静默成功。
+- **修复（后台统一适配安卓前端，App 零改动）**：① 页面用 `Object.defineProperty(writable:false, configurable:false)` 把两个 DSH 命名桥钉死在 window，App 注入的裸赋值静默失败，原生实现恒胜出；② 页面补 document 级 `dragover`/`drop` 监听（含 Files 才 preventDefault，纯文本拖拽保留 textarea 原生行为），路由到 `handleFilePicked`——桌面拖文件与旧版 App 合成 drop 统一入口；③ `insertText` 语义对齐 DSH 版：光标处插入保留草稿（原实现整体替换会清掉用户已输入内容）。
+- **纪律**：zcode 页面今后新增 App 桥一律走 defineProperty 钉死，不能裸赋值 `window.__dshXxxBridge`。
+- **验证**：/tmp/bridgetest/test8.js（puppeteer-core 复刻 App 时序：页面加载→注入 Dart 源提取的通用桥→验证钉死未覆盖→pickImage/insertText/合成 drop/send 桩全链路 6 项 PASS）。注意 async 断言要在事件后 sleep 一拍再读 DOM（handleFilePicked 内有 await arrayBuffer）。
+- **🔴 重启红线**：**桌面端当前会话可能就跑在 zcode-phone-server 上**（`/api/sessions` 里 BUSY 的标题即当前对话）——会话进行中绝不能重启服务（restart_server.sh 只 watch 两个旧会话 id，不含当前会话，会把自己杀掉）。页面改动部署到手机**无需重启**：服务端每请求都从磁盘读 index.html 且主文档 no-cache，手机端重进页面即得新 JS；PAGE_BUILD 指纹仅影响自动 reload 提示，下次自然重启后自会更新。
+
+---
+
+## 后台断连自愈链路（2026-10-06，webview_screen.dart）
+
+- **现象**：App 退后台一会再回来，经常面对「无法加载远程界面 net::ERR_CONNECTION_REFUSED」死错误页，只能手动点重试。
+- **根因**：后台被系统掐断 SSH socket 后，页面重试（3 次×3s）在隧道退避重连（最长约 30s）完成前就烧完；且回前台时没有任何健康检查——隧道重连次数烧完停在 failed、或状态滞留 connected 而底层 socket 已死，两种情况都没人再触发恢复。
+- **自愈不变量（改这些路径前先读懂）**：
+  - `_onPageError`：隧道不在位时**不烧**页面重试次数，置 `_pageNeedsReload=true` 等隧道恢复；
+  - `_onTunnelStatus` 到 connected 且 `_pageError != null` → `_retryLoad()`（隧道恢复驱动页面重载的主路径）；
+  - `_connect()` 成功路径：URL 不匹配**或** `_pageNeedsReload` → 重载；
+  - `didChangeAppLifecycleState` resumed → `_recoverAfterResume()`：隧道非 connected 直接 `_manualConnect()`；自称 connected 先 `_probeLocalPort()`（HTTP 探测本地转发端口，任何响应含 303/401 都算活着），探不通强制重建隧道。
+
+---
+
 ## 质量整改记录（2026-09 体检整改，commit 2360f85）
 
 - **主机密钥 TOFU**：`tunnel_service.dart` 不再无条件信任主机密钥。指纹按 `host:port+算法` 存 SharedPreferences（键 `ssh_hostkey_*`）；首次记录、后续比对、不匹配拒绝并提示。服务器重装/换密钥后：设置页「清除指纹」按钮（`TunnelService.clearHostKeyFingerprints()`）清除后重新记录。
