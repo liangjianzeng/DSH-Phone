@@ -143,36 +143,68 @@ class _HoldOverlay extends StatelessWidget {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    // 就绪前不显示声浪（声浪 = 真正在监听的信号），改为
+                    // 加载指示 +「引擎加载中，请稍后…」；就绪后切回声浪 +
+                    // 松开手势提示。上滑取消提示优先级最高。
                     ValueListenableBuilder<bool>(
-                      valueListenable: session.cancelMode,
-                      builder: (_, cancelling, __) => Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          _ListeningIndicator(red: cancelling),
-                          const SizedBox(width: 10),
-                          Text(
-                            cancelling ? '松开取消' : '松开发送',
-                            style: TextStyle(
-                              color: cancelling
-                                  ? Colors.redAccent
-                                  : Colors.white,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ],
+                      valueListenable: session.ready,
+                      builder: (_, isReady, __) =>
+                          ValueListenableBuilder<bool>(
+                        valueListenable: session.cancelMode,
+                        builder: (_, cancelling, ___) {
+                          final loading = !isReady && !cancelling;
+                          final color =
+                              cancelling ? Colors.redAccent : Colors.white;
+                          return Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              if (loading) ...[
+                                const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                      strokeWidth: 2, color: Colors.white70),
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Text('引擎加载中，请稍后…',
+                                      textAlign: TextAlign.center,
+                                      style: TextStyle(
+                                          color: Colors.white70,
+                                          fontWeight: FontWeight.w600)),
+                                ),
+                              ] else ...[
+                                _ListeningIndicator(red: cancelling),
+                                const SizedBox(width: 10),
+                                Text(cancelling ? '松开取消' : '松开发送',
+                                    style: TextStyle(
+                                        color: color,
+                                        fontWeight: FontWeight.w600)),
+                              ],
+                            ],
+                          );
+                        },
                       ),
                     ),
                     const SizedBox(height: 10),
-                    ValueListenableBuilder<String>(
-                      valueListenable: session.partial,
-                      builder: (_, text, __) => ConstrainedBox(
-                        constraints: const BoxConstraints(minHeight: 48),
-                        child: Align(
-                          alignment: Alignment.topLeft,
-                          child: Text(
-                            text.isEmpty ? '请说话…' : text,
-                            style: const TextStyle(
-                                color: Colors.white, fontSize: 15, height: 1.4),
+                    ValueListenableBuilder<bool>(
+                      valueListenable: session.ready,
+                      builder: (_, isReady, __) =>
+                          ValueListenableBuilder<String>(
+                        valueListenable: session.partial,
+                        builder: (_, text, ___) => ConstrainedBox(
+                          constraints: const BoxConstraints(minHeight: 48),
+                          child: Align(
+                            alignment: Alignment.topLeft,
+                            child: Text(
+                              !isReady
+                                  ? '首次使用需加载识别模型，稍等片刻…'
+                                  : (text.isEmpty ? '请说话…' : text),
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 15,
+                                  height: 1.4),
+                            ),
                           ),
                         ),
                       ),
