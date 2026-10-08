@@ -73,3 +73,6 @@ build_release_log.txt
 
 # zcode-phone-server 桥接服务（独立 git 仓库，嵌套在本项目下）
 /zcode-phone-server/
+
+# workbuddy-phone-server bridge service (nested independent project, do not commit)
+/workbuddy-phone-server/

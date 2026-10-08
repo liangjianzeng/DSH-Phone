@@ -906,24 +906,14 @@ class _WebViewScreenState extends State<WebViewScreen>
     _connect();
   }
 
-  /// 顶栏模式一键切换：同实例内翻转 DSH/Zcode。端口若仍是另一模式的默认值
-  /// 则落到本模式默认值（自定义端口保留），持久化后重载页面。
-  ///
-  /// 同一台服务器的两种模式只是转发目标端口不同（DSH 3080 / Zcode 8787），
-  /// SSH 会话原样保留——转发通道按连接逐条拨号 _activeConfig.remotePort，
-  /// 就地更新内存配置后新连接自动走新端口，无需断开重连。
-  Future<void> _toggleMode() async {
-    final newMode =
-        _config.isZcodeMode ? SSHConfig.modeDsh : SSHConfig.modeZcode;
-    var newPort = _config.remotePort;
-    if (newMode == SSHConfig.modeZcode &&
-        newPort == SSHConfig.defaultRemotePort) {
-      newPort = SSHConfig.defaultZcodeRemotePort;
-    } else if (newMode == SSHConfig.modeDsh &&
-        newPort == SSHConfig.defaultZcodeRemotePort) {
-      newPort = SSHConfig.defaultRemotePort;
-    }
-    final updated = _config.copyWith(mode: newMode, remotePort: newPort);
+  /// 顶栏模式切换：切到指定服务模式（一键翻转按钮 / 下拉菜单选中时调用）。
+  /// 各模式端口独立存储（DSH 3080 / Zcode 8787 / WorkBuddy 8790），切换只是
+  /// 换转发目标；SSH 会话原样保留——转发通道按连接逐条拨号
+  /// _activeConfig.activeRemotePort，就地更新内存配置后新连接自动走新端口，
+  /// 无需断开重连。
+  Future<void> _switchMode(String newMode) async {
+    if (newMode == _config.mode) return;
+    final updated = _config.copyWith(mode: newMode);
     await SSHConfig.saveProfile(_activeIndex, updated);
     if (!mounted) return;
     setState(() {
@@ -932,7 +922,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     });
     TunnelService.instance
         .updateActiveConfig(updated, profileIndex: _activeIndex);
-    final modeName = newMode == SSHConfig.modeZcode ? "Zcode" : "DSH";
+    final modeName = _modeDisplayName(newMode);
     if (TunnelService.instance.status == TunnelStatus.connected) {
       _snack('已切换到 $modeName 模式');
       await _loadTargetUrl();
@@ -940,6 +930,13 @@ class _WebViewScreenState extends State<WebViewScreen>
       _snack('已切换到 $modeName 模式，连接中…');
       _manualConnect();
     }
+  }
+
+  /// 服务模式展示名（顶栏提示 / 通知用）。
+  String _modeDisplayName(String mode) {
+    if (mode == SSHConfig.modeZcode) return 'Zcode';
+    if (mode == SSHConfig.modeWorkbuddy) return 'WorkBuddy';
+    return 'DSH';
   }
 
   Future<void> _connect() async {
@@ -1172,10 +1169,14 @@ class _WebViewScreenState extends State<WebViewScreen>
           a.sshPort != b.sshPort ||
           a.username != b.username ||
           a.localPort != b.localPort ||
-          // remotePort（远端服务端口）与 mode（DSH/Zcode 转发目标）也走
-          // 隧道转发：漏比会导致设置页改完返回"无变化"不重连，旧目标继续用
+          // 远端服务端口（三模式各一个）与 mode / 可选模式开关也走隧道转发：
+          // 漏比会导致设置页改完返回"无变化"不重连，旧目标继续用
           a.remotePort != b.remotePort ||
+          a.zcodeRemotePort != b.zcodeRemotePort ||
+          a.workbuddyRemotePort != b.workbuddyRemotePort ||
           a.mode != b.mode ||
+          a.zcodeEnabled != b.zcodeEnabled ||
+          a.workbuddyEnabled != b.workbuddyEnabled ||
           a.authType != b.authType ||
           a.password != b.password ||
           a.privateKeyPem != b.privateKeyPem ||
@@ -1187,7 +1188,8 @@ class _WebViewScreenState extends State<WebViewScreen>
           a.unslothUseSsh != b.unslothUseSsh ||
           a.unslothPassword != b.unslothPassword ||
           a.accessToken != b.accessToken ||
-          a.zcodeToken != b.zcodeToken) {
+          a.zcodeToken != b.zcodeToken ||
+          a.workbuddyToken != b.workbuddyToken) {
         return true;
       }
     }
@@ -1197,12 +1199,11 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 入口 URL（按当前模式取对应 Token）。
   /// DSH：配置了访问 Token 时拼上 `?token=`，让新版 DSH (>=0.1.2-rc.1)
   /// 在首次访问完成鉴权并下发 30 天签名 cookie；未配置则裸地址直连。
-  /// Zcode：zcode-phone-server 对每个请求校验 Token，必须携带。
+  /// Zcode / WorkBuddy：对应 phone-server 对每个请求校验 Token，必须携带。
   String get _targetUrl {
     final base = 'http://127.0.0.1:${_config.localPort}';
-    final token =
-        (_config.isZcodeMode ? _config.zcodeToken : _config.accessToken)
-            .trim();
+    // 按当前服务模式取对应 Token 字段（SSHConfig.activeModeToken）
+    final token = _config.activeModeToken.trim();
     if (token.isEmpty) return base;
     return '$base/?token=${Uri.encodeQueryComponent(token)}';
   }
@@ -1808,9 +1809,9 @@ class _WebViewScreenState extends State<WebViewScreen>
     setState(() {
       _pageLoading = false;
       _authError = true;
-      _pageError = '访问被拒绝（HTTP $statusCode）：远程 DSH 已启用 Token 鉴权，'
+      _pageError = '访问被拒绝（HTTP $statusCode）：远程服务已启用 Token 鉴权，'
           '当前保存的 Token 已失效（服务端重启后会轮换）。\n'
-          '请在下方填入最新的「DSH 访问 Token」，保存后自动重连。';
+          '请在下方填入最新的访问 Token，保存后自动重连。';
     });
   }
 
@@ -1820,7 +1821,9 @@ class _WebViewScreenState extends State<WebViewScreen>
     if (token.isEmpty) return;
     final updated = _config.isZcodeMode
         ? _config.copyWith(zcodeToken: token)
-        : _config.copyWith(accessToken: token);
+        : (_config.isWorkbuddyMode
+            ? _config.copyWith(workbuddyToken: token)
+            : _config.copyWith(accessToken: token));
     await SSHConfig.saveProfile(_activeIndex, updated);
     if (!mounted) return;
     setState(() {
@@ -1909,7 +1912,11 @@ class _WebViewScreenState extends State<WebViewScreen>
                     color: theme.colorScheme.surface.withValues(alpha: 0.7),
                     padding: const EdgeInsets.symmetric(vertical: 2),
                     child: Text(
-                      _config.isZcodeMode ? 'ZCode-Phone' : 'DSH-Phone',
+                      _config.isZcodeMode
+                          ? 'ZCode-Phone'
+                          : (_config.isWorkbuddyMode
+                              ? 'WorkBuddy-Phone'
+                              : 'DSH-Phone'),
                       style: theme.textTheme.titleMedium,
                     ),
                   ),
@@ -1917,13 +1924,8 @@ class _WebViewScreenState extends State<WebViewScreen>
               ),
             ),
             const Spacer(),
-            // 模式一键切换：与顶栏其它图标同款样式的 IconButton（点击翻转
-            // DSH/Zcode 并自动重连）。
-            IconButton(
-              tooltip: _config.isZcodeMode ? '切换到 DSH 模式' : '切换到 Zcode 模式',
-              icon: const Icon(Icons.swap_horiz, color: Colors.green),
-              onPressed: _toggleMode,
-            ),
+            // 服务模式切换器（未开启可选模式时不显示，形态见 _buildModeSwitcher）
+            _buildModeSwitcher(context),
             _buildInstanceSwitcher(context),
             // Unsloth 入口：全部实例未启用时隐藏（首页无意义）
             if (_unslothAvailable)
@@ -1941,6 +1943,47 @@ class _WebViewScreenState extends State<WebViewScreen>
           ],
         ),
       ),
+    );
+  }
+
+  /// 顶部服务模式切换器，形态随可用模式数量（DSH 恒可用 + 已开启的可选模式）：
+  /// • 仅 DSH（未开启任何可选模式）→ 不显示按钮；
+  /// • 共 2 种模式 → 保持一键翻转（点击直接切到另一模式）；
+  /// • ≥3 种模式 → 点击弹出下拉菜单选择（形态同实例切换器），
+  ///   避免循环翻转要点多次。
+  Widget _buildModeSwitcher(BuildContext context) {
+    final modes = _config.availableModes;
+    if (modes.length < 2) return const SizedBox.shrink();
+    if (modes.length == 2) {
+      final other = modes.first == _config.mode ? modes.last : modes.first;
+      return IconButton(
+        tooltip: '切换到 ${_modeDisplayName(other)} 模式',
+        icon: const Icon(Icons.swap_horiz, color: Colors.green),
+        onPressed: () => _switchMode(other),
+      );
+    }
+    return PopupMenuButton<String>(
+      tooltip: '切换服务模式',
+      icon: const Icon(Icons.swap_horiz, color: Colors.green),
+      onSelected: _switchMode,
+      itemBuilder: (context) => [
+        for (final m in modes)
+          PopupMenuItem<String>(
+            value: m,
+            child: Row(
+              children: [
+                Icon(
+                  m == _config.mode
+                      ? Icons.check_circle
+                      : Icons.radio_button_unchecked,
+                  size: 18,
+                ),
+                const SizedBox(width: 8),
+                Text('${_modeDisplayName(m)} 模式'),
+              ],
+            ),
+          ),
+      ],
     );
   }
 

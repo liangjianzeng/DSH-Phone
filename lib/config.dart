@@ -57,14 +57,20 @@ class SSHConfig {
   /// Unsloth Studio 连接端口默认值。
   static const int defaultUnslothPort = 8888;
 
-  /// 实例服务模式：DSH（DeepSeek Harness Web UI）或 Zcode（zcode-phone-server）。
-  /// 模式只决定 SSH 隧道对端跑的是什么服务；隧道与 WebView 架构两种模式共用。
+  /// 实例服务模式：DSH（DeepSeek Harness Web UI）、Zcode（zcode-phone-server）
+  /// 或 WorkBuddy（workbuddy-phone-server）。
+  /// 模式只决定 SSH 隧道对端跑的是什么服务；隧道与 WebView 架构三种模式共用。
+  ///
+  /// DSH 是必选主模式（永远可用）；Zcode / WorkBuddy 是可选模式，
+  /// 按实例各自开关（[SSHConfig.zcodeEnabled] / [SSHConfig.workbuddyEnabled]）。
   static const String modeDsh = 'dsh';
   static const String modeZcode = 'zcode';
+  static const String modeWorkbuddy = 'workbuddy';
 
-  /// 远端服务端口默认值：DSH Web UI 监听 3080；Zcode 模式默认 8787。
+  /// 远端服务端口默认值：DSH Web UI 监听 3080；Zcode 默认 8787；WorkBuddy 默认 8790。
   static const int defaultRemotePort = 3080;
   static const int defaultZcodeRemotePort = 8787;
+  static const int defaultWorkbuddyRemotePort = 8790;
 
   /// 文件上传大小上限（MB）默认值。
   static const int defaultUploadMaxMb = 10;
@@ -97,6 +103,14 @@ class SSHConfig {
   static const String keyResourceView = 'resource_view_enabled';
   static const String keyResourceDownload = 'resource_download_enabled';
 
+  // 可选服务模式开关（实例级；DSH 为必选主模式无开关）
+  static const String keyZcodeEnabled = 'zcode_enabled';
+  static const String keyWorkbuddyEnabled = 'workbuddy_enabled';
+
+  // 可选服务模式远端端口（实例级；DSH 端口沿用 keyRemotePort 旧键）
+  static const String keyZcodeRemotePort = 'zcode_remote_port';
+  static const String keyWorkbuddyRemotePort = 'workbuddy_remote_port';
+
   // 实例级"默认主机资源监控"开关（最多一个实例开启）
   static const String keyInstanceHostMonitor = 'instance_host_monitor';
 
@@ -122,6 +136,11 @@ class SSHConfig {
   // 服务端首次启动自动生成。与 DSH 的 access_token 相互独立、分开存储。
   static const String secZcodeToken = 'zcode_token';
 
+  // WorkBuddy 服务访问 Token（敏感项）：workbuddy-phone-server 的 config.json
+  // token，服务端首次启动自动生成。与 DSH 的 access_token、Zcode 的 zcode_token
+  // 三者相互独立、分开存储。
+  static const String secWorkbuddyToken = 'workbuddy_token';
+
   static const String authTypeKey = 'key';
   static const String authTypePassword = 'password';
 
@@ -137,11 +156,27 @@ class SSHConfig {
   final String keyPassphrase; // 私钥口令（可空）
   final String alias; // 实例别名（可空，为空时展示名回退为地址）
 
-  /// 实例服务模式：[modeDsh]（默认，兼容旧数据）或 [modeZcode]。
+  /// 实例服务模式：[modeDsh]（默认，兼容旧数据）、[modeZcode] 或 [modeWorkbuddy]。
+  /// 只能取 [availableModes] 中的模式；加载时若指向已关闭的可选模式会回退 DSH。
   final String mode;
 
-  /// 隧道对端服务端口（远端 127.0.0.1 上的端口）：DSH=3080，Zcode=8787。
+  /// DSH 远端服务端口（隧道对端 127.0.0.1 上的 DSH Web UI 端口，默认 3080）。
+  /// Zcode / WorkBuddy 的端口是各自独立字段，互不覆盖。
   final int remotePort;
+
+  /// Zcode 可选服务启用开关（实例级，默认关闭）。
+  /// 关闭时顶栏不出现 Zcode、设置页不显示其端口/Token 配置；
+  /// DSH 为主模式，无此开关。
+  final bool zcodeEnabled;
+
+  /// WorkBuddy 可选服务启用开关（实例级，默认关闭），语义同 [zcodeEnabled]。
+  final bool workbuddyEnabled;
+
+  /// Zcode 远端服务端口（zcode-phone-server，默认 8787）。
+  final int zcodeRemotePort;
+
+  /// WorkBuddy 远端服务端口（workbuddy-phone-server，默认 8790）。
+  final int workbuddyRemotePort;
 
   /// 实例级"默认主机资源监控"开关：开启后该实例成为全局监控目标，
   /// 顶栏趋势曲线始终显示它的主机数据（与当前连接实例无关）。
@@ -176,6 +211,13 @@ class SSHConfig {
   /// 请求校验。与 DSH 的 [accessToken] 相互独立、分开存储。
   final String zcodeToken;
 
+  /// WorkBuddy 服务访问 Token（敏感项，存 secure storage）。
+  ///
+  /// workbuddy-phone-server 首次启动自动生成（见其 config.json 的 token 字段
+  /// 或启动控制台）；WorkBuddy 模式下 WebView 以 `?token=X` 访问，服务端对每个
+  /// 请求校验。与 DSH 的 [accessToken]、[zcodeToken] 相互独立、分开存储。
+  final String workbuddyToken;
+
   const SSHConfig({
     this.host = '',
     this.sshPort = 22,
@@ -188,6 +230,10 @@ class SSHConfig {
     this.alias = '',
     this.mode = modeDsh,
     this.remotePort = defaultRemotePort,
+    this.zcodeEnabled = false,
+    this.workbuddyEnabled = false,
+    this.zcodeRemotePort = defaultZcodeRemotePort,
+    this.workbuddyRemotePort = defaultWorkbuddyRemotePort,
     this.hostMonitorEnabled = false,
     this.unslothEnabled = false,
     this.unslothPort = defaultUnslothPort,
@@ -195,6 +241,7 @@ class SSHConfig {
     this.unslothPassword = '',
     this.accessToken = '',
     this.zcodeToken = '',
+    this.workbuddyToken = '',
   });
 
   bool get isConfigured =>
@@ -202,13 +249,62 @@ class SSHConfig {
 
   bool get isZcodeMode => mode == modeZcode;
 
+  bool get isWorkbuddyMode => mode == modeWorkbuddy;
+
+  /// 本实例可用的服务模式列表：DSH 恒在首位，其后是已开启的可选模式。
+  /// 顶栏切换按钮的形态（隐藏 / 一键翻转 / 下拉选择）由它的长度决定。
+  List<String> get availableModes => [
+        modeDsh,
+        if (zcodeEnabled) modeZcode,
+        if (workbuddyEnabled) modeWorkbuddy,
+      ];
+
+  /// 当前服务模式对应的远端服务端口（隧道转发目标）。
+  int get activeRemotePort {
+    if (isZcodeMode) return zcodeRemotePort;
+    if (isWorkbuddyMode) return workbuddyRemotePort;
+    return remotePort;
+  }
+
+  /// 当前服务模式对应的访问 Token（三模式各自独立存储）。
+  String get activeModeToken {
+    if (isZcodeMode) return zcodeToken;
+    if (isWorkbuddyMode) return workbuddyToken;
+    return accessToken;
+  }
+
+  /// 清洗非法模式：mode 指向未开启的可选模式（如关闭 Zcode 后残留）时
+  /// 回退为主模式 DSH；合法时返回自身。
+  SSHConfig get sanitized =>
+      availableModes.contains(mode) ? this : copyWith(mode: modeDsh);
+
+  /// 按服务模式返回远端服务端口默认值（DSH=3080 / Zcode=8787 / WorkBuddy=8790）。
+  ///
+  /// 三模式端口各自独立存储，此默认值仅供设置页端口字段解析失败时兜底、
+  /// 以及旧数据迁移时归位使用，不再随模式切换互相覆盖。
+  static int defaultPortForMode(String mode) {
+    switch (mode) {
+      case modeZcode:
+        return defaultZcodeRemotePort;
+      case modeWorkbuddy:
+        return defaultWorkbuddyRemotePort;
+      default:
+        return defaultRemotePort;
+    }
+  }
+
   /// 复制并覆盖指定字段（其余字段原样保留）。
   @pragma('vm:prefer-inline')
   SSHConfig copyWith({
     String? accessToken,
     String? zcodeToken,
+    String? workbuddyToken,
     String? mode,
     int? remotePort,
+    bool? zcodeEnabled,
+    bool? workbuddyEnabled,
+    int? zcodeRemotePort,
+    int? workbuddyRemotePort,
     bool? hostMonitorEnabled,
     bool? unslothEnabled,
   }) =>
@@ -224,6 +320,10 @@ class SSHConfig {
         alias: alias,
         mode: mode ?? this.mode,
         remotePort: remotePort ?? this.remotePort,
+        zcodeEnabled: zcodeEnabled ?? this.zcodeEnabled,
+        workbuddyEnabled: workbuddyEnabled ?? this.workbuddyEnabled,
+        zcodeRemotePort: zcodeRemotePort ?? this.zcodeRemotePort,
+        workbuddyRemotePort: workbuddyRemotePort ?? this.workbuddyRemotePort,
         hostMonitorEnabled: hostMonitorEnabled ?? this.hostMonitorEnabled,
         unslothEnabled: unslothEnabled ?? this.unslothEnabled,
         unslothPort: unslothPort,
@@ -231,6 +331,7 @@ class SSHConfig {
         unslothPassword: unslothPassword,
         accessToken: accessToken ?? this.accessToken,
         zcodeToken: zcodeToken ?? this.zcodeToken,
+        workbuddyToken: workbuddyToken ?? this.workbuddyToken,
       );
 
   bool get useKey => authType == authTypeKey;
@@ -279,7 +380,33 @@ class SSHConfig {
           await _safeSecRead(storage, _pKey(i, secAccessToken));
       final zcodeToken =
           await _safeSecRead(storage, _pKey(i, secZcodeToken));
-      list.add(SSHConfig(
+      final workbuddyToken =
+          await _safeSecRead(storage, _pKey(i, secWorkbuddyToken));
+      final mode = prefs.getString(_pKey(i, keyMode)) ?? modeDsh;
+      // 可选模式开关：无记录时按旧数据推断——曾保存为该模式、或已填过对应
+      // Token 的视为开启（老安装升级后功能不丢）；全新实例默认仅 DSH。
+      final zcodeEnabled = prefs.getBool(_pKey(i, keyZcodeEnabled)) ??
+          (mode == modeZcode || zcodeToken.isNotEmpty);
+      final workbuddyEnabled = prefs.getBool(_pKey(i, keyWorkbuddyEnabled)) ??
+          (mode == modeWorkbuddy || workbuddyToken.isNotEmpty);
+      // 三模式端口独立存储（升级版）。zcode_remote_port 不存在说明是旧数据：
+      // 旧的单一 remote_port 归属于当时保存的模式，其余模式回退各自默认端口。
+      final legacyRemote =
+          prefs.getInt(_pKey(i, keyRemotePort)) ?? defaultRemotePort;
+      final perModePorts =
+          prefs.containsKey(_pKey(i, keyZcodeRemotePort));
+      final dshRemotePort = perModePorts
+          ? legacyRemote
+          : (mode == modeDsh ? legacyRemote : defaultRemotePort);
+      final zcodeRemotePort =
+          prefs.getInt(_pKey(i, keyZcodeRemotePort)) ??
+              (mode == modeZcode ? legacyRemote : defaultZcodeRemotePort);
+      final workbuddyRemotePort =
+          prefs.getInt(_pKey(i, keyWorkbuddyRemotePort)) ??
+              (mode == modeWorkbuddy
+                  ? legacyRemote
+                  : defaultWorkbuddyRemotePort);
+      final profile = SSHConfig(
         host: prefs.getString(_pKey(i, keyHost)) ?? '',
         sshPort: prefs.getInt(_pKey(i, keySshPort)) ?? 22,
         username: prefs.getString(_pKey(i, keyUsername)) ?? '',
@@ -289,8 +416,12 @@ class SSHConfig {
         privateKeyPem: privateKeyPem,
         keyPassphrase: keyPassphrase,
         alias: prefs.getString(_pKey(i, keyAlias)) ?? '',
-        mode: prefs.getString(_pKey(i, keyMode)) ?? modeDsh,
-        remotePort: prefs.getInt(_pKey(i, keyRemotePort)) ?? defaultRemotePort,
+        mode: mode,
+        remotePort: dshRemotePort,
+        zcodeEnabled: zcodeEnabled,
+        workbuddyEnabled: workbuddyEnabled,
+        zcodeRemotePort: zcodeRemotePort,
+        workbuddyRemotePort: workbuddyRemotePort,
         hostMonitorEnabled:
             prefs.getBool(_pKey(i, keyInstanceHostMonitor)) ?? false,
         unslothEnabled:
@@ -301,7 +432,10 @@ class SSHConfig {
         unslothPassword: unslothPassword,
         accessToken: accessToken,
         zcodeToken: zcodeToken,
-      ));
+        workbuddyToken: workbuddyToken,
+      );
+      // mode 指向已关闭的可选模式时回退 DSH，保证加载出的实例自洽
+      list.add(profile.sanitized);
     }
     return list;
   }
@@ -340,6 +474,12 @@ class SSHConfig {
     await prefs.setString(_pKey(i, keyAlias), config.alias);
     await prefs.setString(_pKey(i, keyMode), config.mode);
     await prefs.setInt(_pKey(i, keyRemotePort), config.remotePort);
+    // 可选模式开关与各模式独立端口（remote_port 仍写 DSH 端口，兼容旧版本）
+    await prefs.setBool(_pKey(i, keyZcodeEnabled), config.zcodeEnabled);
+    await prefs.setBool(_pKey(i, keyWorkbuddyEnabled), config.workbuddyEnabled);
+    await prefs.setInt(_pKey(i, keyZcodeRemotePort), config.zcodeRemotePort);
+    await prefs.setInt(
+        _pKey(i, keyWorkbuddyRemotePort), config.workbuddyRemotePort);
     await prefs.setBool(
         _pKey(i, keyInstanceHostMonitor), config.hostMonitorEnabled);
     await prefs.setBool(_pKey(i, keyUnslothEnabled), config.unslothEnabled);
@@ -382,6 +522,12 @@ class SSHConfig {
           key: _pKey(i, secZcodeToken), value: config.zcodeToken);
     } else {
       await storage.delete(key: _pKey(i, secZcodeToken));
+    }
+    if (config.workbuddyToken.isNotEmpty) {
+      await storage.write(
+          key: _pKey(i, secWorkbuddyToken), value: config.workbuddyToken);
+    } else {
+      await storage.delete(key: _pKey(i, secWorkbuddyToken));
     }
   }
 

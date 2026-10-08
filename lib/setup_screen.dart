@@ -162,8 +162,12 @@ class _SetupScreenState extends State<SetupScreen> {
   late TextEditingController _keyPassphrase;
   late TextEditingController _localPort;
 
-  /// 隧道对端服务端口（远端 127.0.0.1 上的端口）。
+  /// 隧道对端服务端口（远端 127.0.0.1 上的端口）——DSH 主模式端口。
   late TextEditingController _remotePort;
+
+  /// Zcode / WorkBuddy 可选服务的远端端口（独立存储，互不覆盖）。
+  late TextEditingController _zcodeRemotePort;
+  late TextEditingController _workbuddyRemotePort;
 
   /// DSH Web 访问 Token（可选；新版 dsh>=0.1.2-rc.1 启用 token 鉴权时填写）。
   late TextEditingController _accessToken;
@@ -172,14 +176,23 @@ class _SetupScreenState extends State<SetupScreen> {
   /// 与 DSH token 相互独立、分开存储。
   late TextEditingController _zcodeToken;
 
+  /// WorkBuddy 服务访问 Token（WorkBuddy 模式必填；workbuddy-phone-server
+  /// 的访问令牌）。与 DSH / Zcode token 三者相互独立、分开存储。
+  late TextEditingController _workbuddyToken;
+
   /// Unsloth Studio 配置控件（实例级）。
   late TextEditingController _unslothPort;
   late TextEditingController _unslothPassword;
 
   late String _authType;
 
-  /// 当前编辑实例的服务模式（DSH / Zcode，随实例切换回填）。
+  /// 当前编辑实例的服务模式（DSH / Zcode / WorkBuddy，随实例切换回填）。
   late String _mode;
+
+  /// Zcode / WorkBuddy 可选服务启用开关（实例级，随实例切换回填）。
+  /// DSH 是必选主模式，无开关；关闭的可选模式不出现在"当前服务模式"与顶栏。
+  late bool _zcodeEnabled;
+  late bool _workbuddyEnabled;
 
   /// 当前编辑实例的"默认主机资源监控"开关（实例级，随实例切换回填）。
   late bool _instanceHostMonitorEnabled;
@@ -374,17 +387,40 @@ class _SetupScreenState extends State<SetupScreen> {
     }
   }
 
-  /// 切换服务模式：未手动改过远端端口时（等于另一模式的默认值），自动回填新模式的默认端口。
+  /// 当前编辑实例可用的服务模式：DSH 恒在首位 + 已开启的可选模式。
+  List<String> get _availableModes => [
+        SSHConfig.modeDsh,
+        if (_zcodeEnabled) SSHConfig.modeZcode,
+        if (_workbuddyEnabled) SSHConfig.modeWorkbuddy,
+      ];
+
+  /// 服务模式展示名。
+  String _modeDisplay(String mode) {
+    if (mode == SSHConfig.modeZcode) return 'Zcode';
+    if (mode == SSHConfig.modeWorkbuddy) return 'WorkBuddy';
+    return 'DSH';
+  }
+
+  /// 切换当前服务模式（仅限已开启的模式；各模式端口独立存储，无需回填）。
   void _applyMode(String mode) {
+    setState(() => _mode = mode);
+    _scheduleAutoSave();
+  }
+
+  /// 切换 Zcode 可选服务：关闭时若当前正处于 Zcode 模式，回退主模式 DSH。
+  void _applyZcodeEnabled(bool v) {
     setState(() {
-      final current = int.tryParse(_remotePort.text.trim());
-      if (current == null ||
-          current == SSHConfig.defaultRemotePort ||
-          current == SSHConfig.defaultZcodeRemotePort) {
-        _remotePort.text =
-            '${mode == SSHConfig.modeZcode ? SSHConfig.defaultZcodeRemotePort : SSHConfig.defaultRemotePort}';
-      }
-      _mode = mode;
+      _zcodeEnabled = v;
+      if (!v && _mode == SSHConfig.modeZcode) _mode = SSHConfig.modeDsh;
+    });
+    _scheduleAutoSave();
+  }
+
+  /// 切换 WorkBuddy 可选服务：关闭时若当前正处于 WorkBuddy 模式，回退 DSH。
+  void _applyWorkbuddyEnabled(bool v) {
+    setState(() {
+      _workbuddyEnabled = v;
+      if (!v && _mode == SSHConfig.modeWorkbuddy) _mode = SSHConfig.modeDsh;
     });
     _scheduleAutoSave();
   }
@@ -401,12 +437,19 @@ class _SetupScreenState extends State<SetupScreen> {
     _keyPassphrase = TextEditingController(text: c.keyPassphrase);
     _localPort = TextEditingController(text: '${c.localPort}');
     _remotePort = TextEditingController(text: '${c.remotePort}');
+    _zcodeRemotePort =
+        TextEditingController(text: '${c.zcodeRemotePort}');
+    _workbuddyRemotePort =
+        TextEditingController(text: '${c.workbuddyRemotePort}');
     _accessToken = TextEditingController(text: c.accessToken);
     _zcodeToken = TextEditingController(text: c.zcodeToken);
+    _workbuddyToken = TextEditingController(text: c.workbuddyToken);
     _unslothPort = TextEditingController(text: '${c.unslothPort}');
     _unslothPassword = TextEditingController(text: c.unslothPassword);
     _authType = c.authType;
     _mode = c.mode;
+    _zcodeEnabled = c.zcodeEnabled;
+    _workbuddyEnabled = c.workbuddyEnabled;
     _instanceHostMonitorEnabled = c.hostMonitorEnabled;
     _unslothEnabled = c.unslothEnabled;
     _unslothUseSsh = c.unslothUseSsh;
@@ -430,8 +473,11 @@ class _SetupScreenState extends State<SetupScreen> {
     _keyPassphrase.dispose();
     _localPort.dispose();
     _remotePort.dispose();
+    _zcodeRemotePort.dispose();
+    _workbuddyRemotePort.dispose();
     _accessToken.dispose();
     _zcodeToken.dispose();
+    _workbuddyToken.dispose();
     _unslothPort.dispose();
     _unslothPassword.dispose();
     super.dispose();
@@ -557,9 +603,13 @@ class _SetupScreenState extends State<SetupScreen> {
       localPort: int.tryParse(_localPort.text.trim()) ?? 3081,
       mode: _mode,
       remotePort: int.tryParse(_remotePort.text.trim()) ??
-          (_mode == SSHConfig.modeZcode
-              ? SSHConfig.defaultZcodeRemotePort
-              : SSHConfig.defaultRemotePort),
+          SSHConfig.defaultRemotePort,
+      zcodeEnabled: _zcodeEnabled,
+      workbuddyEnabled: _workbuddyEnabled,
+      zcodeRemotePort: int.tryParse(_zcodeRemotePort.text.trim()) ??
+          SSHConfig.defaultZcodeRemotePort,
+      workbuddyRemotePort: int.tryParse(_workbuddyRemotePort.text.trim()) ??
+          SSHConfig.defaultWorkbuddyRemotePort,
       authType: _authType,
       password: _authType == SSHConfig.authTypePassword ? _password.text : '',
       privateKeyPem:
@@ -573,6 +623,7 @@ class _SetupScreenState extends State<SetupScreen> {
       unslothPassword: _unslothPassword.text,
       accessToken: _accessToken.text.trim(),
       zcodeToken: _zcodeToken.text.trim(),
+      workbuddyToken: _workbuddyToken.text.trim(),
     );
   }
 
@@ -752,67 +803,35 @@ class _SetupScreenState extends State<SetupScreen> {
             onChanged: (_) => _scheduleAutoSave(),
           ),
           const SizedBox(height: 12),
-          const Text('服务模式', style: TextStyle(fontSize: 16)),
-          Row(
-            children: [
-              Expanded(
-                child: RadioListTile<String>(
-                  title: const Text('DSH'),
-                  subtitle: const Text('DeepSeek Harness'),
-                  value: SSHConfig.modeDsh,
-                  groupValue: _mode,
-                  onChanged: (v) => _applyMode(v ?? SSHConfig.modeDsh),
-                ),
-              ),
-              Expanded(
-                child: RadioListTile<String>(
-                  title: const Text('Zcode'),
-                  subtitle: const Text('zcode-phone-server'),
-                  value: SSHConfig.modeZcode,
-                  groupValue: _mode,
-                  onChanged: (v) => _applyMode(v ?? SSHConfig.modeDsh),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
+          const Divider(),
+          // ============ DSH 主模式（必设） ============
+          // 隧道与页面加载以 DSH 为主模式；Zcode / WorkBuddy 为可选服务，
+          // 分组放在下方，不与主模式配置夹杂。
+          const Text('DSH 服务（主模式 · 必设）',
+              style: TextStyle(fontSize: 16)),
+          const SizedBox(height: 8),
           TextFormField(
             controller: _remotePort,
             keyboardType: TextInputType.number,
-            decoration: InputDecoration(
-              labelText: '远端服务端口',
-              helperText: _mode == SSHConfig.modeZcode
-                  ? '隧道对端端口：zcode-phone-server 默认 8787'
-                  : '隧道对端端口：DSH Web UI 默认 3080',
-              border: const OutlineInputBorder(),
+            decoration: const InputDecoration(
+              labelText: 'DSH 远端服务端口',
+              helperText: '隧道对端端口：DSH Web UI 默认 3080',
+              border: OutlineInputBorder(),
             ),
             validator: _validatePort,
             onChanged: (_) => _scheduleAutoSave(),
           ),
           const SizedBox(height: 12),
-          // DSH 与 Zcode 的访问 Token 分开存储：各自独立输入框、独立加密存储，
+          // 三个模式的访问 Token 分开存储：各自独立输入框、独立加密存储，
           // 改其一不影响另一（连接时按当前模式取对应字段）。
           TextFormField(
             controller: _accessToken,
             obscureText: _obscureToken,
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               labelText: 'DSH 访问 Token（可选）',
               hintText: '粘贴 DSH 访问 Token（留空则不启用）',
               helperText: '新版 DSH(≥0.1.2) 启用 token 鉴权，首次访问需携带；'
                   '换取 30 天签名 cookie 后免 token，过期需重新填写',
-              border: OutlineInputBorder(),
-            ),
-            onChanged: (_) => _scheduleAutoSave(),
-          ),
-          const SizedBox(height: 12),
-          TextFormField(
-            controller: _zcodeToken,
-            obscureText: _obscureToken,
-            decoration: InputDecoration(
-              labelText: 'Zcode 服务访问 Token（Zcode 模式必填）',
-              hintText: '粘贴 zcode-phone-server 的访问令牌',
-              helperText: '服务端首次启动自动生成：见 zcode-phone-server/config.json '
-                  '的 token 字段或启动控制台；不填服务端会拒绝访问',
               border: const OutlineInputBorder(),
               suffixIcon: IconButton(
                 icon: Icon(_obscureToken
@@ -826,6 +845,130 @@ class _SetupScreenState extends State<SetupScreen> {
             onChanged: (_) => _scheduleAutoSave(),
           ),
           const SizedBox(height: 16),
+          const Divider(),
+          // ============ 可选服务模式（Zcode / WorkBuddy） ============
+          const Text('可选服务模式', style: TextStyle(fontSize: 18)),
+          const SizedBox(height: 4),
+          const Text(
+            'Zcode / WorkBuddy 为可选服务：开启后才能从顶部状态栏切换使用；'
+            '关闭后顶栏不出现对应入口，其端口 / Token 配置收起。',
+            style: TextStyle(fontSize: 12, color: Colors.grey),
+          ),
+          const SizedBox(height: 8),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Zcode'),
+            subtitle: const Text('zcode-phone-server；开启后可从顶栏切换，默认端口 8787'),
+            value: _zcodeEnabled,
+            onChanged: _applyZcodeEnabled,
+          ),
+          if (_zcodeEnabled) ...[
+            Padding(
+              padding: const EdgeInsets.only(left: 24),
+              child: TextFormField(
+                controller: _zcodeRemotePort,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: 'Zcode 远端服务端口',
+                  helperText: '隧道对端端口：zcode-phone-server 默认 8787',
+                  border: OutlineInputBorder(),
+                ),
+                validator: _validatePort,
+                onChanged: (_) => _scheduleAutoSave(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Padding(
+              padding: const EdgeInsets.only(left: 24),
+              child: TextFormField(
+                controller: _zcodeToken,
+                obscureText: _obscureToken,
+                decoration: InputDecoration(
+                  labelText: 'Zcode 服务访问 Token（Zcode 模式必填）',
+                  hintText: '粘贴 zcode-phone-server 的访问令牌',
+                  helperText: '服务端首次启动自动生成：见 zcode-phone-server/config.json '
+                      '的 token 字段或启动控制台；不填服务端会拒绝访问',
+                  border: const OutlineInputBorder(),
+                  suffixIcon: IconButton(
+                    icon: Icon(_obscureToken
+                        ? Icons.visibility_off_outlined
+                        : Icons.visibility_outlined),
+                    tooltip: _obscureToken ? '显示 Token' : '隐藏 Token',
+                    onPressed: () =>
+                        setState(() => _obscureToken = !_obscureToken),
+                  ),
+                ),
+                onChanged: (_) => _scheduleAutoSave(),
+              ),
+            ),
+          ],
+          const SizedBox(height: 8),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('WorkBuddy'),
+            subtitle: const Text(
+                'workbuddy-phone-server；开启后可从顶栏切换，默认端口 8790'),
+            value: _workbuddyEnabled,
+            onChanged: _applyWorkbuddyEnabled,
+          ),
+          if (_workbuddyEnabled) ...[
+            Padding(
+              padding: const EdgeInsets.only(left: 24),
+              child: TextFormField(
+                controller: _workbuddyRemotePort,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: 'WorkBuddy 远端服务端口',
+                  helperText: '隧道对端端口：workbuddy-phone-server 默认 8790',
+                  border: OutlineInputBorder(),
+                ),
+                validator: _validatePort,
+                onChanged: (_) => _scheduleAutoSave(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Padding(
+              padding: const EdgeInsets.only(left: 24),
+              child: TextFormField(
+                controller: _workbuddyToken,
+                obscureText: _obscureToken,
+                decoration: InputDecoration(
+                  labelText: 'WorkBuddy 服务访问 Token（WorkBuddy 模式必填）',
+                  hintText: '粘贴 workbuddy-phone-server 的访问令牌',
+                  helperText: '服务端首次启动自动生成：见 workbuddy-phone-server/config.json '
+                      '的 token 字段或启动控制台；不填服务端会拒绝访问',
+                  border: const OutlineInputBorder(),
+                  suffixIcon: IconButton(
+                    icon: Icon(_obscureToken
+                        ? Icons.visibility_off_outlined
+                        : Icons.visibility_outlined),
+                    tooltip: _obscureToken ? '显示 Token' : '隐藏 Token',
+                    onPressed: () =>
+                        setState(() => _obscureToken = !_obscureToken),
+                  ),
+                ),
+                onChanged: (_) => _scheduleAutoSave(),
+              ),
+            ),
+          ],
+          const SizedBox(height: 12),
+          const Text('当前服务模式', style: TextStyle(fontSize: 16)),
+          const SizedBox(height: 4),
+          // 只在主模式 + 已开启的可选模式之间选择；连接后也可在顶栏随时切换。
+          SegmentedButton<String>(
+            segments: [
+              for (final m in _availableModes)
+                ButtonSegment<String>(
+                  value: m,
+                  label: Text(_modeDisplay(m)),
+                ),
+            ],
+            selected: {_mode},
+            showSelectedIcon: true,
+            onSelectionChanged: (selection) => _applyMode(selection.first),
+          ),
+          const SizedBox(height: 16),
+          const Divider(),
           const Text('认证方式', style: TextStyle(fontSize: 16)),
           Row(
             children: [

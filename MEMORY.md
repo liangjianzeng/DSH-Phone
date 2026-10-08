@@ -145,3 +145,25 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 - **根因**：引擎（zcode.cjs）对同一回合**同时**发 `model.streaming`（token 直播）与 `part.upserted/part.delta`（部件落库）两类事件（引擎源码 grep 坐实）。页面把直播 token 画进 `__live-text` 累积块、把落库部件画成真实 partId 元素，两路都渲染。思考行早有"落库追平直播才交接"的去重（upserted 分支 + renderTail 长度比较），**正文 text 漏了同款处理**。
 - **修复**：新增 `settleLiveText(m)`（落库文本总长追平直播块前只记数据不渲染副本，追平即移除直播块）；挂在 part.upserted/part.delta/renderTail 三个正文入口；`model.streaming` 增加 hasReal 守卫（真实部件已接管就不再重建直播块，思考/正文同款）；part.delta 的 reasoning `!pe` 分支补上与 upserted 同款的直播去重。
 - **教训**：给"直播+落库"双通道页面加渲染路径时，两条通道必须同一时刻只渲染一份——新增部件类型（text/reasoning/tool）都要过一遍 settle 去重，漏一个就是"重复输出"类用户报告。
+
+---
+
+## 服务模式模型：DSH 主模式 + 可选服务（2026-10-07 重构）
+
+- **模型**：DSH 是必选主模式（无开关）；Zcode / WorkBuddy 为**实例级可选服务**，
+  各自 `zcodeEnabled` / `workbuddyEnabled` 开关（SSHConfig 字段，键
+  `zcode_enabled` / `workbuddy_enabled`），端口也**按模式独立存储**
+  （`remote_port`=DSH 3080 / `zcode_remote_port`=8787 / `workbuddy_remote_port`=8790），
+  切换模式不再互相覆盖端口。隧道转发目标恒取 `config.activeRemotePort`。
+- **设置页**：SSH 配置 → 「DSH 服务（主模式·必设）」（DSH 端口+Token）→
+  「可选服务模式」（Zcode/WorkBuddy 开关，开启才展开各自端口/Token）→
+  「当前服务模式」分段选择器（只列已开启模式）。「当前服务模式」关闭当前模式时自动回退 DSH；
+  `SSHConfig.sanitized` 在 loadAllProfiles 兜底把指向已关闭模式的实例洗回 DSH。
+- **顶栏切换按钮形态自适应**（`_buildModeSwitcher`）：仅 DSH → 不显示；
+  共 2 种模式 → IconButton 一键翻转；≥3 种 → PopupMenuButton 下拉选择（当前模式打勾，形态同实例切换器）。
+- **旧数据迁移**：`zcode_remote_port` 键不存在即旧格式——旧单一 `remote_port`
+  归属当时保存的模式，其余模式回退默认端口；启用开关无记录时按
+  「当前模式是该模式或已填对应 Token」推断，老安装升级不丢功能。
+- **纪律**：模式相关 UI 一律走 `availableModes` / `activeRemotePort` /
+  `activeModeToken` getter，不要再写 mode 三元硬编码；新增第四种服务模式时
+  只需加常量+开关+字段，顶栏下拉自动兼容。
