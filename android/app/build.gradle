@@ -29,10 +29,24 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-        // 仅打包手机 ARM 原生库：sherpa-onnx 依赖的 libonnxruntime.so 很大，
-        // 去掉 x86/x86_64 桌面 ABI 可砍掉约 60-70MB（手机用不到）。
+        // 仅打包 arm64-v8a：sherpa-onnx 依赖的 libonnxruntime.so 很大，
+        // 去掉 x86/x86_64 桌面 ABI 与 armeabi-v7a（32 位老机型，2017 年后
+        // 主流手机均 arm64）共省约 50MB。需要 32 位兼容时用 --split-per-abi 出双包。
         ndk {
-            abiFilters 'arm64-v8a', 'armeabi-v7a'
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    // APK 体积优化（2026-10-08）：
+    //  • 原生库压缩存储（useLegacyPackaging）：APK 文件显著变小，
+    //    安装时解包到 /data，运行性能不变。
+    //  • Web 专用资产（sherpa_onnx_web 的 wasm/js、record_web、
+    //    flutter_inappwebview_web）安卓端不会加载，插件误打包约 4.2MB，
+    //    由文件底部 copyFlutterAssets* 钩子剔除（flutter 资产在 mergeAssets
+    //    之后才拷入合并目录，ignoreAssetsPattern / merge 钩子均拦不住）。
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
         }
     }
 
@@ -75,4 +89,23 @@ dependencies {
 
 flutter {
     source = "../.."
+}
+
+// 剔除 Web 专用资产（约 4.2MB）：flutter_sherpa_onnx / record / inappwebview
+// 的 web 实现在安卓端永不加载，插件资产却被无差别打包。flutter 资产由
+// copyFlutterAssets<Variant> 在 mergeAssets 之后拷入合并输出目录，故钩子挂在
+// 该任务末尾，扫 intermediates/assets/**/flutter_assets/packages 删除。
+tasks.matching { it.name.startsWith('copyFlutterAssets') }
+        .configureEach {
+    doLast {
+        def base = new File(project.buildDir, 'intermediates/assets')
+        if (!base.isDirectory()) return
+        base.eachDirRecurse { d ->
+            if (d.absolutePath.replace('\\', '/')
+                    .endsWith('/flutter_assets/packages')) {
+                ['sherpa_onnx_web', 'record_web', 'flutter_inappwebview_web']
+                        .each { pkg -> new File(d, pkg).deleteDir() }
+            }
+        }
+    }
 }
