@@ -70,6 +70,13 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 按住说话会话（长按语音按钮期间非 null；结束后置回 null）。
   HoldToTalkSession? _holdSession;
 
+  /// 松手后的收声缓冲计时器：松手先等 [_voiceLinger] 再真正停止录音定稿，
+  /// 避免用户"手比嘴快"（说完才松手）把句尾截断。
+  Timer? _pendingVoiceEnd;
+
+  /// 缓冲期内尚未定稿的会话（供 [_cancelPendingVoiceEnd] 丢弃/收尾）。
+  HoldToTalkSession? _pendingVoiceSession;
+
   /// 连续自动重连次数上限：防止"死循环连接"刷屏/耗尽资源。
   static const int _maxReconnect = 5;
   int _reconnectCount = 0;
@@ -675,10 +682,18 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// `_holdSession != null` 拦截永久失效（真机实测踩坑）。
   bool _voiceLongPressActive = false;
 
+  /// 松手后的收声缓冲：用户往往"手比嘴快"（说完才松手），松手即停会把句尾
+  /// 截断。松手先等 1 秒让 ASR 继续收声定稿，再真正停止录音。
+  static const Duration _voiceLinger = Duration(milliseconds: 1000);
+
   /// 语音按钮长按开始：授权麦克风 → 确保模型就绪（未就绪弹断点续传下载引导）→
   /// 启动会话与浮层。系统识别（speech_to_text）已移除：ROM 权限问题
   /// 导致部分机型（小米系）一用即崩，2026-10-02 决策只保留端侧方案。
   Future<void> _onVoiceLongPressStart() async {
+    // 缓冲期内又按住：先丢弃上一段未定稿录音再开新录音，别让旧引擎麦克风
+    // 常开 / 两段录音串味。必须在 `_holdSession != null` 守卫之前调——缓冲期
+    // 内 `_holdSession` 仍非 null，放在后面会被守卫永久拦截。
+    await _cancelPendingVoiceEnd();
     if (_holdSession != null) return;
     final c = _controller;
     if (c == null) return;
@@ -734,12 +749,49 @@ class _WebViewScreenState extends State<WebViewScreen>
     _voiceLongPressActive = false; // 弹窗期间的收尾判断依赖此标记
     final session = _holdSession;
     if (session == null) return;
+    // 引擎尚未就绪（加载中松手）→ 标记取消，由 start 完成侧收尾。
+    // 此时尚未录音，无"收声缓冲"可言，保持原行为。
     if (!session.isStarted) {
       session.cancelRequested = true;
       return;
     }
-    if (mounted) setState(() => _holdSession = null);
     final discard = cancelled || session.cancelMode.value;
+    if (discard) {
+      // 上滑取消意图明确：立即取消，无需缓冲。
+      if (mounted) setState(() => _holdSession = null);
+      await _finalizeVoiceLinger(session, discard: true);
+      return;
+    }
+    // 普通发送：松手先等 [_voiceLinger] 让 ASR 继续收声定稿，免得"手比嘴快"
+    // 把句尾截断。缓冲期内 _holdSession 保持非 null，麦克风图标继续显示
+    // "录音中"给用户明确反馈；1 秒后由定时器真正停止录音 + 注入 + 发送。
+    _pendingVoiceSession = session;
+    _pendingVoiceEnd = Timer(_voiceLinger, () {
+      _pendingVoiceSession = null;
+      _pendingVoiceEnd = null;
+      if (mounted) setState(() => _holdSession = null);
+      unawaited(_finalizeVoiceLinger(session, discard: false));
+    });
+  }
+
+  /// 缓冲期（[_voiceLinger]）内又按住：丢弃上一段未定稿录音——停止旧引擎
+  /// 麦克风、撤除浮层，再开新录音。
+  Future<void> _cancelPendingVoiceEnd() async {
+    final timer = _pendingVoiceEnd;
+    final session = _pendingVoiceSession;
+    _pendingVoiceEnd = null;
+    _pendingVoiceSession = null;
+    if (timer == null) return;
+    timer.cancel();
+    if (session == null) return;
+    if (mounted) setState(() => _holdSession = null);
+    await _finalizeVoiceLinger(session, discard: true);
+  }
+
+  /// 真正定稿：stop 录音取终稿 → 注入输入框 → 自动发送。
+  /// 由 [_onVoiceLongPressEnd]（取消/立即定稿）或 [_pendingVoiceEnd] 定时器触发。
+  Future<void> _finalizeVoiceLinger(HoldToTalkSession session,
+      {required bool discard}) async {
     final text = await session.end(cancelled: discard);
     if (discard || text.isEmpty || !mounted) return;
     final ok = await _injectComposerTextAndSend(text);
