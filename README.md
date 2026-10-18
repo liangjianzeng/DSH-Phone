@@ -5,7 +5,7 @@
 DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 用户名 / 认证方式（SSH 密钥或密码），应用自动建立 SSH 隧道（`127.0.0.1:<localPort>` → 远程 `127.0.0.1:3080`），并通过 WebView 加载 DSH Web UI。内置本地缓存加速、SSH 保活、界面缩放与全屏显示、主题自适应，以及手动修改连接配置 / 刷新缓存 / 查看关于的入口。
 
 - **开源地址**：https://github.com/liangjianzeng/DSH-Phone
-- **当前版本**：v0.2.1（build 17）
+- **当前版本**：v0.2.2（build 18）
 - **安装包**：最新构建产物见 `build/app/outputs/flutter-apk/app-release.apk`；历史版本请在 **GitHub Releases** 下载（仓库不再提交 APK 二进制）。
 
 <!-- 发版检查清单：1) pubspec.yaml 的 version（唯一版本来源，构建 versionName/versionCode）；2) 同步下方「当前版本」；3) lib/config.dart 的 fallbackAppVersion 仅作读取失败兜底，正常 release 自动读取构建版本无需改；4) 打 tag 触发 CI 构建 Releases。 -->
@@ -72,10 +72,11 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - 📊 **主机监控（10 分钟趋势）**：每 10s 采集远程主机 CPU / 内存 / GPU 使用率 / GPU 温度，顶栏背景显示最近 10 分钟趋势曲线（紫色=GPU 使用率 · 黄色=CPU · 蓝色=内存 · 中国红=GPU 温度）；采集命令对 ARM / 精简 / 容器环境健壮（/proc/stat + /proc/meminfo），Windows 走 PowerShell 性能计数器。
 - 🎯 **实例级"默认主机资源监控"**：每路实例可单独开启（默认关闭，全局仅允许一个实例开启）；开启后该实例成为全局监控目标，顶栏曲线始终显示它的主机数据（与当前连接实例无关），切换实例曲线不断。
 - 🧪 **Unsloth Studio 远程加载**：顶栏设置旁新增 ⚗️ 图标，一键加载远程 Unsloth Studio（复用 WebView 能力）；支持缓存加载与缓存刷新；配置按实例独立——连接端口（默认 8888）、连接方式（HTTP 直连 / SSH 隧道）；登录页**自动登录**（配置登录密码后自动填写并提交，用户名固定 `unsloth`）；默认关闭、全局仅允许一个实例开启（同"默认主机资源监控"模式），顶栏图标始终打开启用实例的 Unsloth Studio。
+- 🐙 **GitHub 仓库快捷访问**：全局开关（默认关闭，设置 → 外部访问），开启后顶栏设置旁新增 `</>` 图标，点击在应用内 WebView 打开 github.com；本地缓存优先加载 + **登录持久化**（Cookie / DOM Storage 保留登录态，网页登录一次长期有效）；支持 **PAT 令牌免登录**——GitHub 页面顶栏钥匙图标填入 Fine-grained Personal Access Token（勾选 contents: read 即可），存安全存储并自动以 `x-access-token` 前缀重载进入登录态，清空令牌则回落网页登录；访问地址可覆盖（兼容 GitHub Enterprise）。
 - ⚡ **设置自动保存**：表单编辑停止即自动落盘（无右上角"保存"按钮），返回设置页自动重连应用最新配置；实例级监控开关切换即生效。
 - 🖥️ **全屏边缘到边缘**：顶栏延伸到系统状态栏区域，最大化显示面积。
 - 🌗 **主题自适应**：跟随系统深色 / 浅色模式，背景与状态栏图标自动切换。
-- ⚙️ **设置管理**：修改地址 / 用户名 / 认证、实例服务模式（DSH / Zcode）与远端服务端口、清空缓存、缩放控制、对话区缩放控件 / 相机入口 / 语音输入入口（含并入相机开关）开关、识别增强档位与自定义热词、天气动效开关、日出日落联动开关、月相观测位置、刷新缓存。
+- ⚙️ **设置管理**：修改地址 / 用户名 / 认证、实例服务模式（DSH / Zcode）与远端服务端口、清空缓存、缩放控制、对话区缩放控件 / 相机入口 / 语音输入入口（含并入相机开关）开关、识别增强档位与自定义热词、天气动效开关、日出日落联动开关、月相观测位置、GitHub 仓库快捷访问开关（PAT 令牌 / 地址覆盖）、刷新缓存。
 - ℹ️ **关于**：显示版本、项目原理、开源地址，可直接跳转 GitHub / README。
 - 🔒 **敏感信息加密**：密码 / 私钥存于 Android Keystore（`flutter_secure_storage`）。
 
@@ -117,7 +118,7 @@ flutter build apk --release
 
 1. 首次打开 → 配置 SSH 地址（如 `100.81.83.59`）、用户名（如 `jianzengliang`）、认证方式与本地端口（默认 `3081`）；最多可配置 3 路实例。
 2. 保存并连接，隧道建立后自动加载 `http://127.0.0.1:3081` 的 DSH Web UI。若服务端启用了 token 鉴权（访问提示 `dsh web authentication required`），先在设置对应实例填入 DSH 启动时打印的 `?token=` 值。
-3. 顶栏：实例切换器 + 连接状态 + Unsloth Studio 入口 + 设置入口。设置页含 SSH 配置、DSH 访问 Token、Unsloth Studio 配置、加载超时、界面开关（缩放控件 / 相机入口 / 语音输入入口 / 天气动效 / 日出日落联动）、月相观测位置、上传大小上限、关于信息。
+3. 顶栏：实例切换器 + 连接状态 + Unsloth Studio 入口 + GitHub 入口（全局开关开启后显示）+ 设置入口。设置页含 SSH 配置、DSH 访问 Token、Unsloth Studio 配置、GitHub 仓库快捷访问开关（PAT 令牌可在 GitHub 页面内直接填写）、加载超时、界面开关（缩放控件 / 相机入口 / 语音输入入口 / 天气动效 / 日出日落联动）、月相观测位置、上传大小上限、关于信息。
 
 > 说明：远程 DSH 默认只监听 `127.0.0.1:3080`，且配置类接口（如 `settings.describe`）被设计为仅 loopback 访问。DSH-Phone 通过 SSH 隧道把手机本机端口转发到远程，使 WebView 以 loopback 身份访问，从而获得完整功能。
 >
@@ -165,6 +166,7 @@ lib/
 ├── download_manager.dart     # 会话级下载管理（断点续传 / 暂停 / 取消）
 ├── download_screen.dart      # 资源下载页（进度 / 暂停继续 / 另存为）
 ├── unsloth_screen.dart       # Unsloth Studio 页面（独立 WebView / 缓存刷新 / 自动登录）
+├── github_screen.dart        # GitHub 仓库快捷访问页（独立 WebView / PAT 令牌对话框 / x-access-token 自动认证 / 登录持久化）
 ├── asr/asr_engine.dart           # 语音识别引擎抽象（StreamingAsrEngine 接口）
 ├── asr/sherpa_streaming_asr.dart # sherpa-onnx 流式中文识别封装（录音→PCM→实时 partial）
 ├── asr/asr_model_manager.dart    # 中文模型管理（~160MB 断点续传下载 / 就绪校验）
@@ -183,6 +185,12 @@ third_party/flutter_foreground_task/  # 本地 fork 的 flutter_foreground_task�
 
 ## 版本记录
 
+- **v0.2.2（build 18）**：**GitHub 仓库快捷访问 + ASR 全离主线程 + APK 瘦身 76%**——
+  - **GitHub 仓库快捷访问**：全局开关默认关闭（设置 → 外部访问），开启后顶栏设置旁出现 `</>` 图标，应用内 WebView 打开 github.com；本地缓存优先加载、Cookie/DOM Storage 登录持久化（网页登录一次长期有效）；**PAT 令牌免登录**——GitHub 页面顶栏钥匙图标直接填入 Fine-grained Personal Access Token（勾选 contents: read 只读即可），存 `flutter_secure_storage`，保存后自动以 `x-access-token:` 前缀重载认证进入登录态，清空令牌回落网页登录；访问地址可覆盖（兼容 GitHub Enterprise）。
+  - **语音/识别全离主线程**：ASR 识别整体迁移 **worker isolate**（解码不再占用 UI 线程）+ 浮层加载态；**热词真正生效**（修复 modeling_unit 缺省导致编码失败），词表外生僻字走**同音后校正**；松手后保留 **1 秒收声缓冲**避免尾字截断；修复语音松手后未自动发送（发送按钮误匹配正文 todoBar——改 id/aria 优先、仅匹配真实按钮，页面 async send 自动重试一次）。
+  - **回前台自愈**：后台断连后回到前台自动恢复——WebView 健康检查 + SSH 隧道探活 + 自动重连重载，无需手动刷新。
+  - **APK 瘦身 92.8MB → 22.3MB（-76%）**：NDK 仅打包 arm64-v8a（弃 32 位兼容库 -37.9MB；老机型可 `--split-per-abi` 出双包）；原生库压缩存储（`.so` 解压态 47.4MB → 包内 18.8MB，安装时解包、运行性能不变）；剔除安卓永不加载的 Web 专用资产（-4.2MB）。
+  - **交互细节**：相机按钮默认位置上移约 1cm，拖动**松手持久化**位置（纵向比例 + 吸附侧），下次进入沿用；实例切换器去掉序号前缀仅显示实例名，节省顶栏空间。
 - **v0.2.1（build 17）**：**DSH ⇄ Zcode 双服务模式 + 语音/相机/天气体验与稳定性**——
   - **实例级服务模式（DSH/Zcode）**：每路实例可选服务模式，隧道转发目标随模式切换（DSH→远端 3080 / Zcode→远端 8080 用户级单端口 web 服务，鉴权链与 DSH 一致，token 必填提示）；Zcode 远端服务端口可按机器配置；顶栏图标**一键切换模式**，就地更新转发目标不断线；修复改端口/模式后配置对比漏比不重连、热切换后 token 无效（转发连接未销毁、主文档命中旧缓存跳过鉴权链）等系列问题。
   - **语音并入相机 + 识别增强**：设置可将语音输入并入相机按钮（隐藏麦克风，相机右下角叠加麦克风角标随月相底色自动反色，短按拍照/长按说话）；相机按钮支持左右边缘吸附；新增**识别增强**档位（beam search + 热词），内置 + 自定义中文热词**两档均生效**并对热词做归一化（忽略标点空白分隔）；按下录音有短促提示音；麦克风空闲缓慢呼吸。
