@@ -17,6 +17,7 @@ import 'artifact_viewer_screen.dart';
 import 'config.dart';
 import 'download_manager.dart';
 import 'download_screen.dart';
+import 'github_screen.dart';
 import 'host_monitor.dart';
 import 'moon_astronomy.dart';
 import 'moon_location.dart';
@@ -111,6 +112,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   bool _hostMonitorEnabled = true; // 主机监控（默认开：采样并呈现曲线）
   bool _resourceViewEnabled = true; // 资源查看（默认开）
   bool _resourceDownloadEnabled = true; // 资源下载（默认开）
+  bool _githubEnabled = false; // GitHub 仓库快捷访问（全局开关，默认关）
 
   /// 缩放比例共享通知器：设置页可实时监听并展示。
   final ValueNotifier<double> _zoomScaleNotifier = ValueNotifier<double>(1.0);
@@ -814,11 +816,13 @@ class _WebViewScreenState extends State<WebViewScreen>
     final hostMonitor = await SSHConfig.loadHostMonitorEnabled();
     final resourceView = await SSHConfig.loadResourceViewEnabled();
     final resourceDownload = await SSHConfig.loadResourceDownloadEnabled();
+    final github = await SSHConfig.loadGithubEnabled();
     if (!mounted) return;
     setState(() {
       _hostMonitorEnabled = hostMonitor;
       _resourceViewEnabled = resourceView;
       _resourceDownloadEnabled = resourceDownload;
+      _githubEnabled = github;
     });
     // 同步监控采样器：关闭则不请求（曲线随之消失）。
     HostMonitor.instance.enabled = hostMonitor;
@@ -844,6 +848,13 @@ class _WebViewScreenState extends State<WebViewScreen>
     if (!mounted) return;
     setState(() => _resourceDownloadEnabled = enabled);
     SSHConfig.saveResourceDownloadEnabled(enabled);
+  }
+
+  /// GitHub 快捷访问开关：保存后刷新顶栏入口显隐。
+  void _setGithubEnabled(bool enabled) {
+    if (!mounted) return;
+    setState(() => _githubEnabled = enabled);
+    SSHConfig.saveGithubEnabled(enabled);
   }
 
   /// 通过 CSS zoom 应用缩放比例（页面就绪后调用）。
@@ -1137,6 +1148,22 @@ class _WebViewScreenState extends State<WebViewScreen>
     );
   }
 
+  /// 是否存在启用了 GitHub 快捷访问的全局开关。
+  ///
+  /// 顶栏 GitHub 入口据此显示/隐藏：未启用时隐藏（首页无意义）。
+  bool get _githubAvailable => _githubEnabled;
+
+  /// 打开 GitHub 仓库访问页面（全局开关，与当前连接实例无关）。
+  void _openGithub() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => GitHubScreen(
+          timeoutSeconds: _timeoutSeconds,
+        ),
+      ),
+    );
+  }
+
   Future<void> _openSettings({int? profileIndex}) async {
     final connected = _tunnelStatus == TunnelStatus.connected;
     final target = profileIndex ?? _activeIndex;
@@ -1178,6 +1205,8 @@ class _WebViewScreenState extends State<WebViewScreen>
           onResourceViewChanged: _setResourceViewEnabled,
           resourceDownloadEnabled: _resourceDownloadEnabled,
           onResourceDownloadChanged: _setResourceDownloadEnabled,
+          githubEnabled: _githubEnabled,
+          onGithubEnabledChanged: _setGithubEnabled,
           // 实例级监控开关即时保存后：重新加载配置并刷新监控隧道
           onInstanceMonitorChanged: (_) => _load(),
         ),
@@ -1983,6 +2012,13 @@ class _WebViewScreenState extends State<WebViewScreen>
                 tooltip: 'Unsloth Studio',
                 icon: const Icon(Icons.science_outlined),
                 onPressed: _openUnsloth,
+              ),
+            // GitHub 入口：全局开关启用时显示
+            if (_githubAvailable)
+              IconButton(
+                tooltip: 'GitHub',
+                icon: const Icon(Icons.code_outlined),
+                onPressed: _openGithub,
               ),
             IconButton(
               tooltip: '设置',

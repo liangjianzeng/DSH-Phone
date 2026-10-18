@@ -97,6 +97,10 @@ class SSHConfig {
   static const String keyResourceView = 'resource_view_enabled';
   static const String keyResourceDownload = 'resource_download_enabled';
 
+  // GitHub 仓库快捷访问（全局，非实例级；token 是用户级不随实例变）
+  static const String keyGithubEnabled = 'github_enabled';
+  static const String keyGithubUrl = 'github_url';
+
   // 实例级"默认主机资源监控"开关（最多一个实例开启）
   static const String keyInstanceHostMonitor = 'instance_host_monitor';
 
@@ -121,6 +125,10 @@ class SSHConfig {
   // Zcode 服务访问 Token（敏感项）：zcode-phone-server 的 config.json token，
   // 服务端首次启动自动生成。与 DSH 的 access_token 相互独立、分开存储。
   static const String secZcodeToken = 'zcode_token';
+
+  // GitHub 访问令牌（敏感项，存 secure storage）：fine-grained PAT，
+  // 以 x-access-token 前缀注入 URL 自动认证，避免 WebView 内 OAuth 登录。
+  static const String secGithubToken = 'github_token';
 
   static const String authTypeKey = 'key';
   static const String authTypePassword = 'password';
@@ -450,6 +458,51 @@ class SSHConfig {
   static Future<void> saveResourceDownloadEnabled(bool enabled) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(keyResourceDownload, enabled);
+  }
+
+  // ============ GitHub 仓库快捷访问（全局）============
+
+  /// 读取 GitHub 快捷访问开关（默认关闭）。
+  static Future<bool> loadGithubEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(keyGithubEnabled) ?? false;
+  }
+
+  /// 保存 GitHub 快捷访问开关。
+  static Future<void> saveGithubEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(keyGithubEnabled, enabled);
+  }
+
+  /// 读取 GitHub 访问地址（默认 github.com，空值归一化）。
+  static Future<String> loadGithubUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    final v = (prefs.getString(keyGithubUrl) ?? '').trim();
+    return v.isNotEmpty ? v : 'https://github.com';
+  }
+
+  /// 保存 GitHub 访问地址（允许清空回退默认）。
+  static Future<void> saveGithubUrl(String url) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(keyGithubUrl, url.trim());
+  }
+
+  /// 读取 GitHub 访问令牌（敏感项，存 secure storage；Android Keystore
+  /// 失效时兜底空串，避免启动即崩溃）。
+  static Future<String> loadGithubToken() async {
+    const storage = FlutterSecureStorage();
+    return _safeSecRead(storage, secGithubToken);
+  }
+
+  /// 保存 GitHub 访问令牌（空则删除，避免旧值滞留在 keystore）。
+  static Future<void> saveGithubToken(String token) async {
+    const storage = FlutterSecureStorage();
+    final t = token.trim();
+    if (t.isNotEmpty) {
+      await storage.write(key: secGithubToken, value: t);
+    } else {
+      await storage.delete(key: secGithubToken);
+    }
   }
 
   // ============ 端侧 ASR 识别增强档位 ============

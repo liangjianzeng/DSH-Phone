@@ -48,6 +48,8 @@ class SetupScreen extends StatefulWidget {
     this.onResourceViewChanged,
     this.resourceDownloadEnabled = true,
     this.onResourceDownloadChanged,
+    this.githubEnabled = false,
+    this.onGithubEnabledChanged,
 
     /// 实例级"默认主机资源监控"开关即时保存后通知父级刷新监控隧道。
     this.onInstanceMonitorChanged,
@@ -140,6 +142,11 @@ class SetupScreen extends StatefulWidget {
   final bool resourceDownloadEnabled;
   final ValueChanged<bool>? onResourceDownloadChanged;
 
+  /// GitHub 快捷访问全局开关（由父级传入，与实例无关）。
+  final bool githubEnabled;
+  /// GitHub 开关变更回调。
+  final ValueChanged<bool>? onGithubEnabledChanged;
+
   /// 实例级"默认主机资源监控"开关即时保存后通知父级刷新监控隧道。
   final ValueChanged<bool>? onInstanceMonitorChanged;
 
@@ -229,6 +236,11 @@ class _SetupScreenState extends State<SetupScreen> {
   late bool _resourceViewEnabled;
   late bool _resourceDownloadEnabled;
 
+  /// GitHub 快捷访问（全局配置，随设置页一次性加载，不随实例标签切换重置）。
+  late bool _githubEnabled;
+  late TextEditingController _githubTokenCtrl;
+  late TextEditingController _githubUrlCtrl;
+
   /// 文件上传大小上限（MB），默认 10，范围 1~30（全局配置）。
   late int _uploadMaxMb;
 
@@ -260,6 +272,10 @@ class _SetupScreenState extends State<SetupScreen> {
     _hostMonitorEnabled = widget.hostMonitorEnabled;
     _resourceViewEnabled = widget.resourceViewEnabled;
     _resourceDownloadEnabled = widget.resourceDownloadEnabled;
+    _githubEnabled = widget.githubEnabled;
+    _githubTokenCtrl = TextEditingController(text: '');
+    _githubUrlCtrl = TextEditingController(text: 'https://github.com');
+    _loadGithub();
     _uploadMaxMb = SSHConfig.defaultUploadMaxMb;
     _asrMode = AsrMode.standard;
     _appVersion = SSHConfig.fallbackAppVersion;
@@ -275,6 +291,27 @@ class _SetupScreenState extends State<SetupScreen> {
   Future<void> _loadAppVersion() async {
     final v = await SSHConfig.appVersion();
     if (mounted) setState(() => _appVersion = v);
+  }
+
+  /// 异步加载 GitHub 快捷访问的令牌与访问地址（全局配置，非实例级）。
+  Future<void> _loadGithub() async {
+    final token = await SSHConfig.loadGithubToken();
+    final url = await SSHConfig.loadGithubUrl();
+    if (!mounted) return;
+    setState(() {
+      _githubTokenCtrl.text = token;
+      _githubUrlCtrl.text = url;
+    });
+  }
+
+  /// 保存 GitHub 令牌（即时落盘 secure storage；空值则清除，避免旧值残留）。
+  Future<void> _saveGithubToken(String value) async {
+    await SSHConfig.saveGithubToken(value);
+  }
+
+  /// 保存 GitHub 访问地址（即时落盘；允许清空回退默认 github.com）。
+  Future<void> _saveGithubUrl(String value) async {
+    await SSHConfig.saveGithubUrl(value);
   }
 
   /// 异步加载全局"文件上传大小上限"（设置页独立路由，本地持有即时反映）。
@@ -434,6 +471,8 @@ class _SetupScreenState extends State<SetupScreen> {
     _zcodeToken.dispose();
     _unslothPort.dispose();
     _unslothPassword.dispose();
+    _githubTokenCtrl.dispose();
+    _githubUrlCtrl.dispose();
     super.dispose();
   }
 
@@ -1140,6 +1179,66 @@ class _SetupScreenState extends State<SetupScreen> {
             widget.onResourceDownloadChanged?.call(v);
           },
         ),
+        const Divider(),
+        const Text('外部访问', style: TextStyle(fontSize: 16)),
+        const SizedBox(height: 8),
+        // GitHub 仓库快捷访问（全局开关，默认关闭）
+        SwitchListTile(
+          title: const Text('GitHub 仓库快捷访问'),
+          subtitle: const Text(
+            '默认关闭；开启后顶栏出现 GitHub 图标，点击在应用内打开 github.com\n'
+            '支持网页登录（Cookie 持久化）或填入个人访问令牌（PAT）免登录',
+          ),
+          value: _githubEnabled,
+          onChanged: (v) {
+            setState(() => _githubEnabled = v);
+            widget.onGithubEnabledChanged?.call(v);
+          },
+        ),
+        // 开启后显示令牌 / 地址配置
+        if (_githubEnabled) ...[
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: Text(
+              '推荐：GitHub → Settings → Developer settings → '
+              'Fine-grained personal access tokens 生成令牌，'
+              '勾选 contents: read 即可只读浏览仓库。',
+              style: TextStyle(color: Colors.grey[600], fontSize: 11),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: TextField(
+              controller: _githubTokenCtrl,
+              obscureText: true,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: InputDecoration(
+                labelText: '个人访问令牌（PAT，可选）',
+                hintText: '留空则使用网页登录',
+                isDense: true,
+                border: const OutlineInputBorder(),
+              ),
+              onChanged: _saveGithubToken,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: TextField(
+              controller: _githubUrlCtrl,
+              autocorrect: false,
+              decoration: InputDecoration(
+                labelText: '访问地址（可选覆盖）',
+                hintText: 'https://github.com',
+                isDense: true,
+                border: const OutlineInputBorder(),
+              ),
+              onChanged: _saveGithubUrl,
+            ),
+          ),
+          const SizedBox(height: 4),
+        ],
         const Divider(),
         const Text('端侧语音识别增强', style: TextStyle(fontSize: 16)),
         const SizedBox(height: 8),
