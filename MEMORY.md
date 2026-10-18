@@ -78,6 +78,23 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 
 ---
 
+## APK 打包与完整性核验（2026-10-18）
+
+- **构建命令**：`flutter build apk --release`，产物 `build/app/outputs/flutter-apk/app-release.apk`。APK 已入 `.gitignore`（不进 Git，历史版上 Releases）；本地构建产物同路径。
+- **22MB 是正常的、包是完整的**，不要误以为截断或漏打。实测拆解：
+  - 解压后 `lib/` = **47.4MB** → 压缩进 APK 约 20MB（`.so` 已编译，压缩率 ~2:1）；加 dex/资源/清单 ≈ **22.3MB** 成品。解压体积 ≈ 压缩后 2.4 倍，对得上即完整。
+  - **arm64-v8a 单一架构**（现代手机几乎都是 arm64，无需四架构重复，否则体积翻倍）。
+  - `lib/` 内含真货：`libonnxruntime.so`(21.7M) + `libapp.so`(11.4M, Dart+sherpa C++) + `libflutter.so`(10.6M) + sherpa 双 `so`(4.8M)。
+  - **ASR 模型(~160MB)不打包**：运行时下载（代码设计"不新增下载、体积不变"）；**WebView 用系统 WebView**，不内置 Chromium（否则 +40~50M）。github.com / DSH / Unsloth 加载都依赖系统 WebView（安卓预装）。
+- **沙箱内无 adb 时，如何核验一个 APK 是否完整**：
+  - 列清单：`jar tf <apk>`（`jar` 在 JDK bin；`unzip`/`7z` 本机未必有）。
+  - 看 `lib/<arch>/*.so` 是否齐全（flutter/app/onnxruntime/sherpa 等关键库），`assets/` 是否误打/漏打模型。
+  - 拆包算大小：`Expand-Archive` 只认 `.zip` 后缀，需先 `Copy-Item .apk .zip` 再拆；`Get-ChildItem -Recurse` 算 `lib/` 总大小，与 APK 压缩后大小对得上即完整。
+  - **受限语言模式挡 `[System.IO.Compression.ZipArchive]` 等 .NET 静态调用**，用 cmdlet/CLI（`Expand-Archive` / `jar`）而非 .NET 类型。
+- 改完代码先 `flutter analyze` 确认无报错再构建（dart 分析器走 `C:\src\flutter\bin\cache\dart-sdk\bin\dart.exe`）。
+
+---
+
 ## zcode-phone-server 位置（2026-10-04 迁移）
 
 - **桥接服务已迁入本项目**：`E:\DTXY\DSH-Phone\zcode-phone-server\`（原来是 `E:\DTXY\zcode-phone-server`，旧路径已不存在）。
