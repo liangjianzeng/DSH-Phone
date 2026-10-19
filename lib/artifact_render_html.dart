@@ -143,7 +143,11 @@ document.addEventListener('click', function (e) {
     String best = ',';
     var bestCount = -1;
     for (final cand in [',', ';', '\t', '|']) {
-      final count = RegExp(RegExp.escape(cand)).allMatches(firstLine).length;
+      // 不用 RegExp.escape：CI 矩阵还跑 Flutter 3.27 / Dart 3.6，那个版本没有
+      // 这个 API（本地 3.7 能过、CI 直接红），手写转义更省事。
+      final escaped =
+          cand.replaceAllMapped(RegExp(r'[.*+?^${}()|\[\]\\]'), (m) => '\\${m[0]}');
+      final count = RegExp(escaped).allMatches(firstLine).length;
       if (count > bestCount) {
         bestCount = count;
         best = cand == '\t' ? 'Tab' : cand;

@@ -29,6 +29,9 @@ jobs:
       - name: pub get
         run: flutter pub get
 
+      - name: JS 桥校验（注入脚本在 Dart 字符串里，analyze/test 看不见）
+        run: node tool/check_bridges_js.mjs
+
       - name: 静态分析
         run: flutter analyze --no-pub
 

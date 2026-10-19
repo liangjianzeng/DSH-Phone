@@ -161,18 +161,31 @@ const String artifactBridgeJs = r'''
         'css|scss|vue|kt|swift|lua|pl|sh|bash|yml|yaml|toml|sql|xml|proto|' +
         'graphql|tf|gradle|diff|patch|ipynb';
     // `(\?|#|$)` 不能省：DSH 的链接常带 ?token=，否则后缀一律判不出。
-    var isResourceSuffix = new RegExp('\\.(' + RESOURCE_EXT + ')(\\?|#|$)', 'i');
-    var isTextSuffix = new RegExp('\\.(' + TEXT_EXT + ')(\\?|#|$)', 'i');
-    var isAnyArtifactSuffix =
+    var resourceRe = new RegExp('\\.(' + RESOURCE_EXT + ')(\\?|#|$)', 'i');
+    var textRe = new RegExp('\\.(' + TEXT_EXT + ')(\\?|#|$)', 'i');
+    var anyArtifactRe =
         new RegExp('\\.(' + TEXT_EXT + '|' + RESOURCE_EXT + ')(\\?|#|$)', 'i');
+    // 版本化动态库（libfoo.so.1 / libfoo.so.1.2.3）：endsWith 判不出，但它是
+    // 纯二进制。Dart 侧 ArtifactRules.typeOfPath 有同款规则，**两处必须一致**，
+    // 否则 chip 点进来是 file → 二进制被当文本读进内存画成乱码。
+    var versionedSoRe = /\.so\.[0-9]/i;
+    function isResourcePath(p) {
+      var s = String(p || '');
+      return resourceRe.test(s) || versionedSoRe.test(s);
+    }
+    function isTextPath(p) { return textRe.test(String(p || '')); }
+    function isArtifactPath(p) {
+      var s = String(p || '');
+      return anyArtifactRe.test(s) || versionedSoRe.test(s);
+    }
     var isFileUrlPrefix = /\/api\/files\/|\/files\/|\/api\/artifact\/|\/artifacts\//i;
 
     // 1) 文件型成果链接：优先判断，即使链接包裹在 pre/code 里。
     var a = closestUp(t, ['a']);
     if (a) {
       var href = a.getAttribute('href') || '';
-      var isFile = isFileUrlPrefix.test(href) || isTextSuffix.test(href);
-      var isResource = isResourceSuffix.test(href);
+      var isFile = isFileUrlPrefix.test(href) || isTextPath(href);
+      var isResource = isResourcePath(href);
       if (isFile || isResource) {
         ev.preventDefault();
         ev.stopPropagation();
@@ -208,12 +221,12 @@ const String artifactBridgeJs = r'''
       var label = mention.getAttribute('aria-label') || '';
       var filePath = elementPath(mention) || title || label || '';
       var isMention = cls.indexOf('fileMention') >= 0 ||
-          isAnyArtifactSuffix.test(filePath);
+          isArtifactPath(filePath);
       if (isMention && filePath) {
         ev.preventDefault();
         ev.stopPropagation();
         // 资源型（apk 等二进制）：走下载保存流程；否则经 SSH 读取查看。
-        var isResource = isResourceSuffix.test(filePath);
+        var isResource = isResourcePath(filePath);
         send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: filePath});
         return;
       }
@@ -229,14 +242,14 @@ const String artifactBridgeJs = r'''
       var text = code.innerText || code.textContent || '';
       var trimmed = text.trim();
       var singleLine = trimmed.indexOf('\n') < 0 && trimmed.length > 0;
-      var suffixRe = isAnyArtifactSuffix; // 脚本内统一后缀表（含 ?/# 处理）
+      var suffixRe = { test: isArtifactPath }; // 脚本内统一后缀表（含 ?/# 与 .so.N）
       if (singleLine && suffixRe.test(trimmed)) {
         // 先按文件名在整个文档的产物 chips 里反查完整路径；
         // 若文本自身已含路径分隔符（/ 或 \），则直接用文本作为路径。
         var mentionPath = findMentionPath(trimmed);
         if (!mentionPath && /[\\/]/.test(trimmed)) mentionPath = trimmed;
         if (mentionPath) {
-          var isResource = isResourceSuffix.test(mentionPath);
+          var isResource = isResourcePath(mentionPath);
           send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: mentionPath});
           return;
         }
@@ -244,7 +257,7 @@ const String artifactBridgeJs = r'''
         // 由 Dart 侧逐个拼接目录定位云端路径。
         var dirs = collectProducedDirs();
         if (dirs.length > 0) {
-          var isResource = isResourceSuffix.test(trimmed);
+          var isResource = isResourcePath(trimmed);
           send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: trimmed, dirs: dirs});
           return;
         }
@@ -271,7 +284,7 @@ const String artifactBridgeJs = r'''
         var bodyMention = bodyBase ? findMentionPath(bodyBase) : '';
         var bodyPath = bodyMention || raw;
         var hasSep = raw.indexOf('\\') >= 0 || raw.indexOf('/') >= 0;
-        var endsWithArtifact = isAnyArtifactSuffix.test(raw);
+        var endsWithArtifact = isArtifactPath(raw);
         // 形似路径：含反斜杠、以 / 或 ~/ 开头、无空格且带已知后缀。
         // 新增"带空格但确实以成果后缀结尾"一支：Windows 里
         // `C:\Program Files\x\报告.md` 这类路径此前**完全点不动**（旧判据要求整串
@@ -284,7 +297,7 @@ const String artifactBridgeJs = r'''
         if (looksPath) {
           ev.preventDefault();
           ev.stopPropagation();
-          var isResource = isResourceSuffix.test(bodyPath);
+          var isResource = isResourcePath(bodyPath);
           send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: bodyPath, dirs: collectProducedDirs()});
           return;
         }

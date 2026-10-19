@@ -83,6 +83,18 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
   Uint8List? _imageBytes;
   bool _loadingImage = false;
 
+  /// 渲染种类与网页文档的**按内容缓存**。
+  ///
+  /// 不是微优化：判定要看首行特征，直接 `content.trimLeft().toLowerCase()`
+  /// 对 20MB 文本就是整串拷贝，而 AppBar 的 tooltip/icon/onPressed 一次 build
+  /// 就问了三遍；`document()` 同理每次 setState 重拼整份 HTML。
+  ArtifactRenderKind? _cachedKind;
+  String? _cachedKindSource;
+  String? _cachedHtml;
+  String? _cachedHtmlSource;
+  ArtifactRenderKind? _cachedHtmlKind;
+  bool? _cachedHtmlDark;
+
   /// 异步加载中的内容（loader 拉取后填充）。
   String? _asyncContent;
   bool _loading = false;
@@ -227,17 +239,18 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
           IconButton(
             // 主渲染方式开关：WebView 效果最好（CSS/图片/表格/脚本），
             // 原生更快也更抗超长文件——两者都保留，用户按需切。
-            tooltip: _shouldUseWeb(_renderKindFor(_effectiveContent))
+            tooltip: _shouldUseWeb(_renderKindFor(_effectiveContent),
+                    _effectiveContent)
                 ? '改用原生渲染（更快，超长文件更稳）'
                 : '改用网页渲染（样式/图片/表格更完整）',
-            icon: Icon(_shouldUseWeb(_renderKindFor(_effectiveContent))
+            icon: Icon(_shouldUseWeb(_renderKindFor(_effectiveContent),
+                    _effectiveContent)
                 ? Icons.phone_android_outlined
                 : Icons.html_outlined),
             onPressed: _isImage || (_effectiveContent.isEmpty && !_loading)
                 ? null
-                : () => setState(() =>
-                    _useWebRenderer =
-                        !_shouldUseWeb(_renderKindFor(_effectiveContent))),
+                : () => setState(() => _useWebRenderer = !_shouldUseWeb(
+                    _renderKindFor(_effectiveContent), _effectiveContent)),
           ),
           IconButton(
             tooltip: '网页式打开（兜底）',
@@ -526,6 +539,16 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
   /// 以前 `file` 型一律先试 HTML、否则 Markdown，于是 `.csv`（没有 `|`）被挤成
   /// 一段、`.json` 的缩进被 Markdown 吃掉且无高亮——这两类现在单独走自己的路。
   ArtifactRenderKind _renderKindFor(String content) {
+    if (_cachedKind != null && _cachedKindSource == content) {
+      return _cachedKind!;
+    }
+    final kind = _computeRenderKind(content);
+    _cachedKind = kind;
+    _cachedKindSource = content;
+    return kind;
+  }
+
+  ArtifactRenderKind _computeRenderKind(String content) {
     final name = (widget.fileName ?? '').toLowerCase();
     final lang = widget.language.trim().toLowerCase();
     if (name.endsWith('.json') || lang == 'json') {
@@ -548,11 +571,17 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
     return ArtifactRenderKind.markdown;
   }
 
+  /// WebView 走 method channel 把整份 HTML 传给原生 `loadDataWithBaseURL`，
+  /// 超大字符串在 Android 上容易撞 binder 事务上限、表现为**点开一片空白**
+  /// （比"渲染朴素"更糟）。超过这个量默认走原生；用户手动切网页仍然允许。
+  static const int _maxWebChars = 1500 * 1024;
+
   /// 是否用系统 WebView 渲染（用户可切换，默认除代码外都用）。
-  bool _shouldUseWeb(ArtifactRenderKind kind) {
+  bool _shouldUseWeb(ArtifactRenderKind kind, String content) {
     final explicit = _useWebRenderer;
     if (explicit != null) return explicit;
-    return kind != ArtifactRenderKind.code;
+    if (kind == ArtifactRenderKind.code) return false;
+    return content.length <= _maxWebChars;
   }
 
   /// 相对资源的基址：不传 baseUrl，HTML/Markdown 里的相对图片与 CSS 必然 404。
@@ -571,7 +600,7 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
   Widget _buildContent() {
     final content = _effectiveContent;
     final kind = _renderKindFor(content);
-    if (_shouldUseWeb(kind)) return _buildWebView(kind, content);
+    if (_shouldUseWeb(kind, content)) return _buildWebView(kind, content);
     switch (kind) {
       case ArtifactRenderKind.code:
         return _buildCodeRenderer(content);
@@ -593,13 +622,22 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
   /// 系统 WebView 主渲染：CSS/字体/表格/图片/脚本交给 Chromium。
   Widget _buildWebView(ArtifactRenderKind kind, String content) {
     final dark = Theme.of(context).brightness == Brightness.dark;
-    final html = ArtifactWebDocument.document(
-      kind: kind,
-      content: content,
-      dark: dark,
-      title: widget.fileName ?? _title,
-      language: widget.language,
-    );
+    if (_cachedHtml == null ||
+        _cachedHtmlSource != content ||
+        _cachedHtmlKind != kind ||
+        _cachedHtmlDark != dark) {
+      _cachedHtml = ArtifactWebDocument.document(
+        kind: kind,
+        content: content,
+        dark: dark,
+        title: widget.fileName ?? _title,
+        language: widget.language,
+      );
+      _cachedHtmlSource = content;
+      _cachedHtmlKind = kind;
+      _cachedHtmlDark = dark;
+    }
+    final html = _cachedHtml!;
     return InAppWebView(
       initialData: InAppWebViewInitialData(
         data: html,
@@ -711,12 +749,15 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
     }
     final header = shown.first;
     final scheme = Theme.of(context).colorScheme;
+    // 纵向 + 横向各一层：只给横向一层时，纵向被 viewport 高度限死，
+    // 表格超过约 15 行就直接 RenderFlex 溢出成黄黑花屏。
     return SingleChildScrollView(
       padding: const EdgeInsets.all(12),
-      scrollDirection: Axis.horizontal,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
           DataTable(
             columns: [
               for (var c = 0; c < cols; c++)
@@ -755,7 +796,8 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
             '${rows.length > shown.length ? '（原生模式仅显示前 ${shown.length - 1} 行，切"网页渲染"看全部）' : ''}',
             style: TextStyle(fontSize: 12, color: scheme.outline),
           ),
-        ],
+          ],
+        ),
       ),
     );
   }
