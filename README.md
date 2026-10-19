@@ -48,11 +48,13 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - 🔐 **首次启动引导**：设置 SSH 地址、端口、用户名，认证方式支持 **SSH 密钥（默认）** 与 **密码**。
 - 📦 **多连接实例（最多 3 路）**：配置指向不同服务端的多路 SSH 实例，顶栏状态栏一键自由切换；可为每路实例设置**别名**（最多 7 个中文或 15 个英文字母），顶栏优先显示别名而非地址，避免多路 IP 混淆；敏感信息仍加密存储。
 - 🔑 **DSH Token 鉴权适配**：新版 DSH 服务端启用 token 鉴权后，在设置中为实例填入「DSH 访问 Token」（显隐切换、随实例切换回填），访问时自动拼接 `?token=` 换取会话 cookie；仅配置了 token 才拼接（旧版服务保持裸地址直连）；token 变更自动重载重新鉴权；401/403 显示专属提示引导填 Token。
-- 🔀 **DSH ⇄ Zcode 双服务模式（实例级）**：每路实例可选择服务模式——**DSH**（转发到远端 `127.0.0.1:3080`）或 **Zcode**（转发到远端 `127.0.0.1:8787` 的 **zcode-phone-server** 桥接服务，鉴权链与 DSH 一致）；Zcode 远端服务端口可按机器修改；顶栏图标一键切换当前模式（仅切隧道转发目标，连接不断、就地生效）。详见下方 [Zcode 模式与 zcode-phone-server](#zcode-模式与-zcode-phone-server)。
+- 🔀 **三服务模式（实例级：DSH 必选主模式 + Zcode / WorkBuddy 可选开关）**：每路实例可分别开启 **Zcode**（转发到远端 `127.0.0.1:8787` 的 **zcode-phone-server** 桥接服务，鉴权链与 DSH 一致）与 **WorkBuddy**（远端 `127.0.0.1:8790`），**DSH**（远端 `127.0.0.1:3080`）恒在。三模式的**远端端口与访问 Token 各自独立存储**（3080 / 8787 / 8790），隧道按当前模式取对应端口。顶栏模式切换入口按**可用模式数**自动变形：只开 DSH 时**不显示**（只有一个模式时不摆"自己切自己"的图标）、两个模式时一键翻转、三个模式时下拉直接选（当前模式打勾）。切换只改转发目标，SSH 会话原样保留、就地生效不断线；远端端口可按机器修改。详见下方 [Zcode 模式与 zcode-phone-server](#zcode-模式与-zcode-phone-server)。
 - ⏱️ **可配置页面加载超时**：默认 60s、范围 30–180s，设置页滑块调整；大上下文会话历史加载较慢时可调大。
 - 🔄 **自动 SSH 隧道**：基于 `dartssh2` 建立本地端口转发，无需 Root。
-- ⚡ **SSH 保活与静默重连**：每 10s 发送 keep-alive，降低移动网络空闲断连；首次异常（如隐藏后台 / 黑屏一段时间后断线）**不闪现错误提示、直接默认重连**，连续异常才提示并自动退避重试（递增退避 + 连续失败上限）。
-- 🔒 **前台服务后台保活**：隧道连接期间启动 Android 前台服务（低优先级静默通知 + 唤醒锁），App 进入后台或关屏时进程与网络保持运行、SSH 保活持续发送，恢复前台**不再重连**；滑动清除任务后隧道随任务停止。
+- ⚡ **隧道监督器与自愈（单一事实来源）**："重连几次、什么时候报错、要不要整条重建"全部收归 `TunnelService` 决策层，UI 只渲染 `TunnelState` 快照、不自行决策——消除旧实现里界面重试计数与隧道内部状态并发打架（表现为"一直提示连不上、手动重试也没用"）。故障先分类（DNS / 不可达 / 被拒 / 超时 / 认证 / 主机密钥 / 私钥 / 本地端口 / 远端无应答）：链路抖动走**指数退避 0.8s→封顶 60s、带抖动、永不放弃**，配置类错误当场提示去改设置。每 10s SSH keep-alive；每 15s 走**端到端探活**（探本地转发端口，半开/假死连接也能查出来），并区分「SSH 传输层已死」→ 重建 与「远端服务没起」→ 不白重建。
+- 🩺 **连接诊断（事件流）**：隧道全程记录事件环形缓冲（400 条：建链 / 认证 / 转发 / 探活 / 重建 / 退避），入口 **设置 → 主机 → 连接诊断**（主界面横幅的「详情」也进这里）。真机挂 VPN、没有 adb 时，这是事后定位"到底在哪一步断的"的唯一入口。
+- 🔁 **顶栏主动刷新与非阻塞提示**：顶栏连接状态图标即状态（绿=正常 / 橙=抖动或重连中 / 红=配置类失败 / 灰=未连），点一下立即端到端探活、探不通当场强制重建（旧版顶栏没有任何重连入口，假死只能杀 App）。链路不健康时**不弹红色全屏、不显示加载遮罩、不烧页面重试次数**，只在页面顶部挂一条非阻塞横幅，恢复健康后自动补载；WebView 一旦连上即**常驻**，网络闪断不再 dispose 整棵 WebView 导致 SPA 状态全丢、整站重载。
+- 🔒 **前台服务后台保活**：隧道需要保持期间（**含重连过程中**，旧实现只在已连接时保活，后台一断就被摘掉唤醒锁、越断越连不上）启动 Android 前台服务（低优先级静默通知 + 唤醒锁），App 进入后台或关屏时进程与网络保持运行、SSH 保活持续发送，恢复前台**不再重连**；滑动清除任务后隧道随任务停止。
 - 🚀 **隧道吞吐优化**：本地 fork 的 `dartssh2`（认证后 zlib 压缩 + 整包批量解密），双向透传不做应用层节流，显著提升大体积加载速度。
 - 🧭 **WebView 加载 DSH Web UI**：`flutter_inappwebview`，loopback 访问，模型/设置等特权接口可用。
 - 💾 **本地缓存加速**：WebView 遵循标准 HTTP 缓存头（服务端 `Cache-Control` 决定资源复用与回源，`no-store` 资源的更新可靠到达手机，修复长期加载旧页面）；主文档请求带 `no-cache`，保证 token→Set-Cookie 鉴权链不被缓存跳过；支持手动清缓存刷新。
@@ -76,7 +78,7 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - ⚡ **设置自动保存**：表单编辑停止即自动落盘（无右上角"保存"按钮），返回设置页自动重连应用最新配置；实例级监控开关切换即生效。
 - 🖥️ **全屏边缘到边缘**：顶栏延伸到系统状态栏区域，最大化显示面积。
 - 🌗 **主题自适应**：跟随系统深色 / 浅色模式，背景与状态栏图标自动切换。
-- ⚙️ **设置管理**：修改地址 / 用户名 / 认证、实例服务模式（DSH / Zcode）与远端服务端口、清空缓存、缩放控制、对话区缩放控件 / 相机入口 / 语音输入入口（含并入相机开关）开关、识别增强档位与自定义热词、天气动效开关、日出日落联动开关、月相观测位置、GitHub 仓库快捷访问开关（PAT 令牌 / 地址覆盖）、刷新缓存。
+- ⚙️ **设置管理**：修改地址 / 用户名 / 认证、实例服务模式（DSH / Zcode / WorkBuddy）与各模式远端服务端口、**连接诊断**入口、清空缓存、缩放控制、对话区缩放控件 / 相机入口 / 语音输入入口（含并入相机开关）开关、识别增强档位与自定义热词、天气动效开关、日出日落联动开关、月相观测位置、GitHub 仓库快捷访问开关（PAT 令牌 / 地址覆盖）、刷新缓存。
 - ℹ️ **关于**：显示版本、项目原理、开源地址，可直接跳转 GitHub / README。
 - 🔒 **敏感信息加密**：密码 / 私钥存于 Android Keystore（`flutter_secure_storage`）。
 
@@ -106,19 +108,34 @@ Zcode 模式的对端是独立仓库 [zcode-phone-server](https://github.com/lia
 
 ### 构建 APK
 
+推荐用仓库自带的一键脚本（先自检环境，再构建）：
+
+```bash
+tool/build_apk.sh                # release APK（默认只 AOT arm64）
+tool/build_apk.sh --check        # 只自检：SDK / JDK 17 / gen_snapshot / 签名是否齐
+tool/build_apk.sh --debug        # debug 包（JIT，不需要 AOT 快照生成器）
+```
+
+等价的手动命令：
+
 ```bash
 flutter pub get
 dart run flutter_launcher_icons        # 从 icon/logo.png 生成启动图标
-flutter build apk --release
+flutter build apk --release --target-platform=android-arm64
 ```
 
 产物：`build/app/outputs/flutter-apk/app-release.apk`（发版时上传 GitHub Releases，仓库不提交 APK 二进制）
+
+打包环境按平台见 [BUILD.md](BUILD.md)（[Windows](BUILD.windows.md) / [Linux、macOS、CI](BUILD.linux.md)），两条通用注意：
+
+- **release 签名**：需要 `android/key.properties` + `key.jks`（不入库）。缺失时 `build.gradle` 会**静默回退 debug 签名**——能装机自测，但不能覆盖安装已发布的正式版，也不要拿去发版。
+- **aarch64 Linux 打包机**（ARM 服务器 / Jetson / DGX 等）：Google 不发 linux_arm64 的 aapt2 / NDK clang，Flutter 也不发 arm64 Linux 主机的 Android AOT `gen_snapshot`，需一次性安装 amd64 多架构运行库与 FEX 模拟器，再用 `tool/build_apk.sh --fix-artifacts` 补齐官方产物（自动包一层 FEX 包装，因为 qemu-user 跑 `gen_snapshot` 会自身崩溃）。清单与报错对照表见 [BUILD.linux.md](BUILD.linux.md)。
 
 ### 使用
 
 1. 首次打开 → 配置 SSH 地址（如 `100.81.83.59`）、用户名（如 `jianzengliang`）、认证方式与本地端口（默认 `3081`）；最多可配置 3 路实例。
 2. 保存并连接，隧道建立后自动加载 `http://127.0.0.1:3081` 的 DSH Web UI。若服务端启用了 token 鉴权（访问提示 `dsh web authentication required`），先在设置对应实例填入 DSH 启动时打印的 `?token=` 值。
-3. 顶栏：实例切换器 + 连接状态 + Unsloth Studio 入口 + GitHub 入口（全局开关开启后显示）+ 设置入口。设置页含 SSH 配置、DSH 访问 Token、Unsloth Studio 配置、GitHub 仓库快捷访问开关（PAT 令牌可在 GitHub 页面内直接填写）、加载超时、界面开关（缩放控件 / 相机入口 / 语音输入入口 / 天气动效 / 日出日落联动）、月相观测位置、上传大小上限、关于信息。
+3. 顶栏：实例切换器（点当前实例标签弹菜单换实例，别名过长自动省略）+ 连接状态（点一下 = 立即探活/重连）+ 模式切换（仅当该实例开了 Zcode 或 WorkBuddy 时出现）+ Unsloth Studio 入口 + GitHub 入口（两者按全局开关显示）+ 设置入口（**始终钉在最右**，图标再多也不会被挤出屏幕，其余图标过宽时横向滚动）。设置页含 SSH 配置、DSH 访问 Token、服务模式与远端端口、**连接诊断**、Unsloth Studio 配置、GitHub 仓库快捷访问开关（PAT 令牌可在 GitHub 页面内直接填写）、加载超时、界面开关（缩放控件 / 相机入口 / 语音输入入口 / 天气动效 / 日出日落联动）、月相观测位置、上传大小上限、关于信息。
 
 > 说明：远程 DSH 默认只监听 `127.0.0.1:3080`，且配置类接口（如 `settings.describe`）被设计为仅 loopback 访问。DSH-Phone 通过 SSH 隧道把手机本机端口转发到远程，使 WebView 以 loopback 身份访问，从而获得完整功能。
 >
@@ -156,9 +173,12 @@ flutter build apk --release
 lib/
 ├── main.dart                 # 应用入口：主题/全屏、首次启动判断
 ├── config.dart               # SSH 配置模型 + 持久化（最多 3 路实例 / 加载超时 / 上传大小上限 / DSH 访问 Token / 旧配置迁移）
-├── tunnel_service.dart       # SSH 隧道服务（认证 / 转发 / 保活 / 断线重连 / SFTP 读取与上传 / 路径解析 / 主机密钥 TOFU）
-├── setup_screen.dart         # 设置 / 首次引导页（实例编辑 / 超时 / 上传大小上限 / 界面控制 / 关于）
-├── webview_screen.dart       # WebView 主界面（实例切换 / 缓存 / 缩放 / 成果识别桥 / 文件上传注入 / 路由）
+├── tunnel_service.dart       # SSH 隧道监督器（唯一事实来源：建链 / 转发 / 保活 / 端到端探活 / 退避重建 / SFTP 读写 / 主机密钥 TOFU）
+├── tunnel_policy.dart        # 隧道决策层（纯 Dart 零依赖：失败分类 / 指数退避 / 四级提示分级）
+├── tunnel_diagnostics.dart   # 隧道事件观测层（环形缓冲 400 条，事后定位断连原因）
+├── tunnel_diagnostics_screen.dart # 连接诊断页（事件流回放，入口：设置 → 主机 / 横幅「详情」）
+├── setup_screen.dart         # 设置 / 首次引导页（实例编辑 / 服务模式与端口 / 超时 / 上传大小上限 / 界面控制 / 连接诊断入口 / 关于）
+├── webview_screen.dart       # WebView 主界面（顶栏与模式切换 / 实例切换 / 非阻塞链路横幅 / 缓存 / 缩放 / 成果识别桥 / 文件上传注入 / 路由）
 ├── webview_bridges.dart      # WebView 注入的 JS 桥脚本常量（成果点击 / 任务状态 / 图片直传 / 文本注入）
 ├── host_monitor.dart         # 主机监控（10 分钟趋势采样 / 环形缓冲 / 趋势绘制）
 ├── artifact_recognizer.dart  # 成果类型识别（markdown/html/代码/文件/资源）
@@ -179,8 +199,10 @@ lib/
 ├── weather_effects.dart      # 相机按钮周边天气动效（云/雨/雪/雾/雷）
 ├── task_notifier.dart        # AI 任务进行中/完成系统通知（锁屏可见）
 └── foreground_service.dart   # 前台服务保活封装（隧道连接期间后台保持进程/网络）
-third_party/dartssh2/                 # 本地 fork 的 dartssh2（吞吐优化 + SFTP 会话释放）
+third_party/dartssh2/                 # 本地 fork 的 dartssh2（吞吐优化 + SFTP 会话释放 + 半开连接/通道泄漏等 5 处本地加固，同步上游时须保留）
 third_party/flutter_foreground_task/  # 本地 fork 的 flutter_foreground_task（AGP 8.x namespace 兼容）
+tool/build_apk.sh                     # 打包机一键脚本（环境自检 / 补齐 aarch64 主机的官方 AOT 产物 / 构建）
+test/                                 # 单元测试（隧道失败分类与退避 / 热词校正 / 成果识别 / 日出日落 …）
 ```
 
 ## 版本记录

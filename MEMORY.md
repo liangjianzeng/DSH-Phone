@@ -95,6 +95,27 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 
 ---
 
+## Linux(aarch64) 打包机：本机编 APK（2026-10-19）
+
+> 本机的 Linux 侧构建记录（Ubuntu 24.04 / aarch64，`Linux 7.0.0-1019-nvidia`）。结论：**能本机出 release APK**，
+> 但要过四道与项目代码无关的坑；全部固化在 `tool/build_apk.sh`（自检 + 修产物 + 构建）。
+
+- **一次性环境准备**（root，本机已装好）：
+  - `sudo dpkg --add-architecture amd64`；另建 `/etc/apt/sources.list.d/amd64-foreign.sources`，`URIs` 必须指 `http://archive.ubuntu.com/ubuntu/`（ports 源没有 amd64），`Architectures: amd64`，再 `sudo apt-get update`。
+  - `sudo apt-get install -y libc6:amd64 libstdc++6:amd64 zlib1g:amd64`。**zlib1g 漏装极难查**：NDK clang 起不来，CMake 只留一句 `The C compiler identification is unknown`。
+  - `sudo add-apt-repository -y ppa:fex-emu/fex && sudo apt-get install -y fex-emu-armv8.2`（原因见第 4 条）。
+- **`android/local.properties` 必须是 `sdk.dir=/home/jianzengliang/android-sdk`**。写成发行版自带的 `/usr/lib/android-sdk`（只有 platform-tools，没有 platforms/build-tools/ndk）会让 Gradle 找不到 compileSdk，`flutter doctor` 也跟着报 "cmdline-tools component is missing"。
+- **Google 不发 linux_arm64 的 Android 原生工具**：`repository2-3.xml` 里 `linux_arm64` 出现 **0 次**——aapt2、build-tools、NDK clang 全是 x86-64，只能靠 qemu-user binfmt 透明执行。缺 amd64 运行库时报 `x86_64-binfmt-P: Could not open '/lib64/ld-linux-x86-64.so.2'`（debug 构建表现为 `AAPT2 ... Daemon startup failed`）。
+- **Flutter 官方不发 arm64 Linux 主机的 Android AOT 快照生成器**：`flutter_tools` 的 `_linuxBinaryDirs` 只列 `android-<abi>-<mode>/linux-x64.zip`（**master 分支至今如此，升级 Flutter 也没用**），运行时却按 hostArch 去 `android-<abi>-<mode>/linux-arm64/gen_snapshot` 找。`tool/build_apk.sh --fix-artifacts` 下载官方 linux-x64 里的 `gen_snapshot` 放进 `linux-arm64/`（md5 必须与官方一致；**别拿别处的二进制顶替**——桌面版 `linux-arm64/gen_snapshot` 不认 `--target-os`，编不出安卓快照）。
+- **qemu-user 跑 gen_snapshot 必崩——别再在 qemu 上耗时间**：表现 `Dart snapshot generator failed with exit code -11`、`qemu-x86_64: QEMU internal SIGSEGV {code=MAPERR, addr=0x20}`（是 **qemu 自己**段错误，不是 guest 崩）。已实测 **qemu 8.2.2（Ubuntu）与 10.0.0（Alpine/musl）表现完全一致**；`-cpu max`、`-cpu qemu64,+avx`、`-singlestep`、`-R <reserved_va>`、屏蔽 `/proc/self/maps`、去掉 `--strip/--deterministic` 全部无效。根因：guest 里 Dart 发出尺寸下溢的 `mmap(NULL, -4096, …)`，真内核返回 ENOMEM 而 qemu 误报成功，VM 随后进入坏状态。**出路是换模拟器**：FEX（FEXCore，x86-64 on AArch64）跑同一个官方 x64 `gen_snapshot`，21s 正常产出 `app.so`。
+  - 落地：`gen_snapshot` 位置换成薄包装（真身改名 `gen_snapshot.bin`），有 FEX 走 FEX、没有则退回 binfmt。只动这一个文件，**不改系统 binfmt**（amd64 容器仍依赖 qemu）。
+  - aapt2 / NDK clang 用 qemu 就够，不需要 FEX。
+- **验证过的成功路径**：`git worktree` 干净检出 HEAD 后 `tool/build_apk.sh --fix-artifacts` → `✓ Built build/app/outputs/flutter-apk/app-release.apk (23.4MB)`，约 6 分钟；抽出的 `libapp.so` 是真 arm64 AOT（`file` 报 ARM aarch64，`_kDartIsolateSnapshotInstructions` 在位）。
+- **本机仍不等于能发正式包**：`android/key.properties` 与 `key.jks` 不在这台机器上，release 会**静默回退 debug 签名**（能装能跑，但不能覆盖安装已装正式版、不能上 Releases）。正式包继续走 CI（打 tag → GitHub Actions x86-64 runner）或 Windows 打包机，直到证书拷来。
+- **DSH 沙箱注意**：策略 `workspace-write` 时 flutter 启动即挂在 `bin/internal/update_engine_version.sh: .../engine.version: 权限不够`（它要写 `~/flutter/bin/cache`），跑 flutter/dart 需 `danger-full-access`。
+
+---
+
 ## zcode-phone-server 位置（2026-10-04 迁移）
 
 - **桥接服务已迁入本项目**：`E:\DTXY\DSH-Phone\zcode-phone-server\`（原来是 `E:\DTXY\zcode-phone-server`，旧路径已不存在）。
@@ -125,15 +146,74 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 
 ---
 
-## 后台断连自愈链路（2026-10-06，webview_screen.dart）
+## 隧道监督器与自愈不变量（2026-10-06 建立，2026-11 全量重构为 TunnelService 监督器）
 
-- **现象**：App 退后台一会再回来，经常面对「无法加载远程界面 net::ERR_CONNECTION_REFUSED」死错误页，只能手动点重试。
-- **根因**：后台被系统掐断 SSH socket 后，页面重试（3 次×3s）在隧道退避重连（最长约 30s）完成前就烧完；且回前台时没有任何健康检查——隧道重连次数烧完停在 failed、或状态滞留 connected 而底层 socket 已死，两种情况都没人再触发恢复。
-- **自愈不变量（改这些路径前先读懂）**：
-  - `_onPageError`：隧道不在位时**不烧**页面重试次数，置 `_pageNeedsReload=true` 等隧道恢复；
-  - `_onTunnelStatus` 到 connected 且 `_pageError != null` → `_retryLoad()`（隧道恢复驱动页面重载的主路径）；
-  - `_connect()` 成功路径：URL 不匹配**或** `_pageNeedsReload` → 重载；
-  - `didChangeAppLifecycleState` resumed → `_recoverAfterResume()`：隧道非 connected 直接 `_manualConnect()`；自称 connected 先 `_probeLocalPort()`（HTTP 探测本地转发端口，任何响应含 303/401 都算活着），探不通强制重建隧道。
+**演进**：原来"重连几次、什么时候报错、要不要重建"散落在 `webview_screen.dart`
+（`_scheduleReconnect` 5 次上限 / `_handleConnectFailure` 首次静默 / `_recoverAfterResume`
+自己 HTTP 探测后 disconnect+connect）。三套逻辑并发打架：UI 侧计数被并发 `connect()`
+清零、5 次烧完后**再没有任何定时器**（表现为"一直提示连接不上，重试也不成功"）、
+回前台的探测走带 token 的完整地址（每次回前台重跑鉴权链）。现在**唯一事实来源**是
+`TunnelService` 的 `TunnelState` 快照 + `stateStream`，UI 只渲染不决策。
+
+- **决策层（纯 Dart，零依赖，可单测）**：`lib/tunnel_policy.dart`
+  - `classifyTunnelFailure()`：DNS / 不可达 / 被拒 / 超时 / 认证 / 主机密钥 / 私钥 / 远端无应答 / 本地端口 → 决定"该重试"还是"该提示改设置"；
+  - `TunnelBackoff`：0.8s 起、×2、封顶 60s、±25% 抖动、**永不放弃**（老实现的头号杀手是"放弃"）；
+  - `TunnelAlertPolicy`：`silent/busy/attention/hard` 四级。链路抖动最多 `busy`（非阻塞横幅），配置类错误（认证/主机密钥/私钥/本地端口）直接 `hard`。
+- **观测层**：`lib/tunnel_diagnostics.dart` 环形缓冲（400 条）+ `lib/tunnel_diagnostics_screen.dart` 事件流页。真机 + VPN 没有 adb，这是唯一能事后定位"到底哪儿断"的入口 —— **不要再把它从设置页摘掉**（入口：设置→主机→连接诊断；主界面横幅「详情」也进这里）。
+- **监督器不变量（改 `tunnel_service.dart` 前先读懂）**：
+  1. `connect()` **幂等且不抛异常**：并发调用共享 `_inflight`，永不 reject。UI 侧任何"await connect 成功就当已连接"的写法都是错的，结论只能来自 `stateStream`。
+  2. 假死必须能被发现：`SSHClient.ping()`（`keepalive@openssh.com`）**无超时**、`forwardLocal()` 的 `_waitChannelOpenReply` **无超时**，半开连接上二者**永久挂起**。所以：转发建链 `.timeout(8s)`、`ping` 包 `.timeout(4s)`、看门狗每 15s 对 `http://127.0.0.1:localPort/` 做**端到端**探活（不带 token、`followRedirects=false`；只做 TCP connect 没用，我们的 `ServerSocket` 在传输层已死时照样 accept）。
+  3. 区分「SSH 死了」和「云端服务没起」：探活失败先 `ping` 传输层，活着 → `kind=remoteDown`（**不重建**，重建也白建），死了 → 连续 3 次 `_forceRebuild`。
+  4. `_wantConnected` 是唯一的"用户意图"开关：只有 `connect()` 置真、`disconnect()/dispose()` 置假。探活、转发回调、网络变化监听**都不许**绕过它自行建链。
+  5. 网络变化不用 `connectivity_plus`（未引入，别加）：`NetworkInterface.list()` 签名轮询（15s）变化即立刻重试。
+  6. 前台服务：`_wantConnected && status != idle` 期间保持（旧实现只在 `connected` 保活 → 后台重连过程中 wakelock 被摘掉，越断越连不上）。
+  7. `_hostTypes` 以 `host:port:username` 为 key（曾是 `Map<SSHClient,HostType>`：每次重连都泄漏一条 + 重新探测）。
+  8. **绝不开启 dartssh2 的 zlib 压缩**：fork 的 `_compressData` 会吐出 0 字节，开了就等于亲手造一个假死。
+  9. **世代号 `_generation` 是"作废在途尝试"的唯一手段**：`disconnect()` / 目标切换 / `dispose()` 都 `_bumpGeneration()`。`_attemptOnce` 在建链前后各复查一次 `aborted()`，`_openTunnel` 在登记 `_client` 前、`authenticated` 后、绑定端口后各复查一次；被取消的尝试抛 `TunnelAbortedException`，**不落失败状态、不排退避**。只靠 `_wantConnected` 挡不住——`await SSHSocket.connect` 回来时没人复查，会把已断开的隧道连回来并起看门狗。
+  10. `_teardown()` 必须在**任何 await 之前**同步摘走 `_client`/`_server`：否则 `await server.close()` 让出的那一拍里，旧 client 的 `_onTransportClosed` 守卫（`_client != client`）仍然通过，会给一条即将成功的新隧道排个退避定时器 → 十几秒后新隧道被自己拆掉。同理：建链成功分支必须 `_retryTimer?.cancel()`（`clearNextRetry` 只清界面字段），`_scheduleRetry` 的回调要校验世代。
+  11. **"端到端存活"只认下行数据**：`_pipe` 只在 `forward.stream` 侧调 `_noteForwardActivity()`。上行 `forward.sink.add` 只是入队，半开链路上本地能"一直在发"，用它当证据 = 假死永不可发现（而且 `probeOk` 被写真后连横幅都藏了）。新鲜窗捷径只允许**维持**既有健康，不能把 `probeOk` 从 false 翻成 true；`_teardown` 必须清 `_lastForwardActivity`。
+  12. `forwardLocal()` 超时后**必须自己收尾迟到的 channel**：`Future.timeout` 不取消源 future，服务端晚一拍回 OPEN_CONFIRM 时 dartssh2 仍会把 channel 登记进 `_channels` 并在远端建一条 TCP；超时/失败分支要 `openFuture.then((c) => c.destroy())`，否则每次超时永久泄漏一条 channel + 一条远端连接。
+  13. `_inflight` 去重要连**目标 key** 一起比（`_targetKey`）：否则 A 实例的在建尝试会被 `connect(B)` 当成 B 的成功返回 → B 的页面跑在 A 的隧道上。
+  14. 网络接口变化**不许清零退避**：tun0/WiFi 交接会让签名每 15s 变一次，`_resetAttempt()` 等于每 15s 一轮全量握手（认证风暴）。用 `networkRetryCooldown`(12s) + `_attempt` 降级不归零。
+  15. 主机类型缓存（`_hostTypes`，key=`host:port:username`）**只在拿到非空输出时写**：`_execOn` 超时返回 null 曾被当成"这是 Windows"永久缓存，Linux 主机从此走 PowerShell 采集、`ensureUploadDir` 探测 `C:/Users/...`。
+  16. 主机密钥 TOFU 不匹配**不许用服务级 bool 传递**（`testConnection`/监控/Unsloth 并发共用会串档，把主隧道的 DNS 失败误判成 hostKey 弹红）：走 `_verifyHostKey(onMismatch:)` 局部标志 → 抛 `TunnelHostKeyMismatchException`。
+  17. `ForegroundTunnelService` 的**期望态与实态分开**（`_want` / `_started`）并用 `_chain` 串行下发。旧实现 `_started` 在 await 之后才置位 + `stop()` 用 `if (!_started) return`：`disconnect()`→`connect()` 紧邻时会留下永久 wakelock，或者整个会话没有前台服务（后台重连最怕 Doze）。
+- **dartssh2 fork 的本地加固**（`third_party/dartssh2`，同步上游时务必保留，共 5 处）：
+  `ssh_socket_io.dart` 加 `TCP_NODELAY`；`ssh_transport.dart` `_onSocketData` 的非 `SSHError` 改为 `closeWithError(SSHInternalError)`（原来 `rethrow` 变成 uncaught zone error → 接收循环卡死而 `isClosed` 仍为 false，就是"显示已连接但已经死了"的成因）；`ssh_client.dart` `_handleTransportClosed` 用 `Channel_Open_Failure` 收尾 `_channelOpenReplyWaiters`（并 `_channelIdAllocator.release` 归还 id）；`_closeChannels()` 与 `close()` 各自包 try/finally——`channel.destroy()` 在传输已死时同步抛 `SSHStateError`，不防护的话 `_channels.clear()` 被跳过、**`_transport.close()` 永不执行**（fd 与远端 sshd 连接槽泄漏，还被调用方静默吞掉）。
+- **UI 侧不变量（`webview_screen.dart`）**：
+  - `_webViewAlive`：连上过就**常驻** WebView。旧结构按状态切分支、WebView 只活在 connected 分支，每次闪断都 dispose 整棵 WebView（SPA 状态全丢 + 整站重载），把网络抖动放大成"老是重新加载"。换实例时显式置假强制重建。
+  - 链路不健康时：不弹红色全屏、不显示加载遮罩、**不烧** `_pageRetryCount`，只挂非阻塞横幅（`_buildTunnelBanner`）+ 置 `_pageNeedsReload`；`_onTunnelState` 在恢复健康时自动补载。
+  - `_onAuthError` 先带已保存 token 自动重试一次（`_authRetryCount`）再要用户填 Token。
+  - 顶栏必须有主动刷新入口：`_buildConnectionButton` → `forceRefresh()`（旧版顶栏没有任何重连入口，假死时用户只能杀 App）。
+- **回归**：`test/tunnel_policy_test.dart`（分类 / 退避单调+封顶+抖动 / 分级 / 状态文案 / 环形缓冲）。改策略层必须让这些断言继续成立。
+
+---
+
+## Tailscale 场景断连排查清单（2026-11 专项）
+
+用户报"VPN 的 SSH 很容易断、一直提示连不上"时，**先看 App 内「连接诊断」的事件流**，
+按类别分流，别再让用户盲猜：
+
+| 事件流特征 | 判定 | 处置 |
+| --- | --- | --- |
+| `dns` / `Failed host lookup: *.ts.net` | Tailscale 未就绪或 MagicDNS 没生效 | 确认 App 有本地网络/VPN 权限；改用 IP 直连（设置里填 IP，不走 MagicDNS） |
+| `unreachable` / `Network is unreachable` | 节点没在线、key 过期、或不在同一 tailnet | `tailscale status` 看对端是否 `offline`；重登 |
+| `refused` | 服务端 sshd 没起 / 端口不对 | 属配置类 → App 直接提示"改设置"，不无限重试 |
+| `timeout` + 反复 `probe` 失败但 `ping` 传输层活着 | **云端服务没起**（DSH 3080 / Zcode 8787 / WorkBuddy 8790） | 提示"云端服务没有应答"，不重建 SSH；让用户起服务，别甩锅网络 |
+| 建链后突然 `transport closed`、`forward open timeout` | 中间设备/NAT 掐空闲连接 | 见下方服务端配置 |
+| 回前台必断 | 系统冻结进程 + Doze 掐网 | App 已用前台服务 + 回前台 `notifyShouldReconnectNow`；仍断则查电池优化白名单 |
+
+**服务端 `/etc/ssh/sshd_config` 建议**（空闲被 NAT/运营商掐断的最常见解药）：
+`ClientAliveInterval 20`、`ClientAliveCountMax 6`、`TCPKeepAlive yes`；
+改完 `sshd -t` 校验再 `systemctl reload sshd`。
+
+**客户端环境建议**：手机与服务端尽量**同一运营商/同一 NAT 出口**（跨运营商对端直连
+最容易被打孔超时）；把 App 加入电池优化白名单；Tailscale 侧开启 `Keepalive`
+（`tailscale set --... ` 或管理面板的 persistent keepalive）避免 DERP 空闲掉线。
+
+**验证方式**：设置→主机→「测试连接」确认 SSH 可通；主界面顶栏云图标点一下 =
+`forceRefresh()` 端到端探活；然后开「连接诊断」挂机 10 分钟，看 `probe`/`transport`
+事件密度，比让用户复现"有时候会断"有用得多。
 
 ---
 
