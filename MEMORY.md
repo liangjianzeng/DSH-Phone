@@ -92,6 +92,14 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
   - 拆包算大小：`Expand-Archive` 只认 `.zip` 后缀，需先 `Copy-Item .apk .zip` 再拆；`Get-ChildItem -Recurse` 算 `lib/` 总大小，与 APK 压缩后大小对得上即完整。
   - **受限语言模式挡 `[System.IO.Compression.ZipArchive]` 等 .NET 静态调用**，用 cmdlet/CLI（`Expand-Archive` / `jar`）而非 .NET 类型。
 - 改完代码先 `flutter analyze` 确认无报错再构建（dart 分析器走 `C:\src\flutter\bin\cache\dart-sdk\bin\dart.exe`）。
+- **打完包，回复里必须交付这四项（2026-10-20 用户定的固定要求，默认执行、不再等提醒）**：
+  1. **绝对路径**（不写 `build/...` 这种相对缩写）：`/home/jianzengliang/MyWork/DSH-Phone/build/app/outputs/flutter-apk/app-release.apk`
+  2. **字节数**（`ls -l` 真实值，顺手换算 MiB）；
+  3. **`sha256sum` 全量哈希**（装机方比对用，别只给前几位）；
+  4. **签名主体 + 构建时间**（`tool/build_apk.sh` 末尾那行 `CN=TongYiLite` 验收）。
+- 另附两条自证（避免"我以为编译进去了"）：构建前 `git status --porcelain lib tool pubspec.yaml .github test` 必须为空，即**包 = 已提交树**；构建后抽 `libapp.so` 抽查本轮新增的字符串/文案确在包内：
+  `unzip -oq <apk> lib/arm64-v8a/libapp.so -d /tmp/x && python3 -c "d=open('/tmp/x/lib/arm64-v8a/libapp.so','rb').read(); print('某新文案' in d.decode('utf-16-le', 'ignore') or '某新文案' in d.decode('utf-8','ignore'))"`
+  （Dart 快照里的中文串按 UTF-16 存，直接 `grep` UTF-8 会误报"缺失"。）
 
 ---
 
