@@ -1268,7 +1268,11 @@ class _WebViewScreenState extends State<WebViewScreen>
           a.unslothUseSsh != b.unslothUseSsh ||
           a.unslothPassword != b.unslothPassword ||
           a.accessToken != b.accessToken ||
-          a.zcodeToken != b.zcodeToken) {
+          a.zcodeToken != b.zcodeToken ||
+          a.zcodeEnabled != b.zcodeEnabled ||
+          a.workbuddyEnabled != b.workbuddyEnabled ||
+          a.workbuddyRemotePort != b.workbuddyRemotePort ||
+          a.workbuddyToken != b.workbuddyToken) {
         return true;
       }
     }
@@ -1281,9 +1285,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// Zcode：zcode-phone-server 对每个请求校验 Token，必须携带。
   String get _targetUrl {
     final base = 'http://127.0.0.1:${_config.localPort}';
-    final token =
-        (_config.isZcodeMode ? _config.zcodeToken : _config.accessToken)
-            .trim();
+    final token = _config.activeModeToken.trim();
     if (token.isEmpty) return base;
     return '$base/?token=${Uri.encodeQueryComponent(token)}';
   }

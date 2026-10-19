@@ -190,7 +190,7 @@ class TunnelService {
       server.listen(_handleLocalConnection);
 
       debugPrint('[DSH] tunnel up: 127.0.0.1:${config.localPort} -> '
-          '127.0.0.1:${config.remotePort}');
+          '127.0.0.1:${config.activeRemotePort}');
       _setStatus(TunnelStatus.connected);
     } catch (e) {
       debugPrint('[DSH] connect failed: $e');
@@ -273,8 +273,8 @@ class TunnelService {
 
   /// 就地更新当前隧道的转发目标配置（不重建 SSH 会话）。
   ///
-  /// 转发通道按连接逐条拨号 [_activeConfig.remotePort]（见 _handleForward），
-  /// 因此同实例内切换服务模式（DSH 3080 ⇄ Zcode 8787）只需更新内存配置。
+  /// 转发通道按连接逐条拨号 [_activeConfig.activeRemotePort]（见 _handleForward），
+  /// 因此同实例内切换服务模式（DSH 3080 ⇄ Zcode 8787 ⇄ WorkBuddy 8790）只需更新内存配置。
   /// 但已建立的连接仍固定转发到旧端口，必须全部销毁，迫使 WebView 用新
   /// 端口重建连接，否则复用的 keep-alive 连接会把请求送到旧服务上。
   /// 仅当 [profileIndex] 与当前激活实例一致时生效，防止迟到的旧实例调用串线。
@@ -304,9 +304,9 @@ class TunnelService {
         .whenComplete(() => _forwardConns.remove(local))
         .catchError((Object _) => _forwardConns.remove(local)));
     try {
-      // 远端服务监听 127.0.0.1:<remotePort>（DSH Web UI=3080 / zcode-phone-server=8787）
+      // 远端服务监听 127.0.0.1:<activeRemotePort>（DSH Web UI=3080 / zcode-phone-server=8787 / WorkBuddy=8790）
       final forward = await client
-          .forwardLocal('127.0.0.1', _activeConfig?.remotePort ?? 3080);
+          .forwardLocal('127.0.0.1', _activeConfig?.activeRemotePort ?? 3080);
       _pipe(local, forward);
     } catch (_) {
       local.destroy();
