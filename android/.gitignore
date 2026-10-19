@@ -1,8 +1,7 @@
-gradle-wrapper.jar
+# 注意：gradle-wrapper.jar / gradlew / gradlew.bat 必须入库（官方新模板即跟踪），
+# 否则新 clone 的打包机无法运行 ./gradlew / flutter build。勿再加忽略。
 /.gradle
 /captures/
-/gradlew
-/gradlew.bat
 /local.properties
 GeneratedPluginRegistrant.java
 

@@ -308,6 +308,23 @@ if command -v jar >/dev/null 2>&1; then
   jar tf "$APK" | grep -E '^lib/arm64-v8a/lib(app|flutter|onnxruntime|sherpa)' | sed 's/^/    /' || true
 fi
 
+# release 签名验收：与 TongYi-Lite 共用正式证书（CN=TongYiLite），
+# 指纹不符 = 打了临时/dev 签名，无法覆盖安装线上版（同 AGENTS 铁律）。
+EXPECTED_FP="fbbe1b6cf879ab941a65cdd7a7a8dd6f5a6bb640412de38c43cb894f08886992"
+APKSIGNER="$(ls "$ANDROID_SDK"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)"
+if [[ -n "$APKSIGNER" ]]; then
+  dn="$("$APKSIGNER" verify --print-certs "$APK" 2>/dev/null | sed -n 's/.*certificate DN: //p' | head -1)"
+  fp="$("$APKSIGNER" verify --print-certs "$APK" 2>/dev/null | sed -n 's/.*SHA-256 digest: //p' | head -1 | tr -d ':')"
+  if [[ "$fp" == "$EXPECTED_FP" ]]; then
+    ok "签名验收通过：$dn"
+  elif [[ "$MODE" == release ]]; then
+    bad "签名不符！$dn ($fp) ≠ CN=TongYiLite/$EXPECTED_FP —— 检查 android/key.jks"
+    exit 1
+  else
+    warn "debug 包签名 $dn（非正式证书，覆盖安装线上版会被拒）"
+  fi
+fi
+
 if [[ "$RUN_INSTALL" == 1 ]]; then
   if command -v adb >/dev/null 2>&1 && adb get-state >/dev/null 2>&1; then
     adb install -r "$APK"
