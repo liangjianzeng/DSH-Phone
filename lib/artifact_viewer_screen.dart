@@ -184,7 +184,10 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
       _loading = true;
       _loadError = null;
     });
-    loader().then((text) {
+    // 用 Future 包一层再链：loader 若**同步**抛异常（闭包内 assert/空指针），
+    // 直接 loader().then 会绕过 catchError，把界面永久留在转圈态。
+    Future<String> run() async => loader();
+    run().then((text) {
       if (!mounted || generation != _loadGeneration) return;
       setState(() {
         _asyncContent = text;

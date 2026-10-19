@@ -160,6 +160,23 @@ void main() {
       expect(find.textContaining('重试后的内容'), findsOneWidget);
     });
 
+    testWidgets('loader 同步抛异常也进错误态（不能永久转圈）', (tester) async {
+      await tester.pumpWidget(_wrap(ArtifactViewerScreen(
+        type: ArtifactType.file,
+        url: '',
+        language: '',
+        content: '',
+        fileName: 'boom.md',
+        webRenderer: false,
+        // 同步 throw（不是返回 rejected Future）：旧写法 loader().then()
+        // 会绕过 catchError，界面永远停在加载圈。
+        loader: () => throw StateError('boom'),
+      )));
+      await tester.pumpAndSettle();
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+      expect(find.textContaining('boom'), findsOneWidget);
+    });
+
     testWidgets('initialError 直接进错误界面（JS 侧 fetch 失败的原因不再被吞）',
         (tester) async {
       await tester.pumpWidget(_wrap(const ArtifactViewerScreen(
