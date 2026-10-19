@@ -30,6 +30,7 @@ class ArtifactViewerScreen extends StatefulWidget {
     this.fileName,
     this.rawBytesLoader,
     this.initialError = '',
+    this.webRenderer,
   });
 
   /// 识别类型。
@@ -61,6 +62,9 @@ class ArtifactViewerScreen extends StatefulWidget {
   /// 点开后只有笼统一句"无内容可查看"——既没说是失败，也没说是 401 还是超时，
   /// 用户和排查者都无从下手。
   final String initialError;
+
+  /// 初始渲染方式（null = 按内容类型自动选）。测试用，也便于以后"记住上次选择"。
+  final bool? webRenderer;
 
   @override
   State<ArtifactViewerScreen> createState() => _ArtifactViewerScreenState();
@@ -123,6 +127,7 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
   @override
   void initState() {
     super.initState();
+    _useWebRenderer = widget.webRenderer;
     if (widget.initialError.isNotEmpty) {
       // JS 侧 fetch 失败带来的原因（401 / 超时 / 超大），不再只是"无内容可查看"。
       _loadError = widget.initialError;
