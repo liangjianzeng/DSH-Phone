@@ -13,7 +13,7 @@ import 'package:share_plus/share_plus.dart';
 
 import 'artifact_recognizer.dart';
 import 'artifact_render_html.dart';
-import 'tunnel_service.dart' show RemoteReadException;
+import 'tunnel_service.dart' show RemoteFailureKind, RemoteReadException;
 
 /// 原生成果查看器：按类型渲染 md / html / 代码，关闭即返回对话。
 ///
@@ -28,6 +28,7 @@ class ArtifactViewerScreen extends StatefulWidget {
     this.content = '',
     this.loader,
     this.fileName,
+    this.path = '',
     this.rawBytesLoader,
     this.initialError = '',
     this.webRenderer,
@@ -61,6 +62,9 @@ class ArtifactViewerScreen extends StatefulWidget {
   /// 以前 JS 的 `fetchArtifact` 一旦失败就 `send({content:''})`，于是链接型成果
   /// 点开后只有笼统一句"无内容可查看"——既没说是失败，也没说是 401 还是超时，
   /// 用户和排查者都无从下手。
+  /// 读取用的云端路径：只为"出错时说清试过哪条路"而存在（无 adb 时的排查命脉）。
+  final String path;
+
   final String initialError;
 
   /// 初始渲染方式（null = 按内容类型自动选）。测试用，也便于以后"记住上次选择"。
@@ -82,6 +86,9 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
   /// onTapLink，相对图片与链接都点不动。原生那条路保留为"快速模式"
   /// （超长代码、低配机型、WebView 起不来时更有优势）。
   bool? _useWebRenderer;
+
+  /// 失败分类（来自 RemoteReadException.kind）：只报文案用户依然不知道下一步。
+  RemoteFailureKind? _loadErrorKind;
 
   /// 图片成果的字节（延迟加载）。图片以前只能下载，连看都看不了。
   Uint8List? _imageBytes;
@@ -199,6 +206,7 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
       if (!mounted || generation != _loadGeneration) return;
       setState(() {
         _loadError = _errorText(e);
+        _loadErrorKind = e is RemoteReadException ? e.kind : null;
         _loading = false;
       });
     });
@@ -207,6 +215,90 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
   /// 提取用户可读的失败原因（自定义异常直接取 message）。
   static String _errorText(Object e) =>
       e is RemoteReadException ? e.message : '$e';
+
+  /// AppBar 标题：优先文件名（4 个字的"文件成果"认不出是哪个成果），
+  /// 文件名过长时靠 ellipsis 收缩，不再靠挤掉标题腾地方。
+  String get _displayTitle {
+    final name = widget.fileName;
+    if (name != null && name.trim().isNotEmpty) return name.trim();
+    return _title;
+  }
+
+  /// 长按标题：复制"文件名 + 云端路径 + 链接"，用于无 adb 时的排查与转述。
+  Future<void> _copyTarget() async {
+    final parts = <String>[
+      if (_displayTitle.isNotEmpty) _displayTitle,
+      if (widget.path.isNotEmpty) '路径：${widget.path}',
+      if (widget.url.isNotEmpty) '链接：${widget.url}',
+    ];
+    if (parts.isEmpty) return;
+    try {
+      await Clipboard.setData(ClipboardData(text: parts.join('\n')));
+    } catch (_) {}
+    if (!mounted) return;
+    _toast('已复制文件名与路径');
+  }
+
+  /// 低频动作收进 ⋯ 菜单：栏上少两个图标，标题才有地方呼吸。
+  Widget _buildOverflowMenu() {
+    final useWeb = _shouldUseWeb(_renderKindFor(_effectiveContent),
+        _effectiveContent);
+    return PopupMenuButton<String>(
+      tooltip: '更多',
+      icon: const Icon(Icons.more_vert),
+      onSelected: (value) {
+        switch (value) {
+          case 'toggle-renderer':
+            setState(() => _useWebRenderer = !useWeb);
+          case 'web-open':
+            setState(() => _webFallback = true);
+          case 'copy-target':
+            _copyTarget();
+          case 'copy-content':
+            _copyContent();
+        }
+      },
+      itemBuilder: (context) => [
+        PopupMenuItem<String>(
+          value: 'toggle-renderer',
+          enabled: !_isImage &&
+              !(_effectiveContent.isEmpty && !_loading),
+          child: Row(children: [
+            Icon(useWeb ? Icons.phone_android_outlined : Icons.html_outlined,
+                size: 20),
+            const SizedBox(width: 10),
+            Text(useWeb ? '改用原生渲染（更快更稳）' : '改用网页渲染（效果最全）'),
+          ]),
+        ),
+        PopupMenuItem<String>(
+          value: 'web-open',
+          enabled: widget.url.isNotEmpty,
+          child: const Row(children: [
+            Icon(Icons.open_in_new, size: 20),
+            SizedBox(width: 10),
+            Text('网页式打开（兜底）'),
+          ]),
+        ),
+        const PopupMenuItem<String>(
+          value: 'copy-target',
+          child: Row(children: [
+            Icon(Icons.my_location, size: 20),
+            SizedBox(width: 10),
+            Text('复制文件名与路径'),
+          ]),
+        ),
+        if (!_canCopyShare)
+          const PopupMenuItem<String>(
+            value: 'copy-content',
+            child: Row(children: [
+              Icon(Icons.copy_all, size: 20),
+              SizedBox(width: 10),
+              Text('复制全文'),
+            ]),
+          ),
+      ],
+    );
+  }
 
   String get _title {
     final lang = widget.language;
@@ -227,8 +319,33 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
       // 背景跟随主题：深色模式下避免刺眼的浅色底色
       backgroundColor: scheme.surface,
       appBar: AppBar(
-        title: Text(_title),
+        // 真机上标题被挤成了"文…"：leading + 6 个图标把 360dp 宽度吃光，
+        // 标题只剩几个像素。三管齐下：图标降到 22、只留 3 个高频动作在栏上
+        // （其余进 ⋯ 菜单）、标题用 Flexible 收缩并支持长按复制文件名与路径。
+        titleSpacing: 4,
+        iconTheme: const IconThemeData(size: 22),
+        actionsIconTheme: const IconThemeData(size: 22),
+        // AppBar 已把 title 包在 Flexible 里（这里再套 Flexible 会
+        // Incorrect use of ParentDataWidget），所以只声明 ellipsis 即可。
+        title: Tooltip(
+          message: '长按复制文件名与路径',
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onLongPress: _copyTarget,
+            child: Text(
+              _displayTitle,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
+          ),
+        ),
         actions: [
+          IconButton(
+            tooltip: '另存为（保存到本机）',
+            icon: const Icon(Icons.download),
+            onPressed: _saving ? null : _save,
+          ),
           IconButton(
             tooltip: '复制内容',
             icon: const Icon(Icons.copy),
@@ -239,34 +356,7 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
             icon: const Icon(Icons.share),
             onPressed: _canCopyShare ? _shareContent : null,
           ),
-          IconButton(
-            tooltip: '另存为（下载保存到本机）',
-            icon: const Icon(Icons.download),
-            onPressed: _saving ? null : _save,
-          ),
-          IconButton(
-            // 主渲染方式开关：WebView 效果最好（CSS/图片/表格/脚本），
-            // 原生更快也更抗超长文件——两者都保留，用户按需切。
-            tooltip: _shouldUseWeb(_renderKindFor(_effectiveContent),
-                    _effectiveContent)
-                ? '改用原生渲染（更快，超长文件更稳）'
-                : '改用网页渲染（样式/图片/表格更完整）',
-            icon: Icon(_shouldUseWeb(_renderKindFor(_effectiveContent),
-                    _effectiveContent)
-                ? Icons.phone_android_outlined
-                : Icons.html_outlined),
-            onPressed: _isImage || (_effectiveContent.isEmpty && !_loading)
-                ? null
-                : () => setState(() => _useWebRenderer = !_shouldUseWeb(
-                    _renderKindFor(_effectiveContent), _effectiveContent)),
-          ),
-          IconButton(
-            tooltip: '网页式打开（兜底）',
-            icon: const Icon(Icons.open_in_new),
-            onPressed: widget.url.isEmpty
-                ? null
-                : () => setState(() => _webFallback = true),
-          ),
+          _buildOverflowMenu(),
         ],
       ),
       body: _buildBody(),
@@ -321,6 +411,11 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
         return const Center(child: CircularProgressIndicator());
       }
       final bytes = _imageBytes;
+      if ((bytes == null || bytes.isEmpty) && _canShowImageViaUrl) {
+        // 云端路径拿不到字节，但链接往往还能开（登录态在 WebView cookie 里）：
+        // 真机上"图片成果提示云端不存在该文件"就是这条兜底缺失造成的。
+        return _buildImageViewViaUrl();
+      }
       if (bytes == null || bytes.isEmpty) {
         return _buildLoadError('无法显示这张图片。');
       }
@@ -408,8 +503,11 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
 
   /// 文件型成果读取失败界面：展示真实原因并提供重试/另存为。
   Widget _buildLoadError([String message = '读取成果失败。']) {
+    final scheme = Theme.of(context).colorScheme;
+    final target = widget.path.isNotEmpty ? widget.path : widget.url;
+    final targetLabel = widget.path.isNotEmpty ? '路径' : '链接';
     return Center(
-      child: Padding(
+      child: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -425,12 +523,38 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
                 style: const TextStyle(color: Colors.red, fontSize: 13),
               ),
             ],
-            if (widget.url.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Text('地址：${widget.url}',
-                  style: const TextStyle(color: Colors.grey, fontSize: 12)),
+            if (_kindHint != null) ...[
+              const SizedBox(height: 6),
+              Text(_kindHint!,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: scheme.outline, fontSize: 12.5)),
             ],
-            const SizedBox(height: 20),
+            // 无 adb 真机排查的命脉：必须看得见"到底试了哪条路径"，
+            // 否则用户只能转述一句"点开提示云端不存在该文件"。
+            if (target.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                decoration: BoxDecoration(
+                  color: scheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: SelectionArea(
+                  child: Text(
+                    '$targetLabel：$target',
+                    style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 6),
+              TextButton.icon(
+                onPressed: _copyTarget,
+                icon: const Icon(Icons.copy, size: 16),
+                label: const Text('复制文件名与路径'),
+              ),
+            ],
+            const SizedBox(height: 12),
             FilledButton.icon(
               onPressed: _retryLoad,
               icon: const Icon(Icons.refresh),
@@ -442,14 +566,48 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
               icon: const Icon(Icons.download),
               label: const Text('另存为'),
             ),
+            if (widget.url.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                // SFTP 这条路走不通时，同源链接往往还能打开（登录态在 WebView
+                // cookie 里），至少让用户看到内容而不是一个红云。
+                onPressed: () => setState(() => _webFallback = true),
+                icon: const Icon(Icons.open_in_new),
+                label: const Text('用网页方式打开'),
+              ),
+            ],
           ],
         ),
       ),
     );
   }
 
+  /// 失败分类 → 下一步建议。
+  String? get _kindHint {
+    switch (_loadErrorKind) {
+      case RemoteFailureKind.notFound:
+        return '文件可能已被清理或改名；也可能是产物 chips 被隐藏后按目录拼出的路径不准。';
+      case RemoteFailureKind.isDirectory:
+        return '这是个目录，请点目录里的具体文件。';
+      case RemoteFailureKind.permission:
+        return '云端账号对该路径没有读权限。';
+      case RemoteFailureKind.timeout:
+        return '链路可能半开：切到主界面点顶栏状态图标探活，或直接重连。';
+      case RemoteFailureKind.channelExhausted:
+        return '远端 SSH 通道被占满（sshd MaxSessions）：稍等片刻再试，或减少并发下载。';
+      case RemoteFailureKind.notConnected:
+        return '隧道当前未连接：回主界面查看顶部横幅并重连。';
+      case RemoteFailureKind.tooLarge:
+        return '文件超出预览上限，请改用"另存为"。';
+      case RemoteFailureKind.other:
+      case null:
+        return null;
+    }
+  }
+
   void _retryLoad() {
     _loadedOk = false;
+    _loadErrorKind = null;
     _binaryVerdict = null;
     _binaryVerdictSource = null;
     _startLoad();
@@ -674,6 +832,47 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
           },
         );
       },
+    );
+  }
+
+  /// 是否可用同源链接显示图片（需 http(s) 链接）。
+  bool get _canShowImageViaUrl {
+    final u = widget.url;
+    return u.startsWith('http://') || u.startsWith('https://');
+  }
+
+  /// 用 WebView 直接加载图片链接：Chromium 自带缩放，且复用同源登录态——
+  /// Dart 侧的 HttpClient 拿不到 WebView cookie jar，自拼请求只会 401。
+  Widget _buildImageViewViaUrl() {
+    return Column(
+      children: [
+        Expanded(
+          child: InAppWebView(
+            initialUrlRequest: URLRequest(url: WebUri(widget.url)),
+            initialSettings: InAppWebViewSettings(
+              javaScriptEnabled: false,
+              cacheMode: CacheMode.LOAD_DEFAULT,
+              builtInZoomControls: true,
+              displayZoomControls: false,
+            ),
+            onReceivedError: (controller, request, error) {
+              if (request.isForMainFrame ?? false) {
+                debugPrint('VIEWER image url error: ${error.description}');
+              }
+            },
+          ),
+        ),
+        Container(
+          width: double.infinity,
+          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+          child: Text(
+            '云端路径读不到，已改用链接方式显示',
+            style: TextStyle(
+                fontSize: 12, color: Theme.of(context).colorScheme.outline),
+          ),
+        ),
+      ],
     );
   }
 

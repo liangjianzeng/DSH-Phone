@@ -1808,6 +1808,7 @@ class _WebViewScreenState extends State<WebViewScreen>
               language: '',
               content: hit.content,
               fileName: path.isNotEmpty ? _basename(path) : _basename(hit.url),
+              path: path,
               loader: path.isEmpty
                   ? null
                   : () => TunnelService.instance.readRemoteFile(path),
@@ -1840,6 +1841,7 @@ class _WebViewScreenState extends State<WebViewScreen>
               language: '',
               content: '',
               fileName: _basename(path),
+              path: path,
               // 读原始字节交 Image.memory：绝不能再走一遍文本解码。
               rawBytesLoader: () =>
                   TunnelService.instance.readRemoteFileBytes(path),
@@ -1879,6 +1881,8 @@ class _WebViewScreenState extends State<WebViewScreen>
           content: hit.content,
           loader: loader,
           fileName: hit.path.isNotEmpty ? _basename(hit.path) : null,
+          // 出错时要能看见"试过哪条路径"：没有 adb 的现场，这是唯一线索。
+          path: hit.path,
           rawBytesLoader: rawBytesLoader,
           // JS 侧取内容失败时回传的原因：让界面说"为什么没内容"，
           // 而不是笼统一句"无内容可查看"。
@@ -1927,12 +1931,17 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 旧判据是"含 `/` 或 `\` 就当完整路径直接早退"，于是 `./report.md`、
   /// `out/app.apk`、`~/x.md` 这类**相对路径**永远得不到目录反查的救机。
   static bool _looksLikeBareName(String path) {
-    if (path.isEmpty) return true;
+    if (path.trim().isEmpty) return true;
     final p = path.trim();
-    if (p.startsWith('./') || p.startsWith('../') || p.startsWith('~')) {
-      return true; // 相对/家目录路径：等价于"只有文件名"，值得反查
-    }
-    return !p.contains(r'\') && !p.contains('/');
+    // 绝对路径：Linux `/x`、Windows `C:\x` 或 `\\server\share`（UNC）。
+    // 除此之外一律值得反查——真机上 `outputs/报告.md`、`build/app.apk` 这类
+    // **相对路径**此前因为含 `/` 被当完整路径直接放行，SFTP 从家目录打开
+    // 必然 noSuchFile → 用户看到"云端不存在该文件"，而 chips 的目录其实就在手里。
+    final absolute = p.startsWith('/') ||
+        p.startsWith(r'\') ||
+        p.startsWith(r'\\') ||
+        RegExp(r'^[a-zA-Z]:[\\/]').hasMatch(p);
+    return !absolute;
   }
 
   /// 资源型成果：经 SSH 下载（复用隧道会话），打开下载页。

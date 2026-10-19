@@ -19,6 +19,49 @@ Widget _wrap(Widget child) => MaterialApp(
     );
 
 void main() {
+  group('ArtifactViewerScreen 顶栏（真机截图：图标把标题挤成"文…"）', () {
+    testWidgets('长文件名仍出现在标题里，栏上图标不超过 4 个', (tester) async {
+      const name = '季度业务分析报告-2026年第三季度-终版复核.md';
+      await tester.pumpWidget(_wrap(const ArtifactViewerScreen(
+        type: ArtifactType.markdown,
+        url: '',
+        language: '',
+        content: '# 正文',
+        fileName: name,
+        webRenderer: false,
+      )));
+      await tester.pumpAndSettle();
+      // 标题用文件名而不是"Markdown 成果"这种四千字标签，且必须渲染出来
+      expect(find.text(name), findsOneWidget);
+      // 栏上只留 另存为/复制/分享 + ⋯，其余进菜单（挤不掉标题的关键）
+      expect(tester.widgetList<IconButton>(find.byType(IconButton)).length,
+          lessThanOrEqualTo(4));
+      expect(find.byType(PopupMenuButton<String>), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('失败卡片显示试过的云端路径并可复制、可网页兜底', (tester) async {
+      await tester.pumpWidget(_wrap(ArtifactViewerScreen(
+        type: ArtifactType.file,
+        url: 'http://127.0.0.1:3080/api/files/outputs/report.md',
+        language: '',
+        content: '',
+        fileName: 'report.md',
+        path: '/root/outputs/report.md',
+        webRenderer: false,
+        loader: () async => throw const RemoteReadException('云端文件不存在',
+            kind: RemoteFailureKind.notFound),
+      )));
+      await tester.pumpAndSettle();
+      // 没有 adb 的现场，"到底试了哪条路径"必须看得见
+      expect(find.textContaining('/root/outputs/report.md'), findsOneWidget);
+      expect(find.textContaining('文件可能已被清理或改名'), findsOneWidget,
+          reason: '要给出分类建议，而不是一句红云');
+      expect(find.text('复制文件名与路径'), findsWidgets);
+      expect(find.text('用网页方式打开'), findsOneWidget);
+    });
+  });
+
   group('ArtifactViewerScreen 原生渲染布局', () {
     testWidgets('CSV 表格纵向可滚：多行不得 RenderFlex 溢出', (tester) async {
       final rows = ['名称,数量,备注'] +
@@ -174,7 +217,8 @@ void main() {
       )));
       await tester.pumpAndSettle();
       expect(find.byType(CircularProgressIndicator), findsNothing);
-      expect(find.textContaining('boom'), findsOneWidget);
+      // 标题同名（boom.md）也会命中，所以只要求"至少出现一次原因"。
+      expect(find.textContaining('boom'), findsWidgets);
     });
 
     testWidgets('initialError 直接进错误界面（JS 侧 fetch 失败的原因不再被吞）',
