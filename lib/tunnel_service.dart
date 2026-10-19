@@ -188,12 +188,54 @@ class TunnelHostKeyMismatchException implements Exception {
   String toString() => 'SSHHostkeyError: Hostkey verification failed';
 }
 
+/// 远端文件失败的具体种类。原来所有失败（不存在 / 是目录 / 无权限 / 隧道断 /
+/// 超时 / 文件被占用）都合并成一句「路径不存在或无权限」，是这条链路上最费
+/// 排查时间的设计——它们的处置方式完全不同。
+enum RemoteFailureKind {
+  notConnected,
+  notFound,
+  isDirectory,
+  permission,
+  timeout,
+  tooLarge,
+  channelExhausted,
+  other,
+}
+
 /// 远程文件读取失败（带用户可读原因，查看器据此展示）。
 class RemoteReadException implements Exception {
-  const RemoteReadException(this.message);
+  const RemoteReadException(this.message, {this.kind = RemoteFailureKind.other});
   final String message;
+  final RemoteFailureKind kind;
   @override
   String toString() => message;
+}
+
+/// [TunnelService.openRemoteFileDetailed] 的结果：句柄 + 失败原因。
+///
+/// 保留返回裸 `SftpFile?` 的 [TunnelService.openRemoteFile] 以兼容旧调用方，
+/// 但下载/预览一律用带原因的版本，否则"文件不存在"会被说成"隧道未连接"。
+class RemoteOpenResult {
+  const RemoteOpenResult(
+    this.file, {
+    this.sftp,
+    this.reason,
+    this.kind = RemoteFailureKind.other,
+    this.size,
+  });
+
+  final SftpFile? file;
+
+  /// 句柄所属的 SFTP 会话：调用方收尾时一并交还 `TunnelService.closeRemoteFile`，
+  /// 以便从存活会话表里摘除（隧道拆毁时才能准确 abort 存活会话）。
+  final SftpClient? sftp;
+  final String? reason;
+  final RemoteFailureKind kind;
+
+  /// `fstat` 得到的大小（未知为 null）：避免上层为拿尺寸再开一次往返。
+  final int? size;
+
+  bool get ok => file != null;
 }
 
 /// 单次主机采样：GPU 使用率 / GPU 温度 / CPU / 内存使用率。
@@ -231,6 +273,40 @@ class TunnelService {
   /// 超过该大小的文件不读入内存（readBytes），避免移动端 OOM，
   /// 大文件应走 [DownloadManager] 的下载/断点续传流程。
   static const int maxRemoteReadBytes = 8 * 1024 * 1024;
+
+  /// 预览可读上限（可配，默认 20MB）：8MB 是"早期拍脑袋"的值，与 JS 桥那个
+  /// 8MB 互不知情，导致大量中等体积的报告/日志点开就说"文件过大"。
+  /// 超过 [maxRemoteReadBytes] 但在本上限内的文件仍可读，只是不再一次性
+  /// 交给 highlight/markdown 全量排版（由查看器负责截断提示）。
+  static int previewMaxBytes = 20 * 1024 * 1024;
+
+  // ---- SFTP 单步超时（必须显式加）----
+  //
+  // 库侧 `SftpClient` 的 `_waitReply` 是裸 Completer，且构造时**没有**注册
+  // channel 的 onDone/onError：TCP 半开（切网/锁屏/被 NAT 掐掉）时
+  // `sftp()` / `open()` / `stat()` / `readBytes()` 的 await **永不返回**。
+  // 后果不是"报错"而是"永久转圈"：查看器一直转、下载页一直 0%，而
+  // `_running` 恒真还会把"重试/继续"永久挡在守卫外。监督器把隧道重建好
+  // 也救不回这些旧 await——所以只能在调用侧设边界。
+  // 对照：exec 8s、forwardLocal 8s、探活 5s、上传 2min，唯独读文件原来没有。
+  static const Duration sftpOpenTimeout = Duration(seconds: 8);
+  static const Duration sftpStatTimeout = Duration(seconds: 6);
+  static const Duration sftpReadTimeout = Duration(seconds: 30);
+
+  /// 隐藏产物「文件名 → 完整路径」反查的总预算。原来对每个候选目录做
+  /// `2 种分隔符 × 3 种路径形态` 的逐个 `open`，5 个目录就是 30 条 SSH 会话
+  /// 串行开合（远端 sshd 默认 `MaxSessions=10`），既慢又直接把通道配额打满。
+  static const Duration resolveBudget = Duration(seconds: 8);
+
+  /// [resolveRemotePath] 兜底试开的最大次数（目录列表不可读时才走到这里）。
+  static const int resolveMaxProbes = 8;
+
+  /// 存活的只读 SFTP 会话（预览/另存为/下载共用一张表）。
+  ///
+  /// 存在的唯一理由：隧道拆毁时能把它们逐个 `close()`，从而把卡在
+  /// `_waitReply` 上的 await 全部 abort 掉。库里没有任何机制做到这点
+  /// （`SftpClient` 不监听通道关闭，waiter 也没有超时）。
+  final Set<SftpClient> _liveSftpClients = <SftpClient>{};
 
   // ==================== 连接监督器（单一事实来源）====================
   //
@@ -1010,6 +1086,11 @@ class TunnelService {
     // "10 秒内有流量"窗口而跳过探测。
     _lastForwardActivity = null;
     _destroyForwardConns();
+    // 在途的只读 SFTP 会话（预览/另存为/下载）必须在这里主动 abort：库侧 waiter
+    // 既没有超时也不监听通道关闭，不主动收尾它们就**永久卡住**——监督器把新隧道
+    // 建好也救不回旧的 await（界面表现为"一直转圈 / 一直 0%"，且 `_running`
+    // 恒真把"重试"也挡在守卫外）。必须在任何 await 之前做，别给事件循环让路。
+    abortLiveSftpSessions(reason: 'teardown');
     if (server != null) {
       try {
         await server.close();
@@ -1276,133 +1357,441 @@ class TunnelService {
     }
   }
 
-  /// 通过现有 SSH 会话读取云端主机上的文件内容（用于成果查看）。
+  /// 通过现有 SSH 会话读取云端主机上的文件内容（用于成果预览）。
   ///
   /// [remotePath] 为云端文件路径（如 `E:\Work\CaTv\xxx.md` 或 `/home/user/xxx.md`）。
   /// 采用 **SFTP** 读取：绕开 shell 命令对中文路径的编码问题（Windows cmd 用
   /// GBK 而 exec 命令按 UTF-8 发送，中文路径会被误解码）。
-  /// 失败时抛出 [RemoteReadException]，原因（未连接 / 超大 / 无法打开）
-  /// 随异常透出，由查看器展示给用户。
   ///
-  /// 大小保护：超过 [maxRemoteReadBytes] 的文件不读入内存（避免 OOM），
-  /// 抛异常走查看器的"读取失败"流程（可另存为下载）。
+  /// 四条硬性约束（都是真机故障倒推出来的）：
+  ///  1. 每一步带超时（[sftpOpenTimeout]/[sftpStatTimeout]/[sftpReadTimeout]）：
+  ///     库侧 `_waitReply` 没有超时，链路半开时是"永久转圈"而不是"报错"；
+  ///  2. 会话登记进 [_liveSftpClients]，隧道拆毁时统一 abort，唤醒卡死的 await
+  ///     （否则监督器把新隧道建好，旧的 `await` 也永远不会醒）；
+  ///  3. 收尾一律 best-effort：库里 `SftpFile.close()` 要 await 服务端 CLOSE 并可能
+  ///     抛异常，放在 `finally` 里会**顶掉 try 已经拿到的返回值**——字节都在手上了
+  ///     还被报成"读取失败"，这就是"点开偶尔失败、再点一下就好"的成因；
+  ///  4. 失败原因分类透出（[RemoteFailureKind]），不再一句话糊住六种不同病因。
   Future<String> readRemoteFile(String remotePath) async {
-    final client = _client;
-    if (client == null) {
-      throw const RemoteReadException('SSH 隧道未连接，无法读取云端文件');
+    final opened = await openRemoteFileDetailed(remotePath);
+    final file = opened.file;
+    if (file == null) {
+      throw RemoteReadException(opened.reason ?? '云端文件打不开',
+          kind: opened.kind);
     }
-    // 尝试多种 SFTP 路径形态（Windows 盘符路径的表示差异）
-    Object? lastError;
-    for (final path in _sftpPathCandidates(remotePath)) {
-      SftpFile? file;
-      SftpClient? sftp;
-      try {
-        sftp = await client.sftp();
-        file = await sftp.open(path);
-        // 先 stat 再 readBytes：超大文件不入内存，防移动端 OOM
-        final attrs = await file.stat();
-        final size = attrs.size ?? 0;
-        if (size > maxRemoteReadBytes) {
-          debugPrint('[DSH] readRemoteFile skipped '
-              '($size bytes > ${maxRemoteReadBytes ~/ (1024 * 1024)}MB) '
-              'for "$path"');
-          throw RemoteReadException(
-            '文件过大（${(size / (1024 * 1024)).toStringAsFixed(1)}MB，'
-            '预览上限 ${maxRemoteReadBytes ~/ (1024 * 1024)}MB），'
-            '请使用"另存为"下载查看',
-          );
-        }
-        final bytes = await file.readBytes();
-        return _decodeBytes(bytes);
-      } on RemoteReadException {
-        rethrow; // 超大文件等原因直接上抛，不再尝试其余路径形态
-      } catch (e) {
-        debugPrint('[DSH] readRemoteFile failed for "$path": $e');
-        lastError = e;
-      } finally {
-        if (file != null) await file.close(); // 顺带关闭所属 SFTP 会话/通道
-        sftp?.close(); // 打开失败等分支：释放会话通道，避免泄漏
+    final Uint8List bytes;
+    try {
+      int? size = opened.size;
+      size ??= await _statAttrs(file).then((a) => a?.size);
+      if (size != null && size > previewMaxBytes) {
+        debugPrint('[DSH] readRemoteFile skipped '
+            '($size bytes > ${previewMaxBytes ~/ (1024 * 1024)}MB) '
+            'for "$remotePath"');
+        throw RemoteReadException(
+          '文件过大（${(size / (1024 * 1024)).toStringAsFixed(1)}MB，'
+          '预览上限 ${previewMaxBytes ~/ (1024 * 1024)}MB），'
+          '请使用"另存为"下载查看',
+          kind: RemoteFailureKind.tooLarge,
+        );
       }
+      bytes = await _readAllBytes(file);
+    } on RemoteReadException {
+      rethrow; // 超大/超时等原因直接上抛，不再重试
+    } catch (e) {
+      throw RemoteReadException('读取云端文件失败：${_describeSftpError(e)}',
+          kind: _kindOf(e));
+    } finally {
+      // 解码放在关闭之后做：关闭本身可能耗时，别让它占着句柄。
+      await closeRemoteFile(file: file, sftp: opened.sftp);
     }
-    throw RemoteReadException(
-      '云端文件打开失败（路径不存在或无权限）: $lastError',
-    );
+    return _decodeBytes(bytes);
   }
 
   /// 解析远程路径并打开 SFTP 文件句柄（用于资源下载/断点续传）。
   ///
-  /// 尝试多种路径形态（与 [readRemoteFile] 一致的候选规则），
-  /// 打开成功即返回，调用方负责 `close()`。隧道未连接或全部形态
-  /// 打开失败时返回 null。
+  /// 兼容旧调用方：只要句柄或 null。需要失败原因请用
+  /// [openRemoteFileDetailed]（下载页正是靠原因区分"隧道未连"与"文件不存在"）。
   Future<SftpFile?> openRemoteFile(String remotePath) async {
-    final client = _client;
-    if (client == null) return null;
-    for (final path in _sftpPathCandidates(remotePath)) {
-      SftpClient? sftp;
-      try {
-        sftp = await client.sftp();
-        return await sftp.open(path); // 返回后会话由 SftpFile.close() 一并关闭
-      } catch (e) {
-        debugPrint('[DSH] openRemoteFile failed for "$path": $e');
-        sftp?.close(); // 打开失败：释放会话通道，避免泄漏
-      }
-    }
-    return null;
+    final result = await openRemoteFileDetailed(remotePath);
+    return result.file;
   }
 
-  /// 用候选目录 + 文件名拼接云端路径，逐个尝试 SFTP 打开，
-  /// 返回第一个可打开的完整路径；全部失败返回 null。
+  /// 打开远端文件并给出失败原因；**目录在这里就挡掉**。
+  ///
+  /// 目录必须专门处理：部分 sftp-server 允许 `open` 目录成功、到 READ 才失败，
+  /// 错误被归成"路径不存在"；而 [resolveRemotePath] 更糟——它把"open 成功"当成
+  /// 解析成功，于是目录被当文件送去下载，最后存出 0 字节文件却显示"完成"。
+  Future<RemoteOpenResult> openRemoteFileDetailed(String remotePath) async {
+    final client = _client;
+    if (client == null) {
+      return const RemoteOpenResult(
+        null,
+        reason: 'SSH 隧道未连接',
+        kind: RemoteFailureKind.notConnected,
+      );
+    }
+    String? lastReason;
+    var lastKind = RemoteFailureKind.other;
+    for (final path in _sftpPathCandidates(remotePath)) {
+      SftpClient? sftp;
+      SftpFile? file;
+      Future<SftpFile>? openFuture;
+      try {
+        sftp = await client
+            .sftp()
+            .timeout(sftpOpenTimeout,
+                onTimeout: () => throw TimeoutException('sftp session'));
+        _liveSftpClients.add(sftp);
+        openFuture = sftp.open(path);
+        file = await openFuture.timeout(sftpOpenTimeout,
+            onTimeout: () => throw TimeoutException('sftp open'));
+        final attrs = await _statAttrs(file);
+        if (attrs?.type == SftpFileType.directory) {
+          await closeRemoteFile(file: file, sftp: sftp);
+          file = null;
+          lastKind = RemoteFailureKind.isDirectory;
+          lastReason = '这是一个目录，不是文件';
+          debugPrint('[DSH] openRemoteFile: "$path" is a directory');
+          continue;
+        }
+        return RemoteOpenResult(file, sftp: sftp, size: attrs?.size);
+      } on TimeoutException {
+        lastKind = RemoteFailureKind.timeout;
+        lastReason = '云端文件响应超时（链路可能已半开）';
+        debugPrint('[DSH] openRemoteFile timeout for "$path"');
+        // 超时的会话必须显式 close：`SftpClient.close()` 会把在途
+        // `_replyWaiters` 全部用 SftpAbortError 结掉——既不泄漏通道，也让那个
+        // 卡住的 await 尽快结束。迟到的 open 若成功，就地回收句柄。
+        openFuture?.then((lateHandle) {
+          unawaited(closeRemoteFile(file: lateHandle, sftp: sftp));
+        }, onError: (_) {});
+        await _closeSftpSession(sftp);
+      } catch (e) {
+        lastKind = _kindOf(e);
+        lastReason = _describeSftpError(e);
+        debugPrint('[DSH] openRemoteFile failed for "$path": $e');
+        await closeRemoteFile(file: file, sftp: sftp);
+      }
+    }
+    return RemoteOpenResult(null,
+        reason: lastReason ?? '云端文件打不开', kind: lastKind);
+  }
+
+  /// 用候选目录 + 文件名拼接云端路径，返回第一个真实存在的完整路径；
+  /// 全部失败返回 null。
   ///
   /// 用于 DSH 产物 chips 被隐藏（只有文件名、无完整路径）的场景。
+  ///
+  /// 旧实现对每个候选目录做 `2 种分隔符 × 3 种路径形态` 的逐个 `open`——
+  /// 5 个目录 = 30 条 SSH 会话串行开合，而远端 sshd 默认 `MaxSessions=10`，
+  /// 于是一次点击就能把通道配额打满，表现为"点什么都失败"。现在：
+  ///  1. 目录候选先清洗（页面 `title`/tooltip 常被当成"目录"收进来）；
+  ///  2. 首选**一次 `listdir` 批量匹配**（1 条会话顶掉 6 次 open），且目录名
+  ///     大小写不敏感匹配（Windows 产物常与 chip 文案大小写不一致）；
+  ///  3. 目录列表不可读时才退回逐个试开，并受 [resolveMaxProbes] 与
+  ///     [resolveBudget] 双重限制。
   Future<String?> resolveRemotePath(String filename, List<String> dirs) async {
-    for (final dir in dirs) {
-      for (final sep in [r'\', '/']) {
+    final client = _client;
+    if (client == null || filename.isEmpty) return null;
+    final candidates = _cleanDirs(dirs);
+    if (candidates.isEmpty) return null;
+    final deadline = DateTime.now().add(resolveBudget);
+    final lower = filename.toLowerCase();
+
+    // ① 批量列目录：一个目录一条会话，命中即返回。
+    for (final dir in candidates) {
+      if (!DateTime.now().isBefore(deadline)) break;
+      for (final sep in const [r'\', '/']) {
+        final joined = (dir.endsWith(r'\') || dir.endsWith('/'))
+            ? '$dir$filename'
+            : '$dir$sep$filename';
+        final listDir = _dirPortion(joined);
+        if (listDir == null) continue;
+        SftpClient? sftp;
+        try {
+          sftp = await client
+              .sftp()
+              .timeout(sftpOpenTimeout,
+                  onTimeout: () => throw TimeoutException('sftp session'));
+          _liveSftpClients.add(sftp);
+          final names = await sftp
+              .listdir(listDir)
+              .timeout(sftpStatTimeout,
+                  onTimeout: () => throw TimeoutException('listdir'));
+          for (final n in names) {
+            if (n.filename.toLowerCase() == lower) {
+              final hit = (dir.endsWith(r'\') || dir.endsWith('/'))
+                  ? '$dir${n.filename}'
+                  : '$dir$sep${n.filename}';
+              debugPrint('[DSH] resolved "$filename" -> "$hit" (listdir)');
+              return hit;
+            }
+          }
+        } catch (e) {
+          debugPrint('[DSH] resolve listdir "$listDir" failed: $e');
+        } finally {
+          await _closeSftpSession(sftp);
+        }
+        // 同一个目录只按第一种分隔符列一次即可（listdir 结果与分隔符无关）。
+        break;
+      }
+    }
+
+    // ② 兜底：目录列表不可读（权限受限 / 非目录）时退回逐个试开，严格限量。
+    var probes = 0;
+    for (final dir in candidates) {
+      for (final sep in const [r'\', '/']) {
         final cand = (dir.endsWith(r'\') || dir.endsWith('/'))
             ? '$dir$filename'
             : '$dir$sep$filename';
-        final file = await openRemoteFile(cand);
-        if (file != null) {
-          await file.close();
-          debugPrint('[DSH] resolved "$filename" -> "$cand"');
-          return cand;
+        for (final path in _sftpPathCandidates(cand)) {
+          if (probes++ >= resolveMaxProbes) return null;
+          if (!DateTime.now().isBefore(deadline)) {
+            debugPrint('[DSH] resolveRemotePath budget exhausted '
+                '($probes probes)');
+            return null;
+          }
+          SftpClient? sftp;
+          SftpFile? file;
+          try {
+            sftp = await client
+                .sftp()
+                .timeout(sftpOpenTimeout,
+                    onTimeout: () => throw TimeoutException('sftp session'));
+            _liveSftpClients.add(sftp);
+            file = await sftp
+                .open(path)
+                .timeout(sftpOpenTimeout,
+                    onTimeout: () => throw TimeoutException('sftp open'));
+            final attrs = await _statAttrs(file);
+            if (attrs?.type == SftpFileType.directory) continue;
+            debugPrint('[DSH] resolved "$filename" -> "$path" (open)');
+            return path;
+          } catch (e) {
+            debugPrint('[DSH] resolve probe "$path" failed: $e');
+          } finally {
+            await closeRemoteFile(file: file, sftp: sftp);
+          }
         }
       }
     }
     return null;
   }
 
-  /// 生成待尝试的 SFTP 路径：原样 → 反斜杠转正斜杠 → 前缀 `/`。
+  /// 清洗页面传来的"候选目录"。
+  ///
+  /// `collectProducedDirs()` 把任何能取到 `title`/`aria-label` 的元素都当目录，
+  /// 于是 `title="在编辑器打开"`、`title="https://x/y"` 这类 tooltip 也进了候选，
+  /// 每一个都换来数次无谓的 SFTP 往返。这里过滤掉明显不是目录的串。
+  static List<String> _cleanDirs(List<String> dirs) {
+    final out = <String>[];
+    for (final d in dirs) {
+      final t = d.trim();
+      if (t.isEmpty || t.length > 255) continue;
+      if (t.contains('://')) continue; // 链接被当目录
+      if (!t.contains(r'\') && !t.contains('/')) continue; // 连路径都不是
+      if (out.contains(t)) continue;
+      out.add(t);
+      if (out.length >= 8) break; // 再多了就是噪声
+    }
+    return out;
+  }
+
+  /// 取路径的目录部分（用于 listdir）；无目录部分返回 null。
+  static String? _dirPortion(String path) {
+    final norm = path.replaceAll(r'\', '/');
+    final i = norm.lastIndexOf('/');
+    if (i <= 0) return null;
+    return norm.substring(0, i);
+  }
+
+  /// 生成待尝试的 SFTP 路径形态，**去重**（原来 POSIX 绝对路径的第 2、3 个
+  /// 候选完全相同，不存在的路径要被白开三次）。
+  ///
+  /// 覆盖三种真实差异：
+  ///  - `~` 开头：SFTP 服务端按字面量解析，`~/x.md` 必然 noSuchFile。sftp-server
+  ///    的工作目录就是用户 home，所以去掉 `~/` 即等价于家目录相对路径；
+  ///  - Windows 盘符：OpenSSH for Windows 常见要求 `/E:/a/b` 形态；
+  ///  - `\` 与 `/` 混用。
   List<String> _sftpPathCandidates(String p) {
     final normalized = p.replaceAll(r'\', '/');
-    return <String>[
-      p,
-      normalized,
-      normalized.startsWith('/') ? normalized : '/$normalized',
-    ];
+    final out = <String>{};
+    void add(String v) {
+      if (v.isNotEmpty) out.add(v);
+    }
+
+    add(p);
+    add(normalized);
+    add(normalized.startsWith('/') ? normalized : '/$normalized');
+    // `~/x` → `x`（相对 sftp-server 的 cwd = 用户 home）
+    final home = normalized.replaceFirst(RegExp(r'^\~/'), '');
+    if (home != normalized) {
+      add(home);
+      add('/$home');
+    }
+    // `E:/a/b` → `/E:/a/b`（Windows OpenSSH 的常见形态）
+    final drive = RegExp(r'^([A-Za-z]:/.*)').firstMatch(normalized);
+    if (drive != null) add('/${drive.group(1)}');
+    return out.toList(growable: false);
+  }
+
+  /// `fstat`：拿不到就返回 null，但**绝不**让它在半开链路上吊死整个读取。
+  Future<SftpFileAttrs?> _statAttrs(SftpFile file) async {
+    try {
+      return await file.stat().timeout(sftpStatTimeout);
+    } on TimeoutException {
+      debugPrint('[DSH] sftp stat timeout');
+      return null;
+    } catch (e) {
+      debugPrint('[DSH] sftp stat failed: $e');
+      return null;
+    }
+  }
+
+  /// 读取全部字节（带超时）。
+  Future<Uint8List> _readAllBytes(SftpFile file) async {
+    try {
+      return await file.readBytes().timeout(sftpReadTimeout,
+          onTimeout: () => throw TimeoutException('sftp readBytes'));
+    } on TimeoutException {
+      throw const RemoteReadException(
+        '读取云端文件超时（链路可能已半开），请稍后重试',
+        kind: RemoteFailureKind.timeout,
+      );
+    }
+  }
+
+  /// 关闭远端句柄/会话并从 [_liveSftpClients] 摘除；异常只记日志。
+  ///
+  /// 为什么两个都要关、且都要吞异常：库里 `SftpFile.close()` 先 `await`
+  /// 服务端 CLOSE（可能抛）再 `_client.close()`；抛异常时同块下一句不会执行
+  /// （会话泄漏），且 `_isClosed` 已置 true 让重试直接 return。而在 `finally`
+  /// 里抛异常还会**顶掉 try 块已经成功的返回值**。
+  Future<void> closeRemoteFile({SftpFile? file, SftpClient? sftp}) async {
+    if (file != null) {
+      try {
+        await file.close().timeout(sftpStatTimeout);
+      } catch (e) {
+        debugPrint('[DSH] sftp file close ignored: $e');
+      }
+    }
+    await _closeSftpSession(sftp);
+  }
+
+  Future<void> _closeSftpSession(SftpClient? sftp) async {
+    if (sftp == null) return;
+    _liveSftpClients.remove(sftp);
+    try {
+      // void 方法：同步把 `_replyWaiters` 逐个 completeError(SftpAbortError)，
+      // 因此它同时是"唤醒卡死 await"和"归还 SSH 通道"两个动作的唯一入口。
+      sftp.close();
+    } catch (e) {
+      debugPrint('[DSH] sftp session close ignored: $e');
+    }
+  }
+
+  /// 隧道拆毁时调用：强制结束所有存活的只读 SFTP 会话。
+  ///
+  /// 库侧 `SftpClient` 构造时没有注册通道的 onDone/onError，`_waitReply` 也没有
+  /// 超时；transport 掉线后在途的 `open`/`stat`/`readBytes` **永不返回**，界面就
+  /// 永久停在转圈/0%，且 `_running` 恒真会把"重试"也挡掉。`SftpClient.close()`
+  /// 会把 `_replyWaiters` 逐个 `completeError(SftpAbortError)`，是唯一能唤醒它们
+  /// 的入口。
+  void abortLiveSftpSessions({String reason = 'tunnel teardown'}) {
+    if (_liveSftpClients.isEmpty) return;
+    debugPrint('[DSH] abort ${_liveSftpClients.length} live sftp session(s): $reason');
+    for (final s in _liveSftpClients.toList(growable: false)) {
+      try {
+        s.close();
+      } catch (e) {
+        debugPrint('[DSH] abort sftp session failed: $e');
+      }
+    }
+    _liveSftpClients.clear();
+  }
+
+  static RemoteFailureKind _kindOf(Object e) {
+    if (e is TimeoutException) return RemoteFailureKind.timeout;
+    if (e is RemoteReadException) return e.kind;
+    if (e is SftpStatusError) {
+      switch (e.code) {
+        case SftpStatusCode.noSuchFile:
+          return RemoteFailureKind.notFound;
+        case SftpStatusCode.permissionDenied:
+          return RemoteFailureKind.permission;
+        case SftpStatusCode.connectionLost:
+        case SftpStatusCode.noConnection:
+          return RemoteFailureKind.notConnected;
+      }
+    }
+    final text = '$e';
+    if (text.contains('MaxSessions') ||
+        text.contains('Channel open failure') ||
+        text.contains('channel open failed')) {
+      return RemoteFailureKind.channelExhausted;
+    }
+    return RemoteFailureKind.other;
+  }
+
+  /// 把 SFTP 异常翻译成人话。
+  static String _describeSftpError(Object e) {
+    if (e is SftpStatusError) {
+      switch (e.code) {
+        case SftpStatusCode.noSuchFile:
+          return '云端不存在该文件';
+        case SftpStatusCode.permissionDenied:
+          return '没有读取权限（或路径被服务端限制）';
+        case SftpStatusCode.failure:
+          return '服务器拒绝访问（可能是目录、文件被占用或路径形态不支持）';
+        case SftpStatusCode.connectionLost:
+          return 'SSH 连接已断开';
+        case SftpStatusCode.noConnection:
+          return 'SSH 未连接';
+        case SftpStatusCode.opUnsupported:
+          return '服务器不支持该 SFTP 操作';
+        case SftpStatusCode.badMessage:
+          return 'SFTP 协议不一致（服务端实现不兼容）';
+      }
+    }
+    if (e is TimeoutException) return '云端文件响应超时（链路可能已半开）';
+    if (e is SftpAbortError) return 'SSH 会话已关闭';
+    return '$e';
   }
 
   /// 读取云端文件原始字节（用于"另存为"时保留原始编码，如 GBK）。
   ///
-  /// 打开失败返回 null。仅读内存（小文本文件），大文件请走下载流；
-  /// 超过 [maxRemoteReadBytes] 同样返回 null（防 OOM）。
-  Future<Uint8List?> readRemoteFileBytes(String remotePath) async {
-    final file = await openRemoteFile(remotePath);
-    if (file == null) return null;
+  /// 失败**抛** [RemoteReadException]，不再静默返回 null：旧实现返回 null 后
+  /// 上层回落 `utf8.encode(内容)`，而那时内容本来就是空的（正因为读失败），
+  /// 于是"写一个 0 字节文件并 toast 保存成功"，用户拿到坏文件还毫不知情。
+  Future<Uint8List> readRemoteFileBytes(String remotePath) async {
+    final opened = await openRemoteFileDetailed(remotePath);
+    final file = opened.file;
+    if (file == null) {
+      throw RemoteReadException(opened.reason ?? '云端文件打不开',
+          kind: opened.kind);
+    }
     try {
-      // 先 stat 再 readBytes：超大文件不入内存，防移动端 OOM
-      final attrs = await file.stat();
-      final size = attrs.size ?? 0;
-      if (size > maxRemoteReadBytes) {
-        debugPrint('[DSH] readRemoteFileBytes skipped '
-            '($size bytes > ${maxRemoteReadBytes ~/ (1024 * 1024)}MB)');
-        return null;
+      final attrs = await _statAttrs(file);
+      if (attrs?.type == SftpFileType.directory) {
+        throw const RemoteReadException('这是一个目录，不是文件',
+            kind: RemoteFailureKind.isDirectory);
       }
-      return await file.readBytes();
+      final size = attrs?.size;
+      if (size != null && size > previewMaxBytes) {
+        throw RemoteReadException(
+          '文件过大（${(size / (1024 * 1024)).toStringAsFixed(1)}MB，'
+          '上限 ${previewMaxBytes ~/ (1024 * 1024)}MB）',
+          kind: RemoteFailureKind.tooLarge,
+        );
+      }
+      return await _readAllBytes(file);
+    } on RemoteReadException {
+      rethrow;
     } catch (e) {
-      debugPrint('[DSH] readRemoteFileBytes failed: $e');
-      return null;
+      throw RemoteReadException('读取云端文件失败：${_describeSftpError(e)}',
+          kind: _kindOf(e));
     } finally {
-      await file.close();
+      await closeRemoteFile(file: file, sftp: opened.sftp);
     }
   }
 
@@ -1460,19 +1849,29 @@ class TunnelService {
     for (final dir in candidates) {
       SftpClient? sftp;
       try {
-        sftp = await client.sftp();
+        sftp = await client
+            .sftp()
+            .timeout(sftpOpenTimeout,
+                onTimeout: () => throw TimeoutException('sftp session'));
+        _liveSftpClients.add(sftp);
         try {
-          await sftp.mkdir(dir);
+          await sftp.mkdir(dir).timeout(sftpStatTimeout);
         } catch (e) {
           // 目录可能已存在（SFTP mkdir 对已存在目录返回 failure）：
           // stat 确认可访问，失败则换下一个候选。
-          await sftp.stat(dir);
+          await sftp.stat(dir).timeout(sftpStatTimeout);
         }
         debugPrint('[DSH] upload dir ready: $dir');
         return dir;
       } catch (e) {
         debugPrint('[DSH] ensureUploadDir failed for "$dir": $e');
-        sftp?.close();
+      } finally {
+        // 成功分支**必须**关会话。旧实现只在 catch 里关（`return dir` 前既没有
+        // finally 也没有 close），于是每成功上传一次就永久泄漏一条 SSH 通道；
+        // 远端 sshd 默认 `MaxSessions=10`，约十次上传之后 `client.sftp()` 与
+        // `forwardLocal()` 一起被服务端拒绝——所有预览报"路径不存在或无权限"、
+        // 所有下载报"隧道可能未连接"，也就是"用着用着全废"的根因。
+        await _closeSftpSession(sftp);
       }
     }
     return null;
@@ -1508,7 +1907,11 @@ class TunnelService {
     final remotePath = '$dir/$remoteName';
 
     try {
-      final sftp = await client.sftp();
+      final sftp = await client
+          .sftp()
+          .timeout(sftpOpenTimeout,
+              onTimeout: () => throw TimeoutException('sftp session'));
+      _liveSftpClients.add(sftp);
       try {
         final file = await sftp.open(
           remotePath,
@@ -1537,10 +1940,11 @@ class TunnelService {
           onProgress?.call(bytes.length, bytes.length);
           debugPrint('[DSH] uploaded ${bytes.length} bytes -> $remotePath');
         } finally {
-          await file.close(); // 顺带关闭所属 SFTP 会话
+          // 关句柄顺带关会话；异常只记日志（这里抛出会把已成功的上传报成失败）。
+          await closeRemoteFile(file: file, sftp: sftp);
         }
       } finally {
-        sftp.close(); // 打开失败分支：释放会话通道，避免泄漏
+        await _closeSftpSession(sftp); // 打开失败分支：释放会话通道，避免泄漏
       }
       return remotePath;
     } catch (e) {

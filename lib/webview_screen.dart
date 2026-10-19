@@ -1778,6 +1778,10 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 打开原生成果查看器：以全屏路由叠在对话之上，关闭即返回对话。
   Future<void> _openArtifact(ArtifactHit hit) async {
     // path 只有文件名时（chips 被隐藏场景），先用候选目录拼接定位云端路径。
+    // 注意：这一步现在受 TunnelService.resolveBudget（8 秒）硬性约束。以前它
+    // 对每个候选目录做「2 种分隔符 × 3 种路径形态」的逐个 SFTP open 且**没有
+    // 超时**，链路一半开时这里就把整个点击吊死——用户看到的是"点了完全没反应"，
+    // 只能杀 App。
     final resolved = await _resolveHitPath(hit);
     if (!mounted) return;
     hit = resolved;
@@ -1786,11 +1790,17 @@ class _WebViewScreenState extends State<WebViewScreen>
     if (hit.type == ArtifactType.resource) {
       if (_resourceDownloadEnabled) {
         _openResourceDownload(hit);
+      } else {
+        // 开关关闭时原来是裸 `return`：点了没任何反应，与"App 坏了"无法区分。
+        _toastToolDisabled('资源下载', '已在设置中关闭，重新打开后可下载');
       }
       return;
     }
     // 工具开关：资源查看关闭时不打开查看器。
-    if (!_resourceViewEnabled) return;
+    if (!_resourceViewEnabled) {
+      _toastToolDisabled('资源查看', '已在设置中关闭，重新打开后可预览');
+      return;
+    }
     // 文件型成果：内容经 SSH 读取云端文件（复用隧道会话），打开后异步加载。
     final loader = hit.type == ArtifactType.file && hit.path.isNotEmpty
         ? () => TunnelService.instance.readRemoteFile(hit.path)
@@ -1810,9 +1820,20 @@ class _WebViewScreenState extends State<WebViewScreen>
           loader: loader,
           fileName: hit.path.isNotEmpty ? _basename(hit.path) : null,
           rawBytesLoader: rawBytesLoader,
+          // JS 侧取内容失败时回传的原因：让界面说"为什么没内容"，
+          // 而不是笼统一句"无内容可查看"。
+          initialError: hit.error,
         ),
       ),
     );
+  }
+
+  /// 工具开关关闭时的提示（原来是无提示 `return`）。
+  void _toastToolDisabled(String toolName, String detail) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..clearSnackBars()
+      ..showSnackBar(SnackBar(content: Text('$toolName$detail')));
   }
 
   /// 解析成果云端路径：path 已含路径分隔符视为完整路径；否则用候选目录
@@ -1821,7 +1842,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 链接型资源（path 为空、url 非空，如 `/api/files/xxx.apk`）时，
   /// 用 URL 文件名 + 候选目录拼接定位，避免"不支持直接下载"。
   Future<ArtifactHit> _resolveHitPath(ArtifactHit hit) async {
-    if (hit.path.contains(r'\') || hit.path.contains('/')) return hit;
+    if (!_looksLikeBareName(hit.path)) return hit;
     var base = hit.path;
     if (base.isEmpty && hit.url.isNotEmpty) {
       base = _basename(hit.url); // 链接型资源兜底：从 URL 提取文件名
@@ -1836,7 +1857,22 @@ class _WebViewScreenState extends State<WebViewScreen>
       language: hit.language,
       content: hit.content,
       path: resolved,
+      dirs: hit.dirs, // 旧实现在这里把 dirs 丢了：解析失败后无从二次补救
+      error: hit.error,
     );
+  }
+
+  /// 是否"只是个文件名"（值得用候选目录去反查）。
+  ///
+  /// 旧判据是"含 `/` 或 `\` 就当完整路径直接早退"，于是 `./report.md`、
+  /// `out/app.apk`、`~/x.md` 这类**相对路径**永远得不到目录反查的救机。
+  static bool _looksLikeBareName(String path) {
+    if (path.isEmpty) return true;
+    final p = path.trim();
+    if (p.startsWith('./') || p.startsWith('../') || p.startsWith('~')) {
+      return true; // 相对/家目录路径：等价于"只有文件名"，值得反查
+    }
+    return !p.contains(r'\') && !p.contains('/');
   }
 
   /// 资源型成果：经 SSH 下载（复用隧道会话），打开下载页。
@@ -1849,7 +1885,8 @@ class _WebViewScreenState extends State<WebViewScreen>
     if (hit.path.isEmpty) {
       ScaffoldMessenger.of(context)
         ..clearSnackBars()
-        ..showSnackBar(const SnackBar(content: Text('该资源不支持直接下载')));
+        ..showSnackBar(const SnackBar(
+            content: Text('该资源只有链接、拿不到云端路径，无法直接下载')));
       return;
     }
     final task = DownloadManager.instance.start(hit.path);
@@ -1861,12 +1898,9 @@ class _WebViewScreenState extends State<WebViewScreen>
     );
   }
 
-  /// 取路径最后一段（兼容 `/` 与 `\` 分隔），用于查看器保存文件名。
-  static String _basename(String p) {
-    final norm = p.replaceAll(r'\', '/');
-    final i = norm.lastIndexOf('/');
-    return i >= 0 ? norm.substring(i + 1) : norm;
-  }
+  /// 取路径最后一段（兼容 `/` 与 `\` 分隔，并去掉 `?query`/`#fragment`），
+  /// 用于查看器/下载页的保存文件名。
+  static String _basename(String p) => DownloadManager.basename(p);
 
   // ================= WebView 加载回调 =================
   //

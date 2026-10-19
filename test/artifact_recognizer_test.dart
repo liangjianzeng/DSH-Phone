@@ -113,4 +113,57 @@ void main() {
       expect(hit.type, ArtifactType.resource);
     });
   });
+
+  group('ArtifactRules 带查询串/片段的后缀判定（回归：?token= 让二进制被当文本）', () {
+    test('带 ?query 的资源仍判为 resource', () {
+      expect(ArtifactRules.typeOfPath('/api/files/app.apk?token=abc'),
+          ArtifactType.resource);
+      expect(ArtifactRules.typeOfPath('E:\\Work\\x.zip#sha=1'),
+          ArtifactType.resource);
+    });
+
+    test('结尾斜杠不影响后缀判定', () {
+      expect(ArtifactRules.typeOfPath('/a/b/app.apk/'), ArtifactType.resource);
+    });
+
+    test('isFileUrl 对带查询串的 .md 生效', () {
+      expect(ArtifactRules.isFileUrl('/api/files/x.md?token=1'), isTrue);
+      expect(ArtifactRules.isFileUrl('/api/files/x.MD#frag'), isTrue);
+      expect(ArtifactRules.isFileUrl('/chat/123'), isFalse);
+    });
+
+    test('新补的常见后缀可识别', () {
+      expect(ArtifactRules.typeOfPath('run.log'), ArtifactType.file);
+      expect(ArtifactRules.typeOfPath('App.tsx'), ArtifactType.file);
+      expect(ArtifactRules.typeOfPath('lib.so.1'), ArtifactType.resource);
+      expect(ArtifactRules.typeOfPath('pkg.deb'), ArtifactType.resource);
+      expect(ArtifactRules.typeOfPath('pkg.jar'), ArtifactType.resource);
+    });
+
+    test('isImageSuffix 覆盖常见图片', () {
+      expect(ArtifactRules.isImageSuffix('/a/b.png?token=x'), isTrue);
+      expect(ArtifactRules.isImageSuffix('/a/b.md'), isFalse);
+    });
+  });
+
+  group('parseArtifactHit 链接型成果', () {
+    test('只有 url 的资源链接强制归 resource（二进制不进文本查看器）', () {
+      final hit = parseArtifactHit({
+        'type': 'file',
+        'url': 'http://127.0.0.1:3080/api/files/app.apk?sign=zz',
+      });
+      expect(hit.type, ArtifactType.resource);
+    });
+
+    test('JS 侧 fetch 失败原因随 error 透出', () {
+      final hit = parseArtifactHit({
+        'type': 'file',
+        'url': '/api/files/x.md',
+        'content': '',
+        'error': 'HTTP 401（登录态失效，需重新填写 Token）',
+      });
+      expect(hit.error, contains('401'));
+    });
+  });
+
 }

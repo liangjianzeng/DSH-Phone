@@ -37,27 +37,38 @@ const String artifactBridgeJs = r'''
 
   // 成果文本拉取：限制大小与超时，防止大文件打爆 WebView 内存 / 请求悬挂。
   // 依据 content-length 头提前拒绝超大文件；无该头时由 Dart 侧 _looksBinary 兜底。
-  var MAX_ARTIFACT_FETCH = 8 * 1024 * 1024; // 8MB 上限
+  //
+  // 失败**必须带原因**回传：旧实现无论 401、超时还是超大都 `send({content:''})`，
+  // 查看器只能显示"无内容可查看"——既不承认这是失败，也不说为什么，用户与
+  // 排查者都无从下手（401 尤其常见：隧道会话过期）。
+  var MAX_ARTIFACT_FETCH = 20 * 1024 * 1024; // 与 TunnelService.previewMaxBytes 一致
   function fetchArtifact(url) {
-    return new Promise(function(resolve, reject) {
+    return new Promise(function(resolve) {
       var settled = false;
+      function done(content, error) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({content: content || '', error: error || ''});
+      }
       var timer = setTimeout(function() {
-        if (!settled) { settled = true; reject(new Error('fetch timeout')); }
+        done('', '读取超时（30 秒未响应）');
       }, 30000);
-      fetch(url).then(function(r) {
+      fetch(url, {credentials: 'same-origin'}).then(function(r) {
+        if (!r.ok) {
+          done('', 'HTTP ' + r.status + ((r.status === 401 || r.status === 403)
+              ? '（登录态失效，需重新填写 Token）' : ''));
+          return;
+        }
         var len = r.headers.get('content-length');
         if (len && parseInt(len, 10) > MAX_ARTIFACT_FETCH) {
-          throw new Error('artifact too large');
+          done('', '文件超过 ' + Math.round(MAX_ARTIFACT_FETCH / 1048576) +
+              'MB，请改用"下载"');
+          return;
         }
-        return r.text();
-      }).then(function(text) {
-        if (settled) return;
-        settled = true; clearTimeout(timer);
-        resolve(text);
+        return r.text().then(function(text) { done(text, ''); });
       }).catch(function(err) {
-        if (settled) return;
-        settled = true; clearTimeout(timer);
-        reject(err);
+        done('', (err && err.message) ? err.message : String(err));
       });
     });
   }
@@ -138,14 +149,29 @@ const String artifactBridgeJs = r'''
     //    "资源型成果"而触发查看/下载流程（导致无法删除、误开下载页）。
     if (closestUp(t, ['[data-composer-card]'])) return;
 
-    // 资源型后缀（apk/压缩包等二进制，走下载保存流程）
-    var isResourceSuffix = /\.(apk|zip|tar|gz|tgz|rar|7z|xz|bin|exe|msi|dmg|iso|img|mp4|mp3|pdf|png|jpg|jpeg|gif|webp|svg|doc|docx|xls|xlsx|ppt|pptx|so|a|dll)(\?|#|$)/i;
+    // 后缀表：**脚本内单一来源**（此前同一份后缀在脚本里写了 4 遍，各自漂移，
+    // 结果 `.log/.tsv/.tsx/.rs/.deb/.jar` 等点了没反应，而 Dart 侧那份
+    // ArtifactRules 又几乎是死代码）。与 artifact_recognizer.dart 保持一致。
+    var RESOURCE_EXT = 'apk|zip|tar|gz|tgz|rar|7z|xz|bin|exe|msi|dmg|iso|img|' +
+        'mp4|mp3|pdf|png|jpg|jpeg|gif|webp|svg|doc|docx|xls|xlsx|ppt|pptx|' +
+        'so|a|dll|deb|rpm|jar|war|whl|bz2|zst|z|class|o|pyc|wav|flac|ogg|mov|' +
+        'mkv|avi|tiff|bmp|ico|ttf|otf|woff|woff2|sqlite|db';
+    var TEXT_EXT = 'md|markdown|html|htm|txt|json|csv|log|tsv|ini|conf|cfg|' +
+        'properties|env|py|dart|js|ts|tsx|jsx|c|cpp|h|hpp|java|go|rs|rb|php|' +
+        'css|scss|vue|kt|swift|lua|pl|sh|bash|yml|yaml|toml|sql|xml|proto|' +
+        'graphql|tf|gradle|diff|patch|ipynb';
+    // `(\?|#|$)` 不能省：DSH 的链接常带 ?token=，否则后缀一律判不出。
+    var isResourceSuffix = new RegExp('\\.(' + RESOURCE_EXT + ')(\\?|#|$)', 'i');
+    var isTextSuffix = new RegExp('\\.(' + TEXT_EXT + ')(\\?|#|$)', 'i');
+    var isAnyArtifactSuffix =
+        new RegExp('\\.(' + TEXT_EXT + '|' + RESOURCE_EXT + ')(\\?|#|$)', 'i');
+    var isFileUrlPrefix = /\/api\/files\/|\/files\/|\/api\/artifact\/|\/artifacts\//i;
 
     // 1) 文件型成果链接：优先判断，即使链接包裹在 pre/code 里。
     var a = closestUp(t, ['a']);
     if (a) {
       var href = a.getAttribute('href') || '';
-      var isFile = /\/api\/files\/|\/files\/|\/api\/artifact\/|\/artifacts\/|\.(md|markdown|html|htm|txt|json|csv)(\?|#|$)/i.test(href);
+      var isFile = isFileUrlPrefix.test(href) || isTextSuffix.test(href);
       var isResource = isResourceSuffix.test(href);
       if (isFile || isResource) {
         ev.preventDefault();
@@ -160,10 +186,12 @@ const String artifactBridgeJs = r'''
           send({type: 'resource', url: a.href, language: '', content: '', path: mentionPath, dirs: dirs});
           return;
         }
-        fetchArtifact(a.href).then(function(text){
-          send({type: 'file', url: a.href, language: '', content: text});
-        }).catch(function(err){
-          send({type: 'file', url: a.href, language: '', content: ''});
+        fetchArtifact(a.href).then(function(res){
+          // file 分支也要带 dirs：Dart 侧「文件名 → 完整路径」的反查依赖 dirs，
+          // 旧实现只有 resource 分支带，链接型文本成果一旦 fetch 失败就彻底没救。
+          send({type: 'file', url: a.href, language: '',
+                content: res.content, error: res.error,
+                path: '', dirs: collectProducedDirs()});
         });
         return;
       }
@@ -180,7 +208,7 @@ const String artifactBridgeJs = r'''
       var label = mention.getAttribute('aria-label') || '';
       var filePath = elementPath(mention) || title || label || '';
       var isMention = cls.indexOf('fileMention') >= 0 ||
-          /\.(md|markdown|html|htm|txt|json|csv|apk|zip|tar|gz|tgz|rar|7z|xz|bin|exe|msi|dmg|iso|img|mp4|mp3|pdf|png|jpg|jpeg|gif|webp|svg|doc|docx|xls|xlsx|ppt|pptx|so|a|dll)(\?|#|$)/i.test(filePath);
+          isAnyArtifactSuffix.test(filePath);
       if (isMention && filePath) {
         ev.preventDefault();
         ev.stopPropagation();
@@ -201,7 +229,7 @@ const String artifactBridgeJs = r'''
       var text = code.innerText || code.textContent || '';
       var trimmed = text.trim();
       var singleLine = trimmed.indexOf('\n') < 0 && trimmed.length > 0;
-      var suffixRe = /\.(md|markdown|html|htm|txt|json|csv|apk|zip|tar|gz|tgz|rar|7z|xz|bin|exe|msi|dmg|iso|img|mp4|mp3|pdf|png|jpg|jpeg|gif|webp|svg|doc|docx|xls|xlsx|ppt|pptx|so|a|dll)$/i;
+      var suffixRe = isAnyArtifactSuffix; // 脚本内统一后缀表（含 ?/# 处理）
       if (singleLine && suffixRe.test(trimmed)) {
         // 先按文件名在整个文档的产物 chips 里反查完整路径；
         // 若文本自身已含路径分隔符（/ 或 \），则直接用文本作为路径。
@@ -242,11 +270,17 @@ const String artifactBridgeJs = r'''
         var bodyBase = lastSep >= 0 ? raw.substring(lastSep + 1) : raw;
         var bodyMention = bodyBase ? findMentionPath(bodyBase) : '';
         var bodyPath = bodyMention || raw;
-        var suffixes = ['.md', '.html', '.htm', '.txt', '.json', '.csv', '.apk', '.zip', '.tar', '.gz', '.tgz', '.rar', '.7z', '.xz', '.bin', '.exe', '.msi', '.dmg', '.iso', '.img', '.mp4', '.mp3', '.pdf', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.so', '.a', '.dll'];
-        // 形似路径：含反斜杠、以 / 开头的绝对路径、~，或无空格且带已知后缀。
+        var hasSep = raw.indexOf('\\') >= 0 || raw.indexOf('/') >= 0;
+        var endsWithArtifact = isAnyArtifactSuffix.test(raw);
+        // 形似路径：含反斜杠、以 / 或 ~/ 开头、无空格且带已知后缀。
+        // 新增"带空格但确实以成果后缀结尾"一支：Windows 里
+        // `C:\Program Files\x\报告.md` 这类路径此前**完全点不动**（旧判据要求整串
+        // 不含空格）；同时又不能放行"这个 A/B 测试…"这种普通句子，因此额外要求
+        // 含路径分隔符且不含中文句读。
         var looksPath = raw.indexOf('\\') >= 0 || raw.indexOf('/') === 0 ||
-            raw === '~' ||
-            (raw.indexOf(' ') < 0 && suffixes.some(function(s) { return raw.toLowerCase().endsWith(s); }));
+            raw === '~' || raw.indexOf('~/') === 0 ||
+            (endsWithArtifact && hasSep && !/[。！？；，、]/.test(raw)) ||
+            (raw.indexOf(' ') < 0 && endsWithArtifact);
         if (looksPath) {
           ev.preventDefault();
           ev.stopPropagation();
@@ -645,4 +679,4 @@ const String terminalBridgeJs = r'''
 
   scan();
 })();
-''';
+''';
