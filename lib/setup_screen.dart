@@ -6,6 +6,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'asr/default_hotwords.dart';
 import 'config.dart';
 import 'moon_location.dart';
+import 'tunnel_diagnostics_screen.dart';
 import 'tunnel_service.dart';
 import 'weather_service.dart';
 
@@ -1202,6 +1203,22 @@ class _SetupScreenState extends State<SetupScreen> {
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 8),
+          // 连接诊断：真机 + VPN 没有 adb，事件流是唯一能定位"为什么连不上"的
+          // 手段（DNS 失败 / 链路不可达 / 半开假死 / 云端服务没起，处置完全不同），
+          // 所以入口必须放在离"测试连接"最近的地方。
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => const TunnelDiagnosticsScreen(),
+                ),
+              ),
+              icon: const Icon(Icons.monitor_heart_outlined),
+              label: const Text('连接诊断（隧道事件流）'),
+            ),
           ),
         ],
       ),

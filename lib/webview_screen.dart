@@ -26,6 +26,8 @@ import 'setup_screen.dart';
 import 'asr/hold_to_talk.dart';
 import 'sun_times.dart';
 import 'task_notifier.dart';
+import 'tunnel_diagnostics_screen.dart';
+import 'tunnel_policy.dart';
 import 'tunnel_service.dart';
 import 'unsloth_screen.dart';
 import 'weather_effects.dart';
@@ -62,11 +64,36 @@ class _WebViewScreenState extends State<WebViewScreen>
   // ---- 文件上传大小上限（MB），可配置，默认 10，范围 1~30 ----
   int _uploadMaxMb = SSHConfig.defaultUploadMaxMb;
 
-  TunnelStatus _tunnelStatus = TunnelStatus.idle;
-  String? _error;
-  StreamSubscription<TunnelStatus>? _tunnelSub;
-  bool _reconnecting = false;
-  bool _switching = false; // 手动切换实例时抑制自动重连
+  /// 隧道状态快照：唯一来源是 [TunnelService] 监督器的状态流。
+  ///
+  /// 这里刻意**不再**持有 `_reconnectCount` / `_maxReconnect` / `_reconnecting`：
+  /// 旧实现在 UI 里数重连次数、5 次（共 30 秒）后永久放弃且不留任何定时器，
+  /// 真实断线于是永远停在红色死错误页上。重试计划、退避、故障分类、探活全部
+  /// 归 TunnelService 拥有，本界面只渲染，并额外提供"主动刷新"入口。
+  TunnelState _tunnel = const TunnelState();
+  StreamSubscription<TunnelState>? _tunnelSub;
+
+  /// 兼容既有渲染分支的只读视图（`_buildBody` / 状态点仍按枚举分支）。
+  TunnelStatus get _tunnelStatus => _tunnel.status;
+
+  /// WebView 是否常驻在页面上。
+  ///
+  /// 一旦连上过就**不再因闪断而销毁**：旧实现 `_buildBody()` 按隧道状态切分支，
+  /// 隧道一断整棵 WebView 被 dispose，SPA 状态全丢、重连后整站重载——移动网络
+  /// 与 Tailscale 的抖动被放大成"每次都要重开一遍页面"，看起来就像"老是连不上"。
+  /// 现在 WebView 常驻，异常用**非阻塞横幅**叠加提示（[_buildTunnelBanner]）。
+  bool _webViewAlive = false;
+
+  /// 顶栏刷新按钮的反馈节流：连点时不要刷屏 SnackBar。
+  DateTime? _lastRefreshFeedback;
+
+  /// 鉴权失败后的"自动带 Token 重试一次"计数：直接弹"Token 已失效"是误报式
+  /// 打扰——服务端刚重启、cookie 未续上都可能瞬时 401。
+  int _authRetryCount = 0;
+
+  /// 本页面最近一次 `connect()` 的序号。dispose 时若序号已被别的页面推进，说明
+  /// 隧道已归属新页面（路由替换场景），此时绝不能断开。
+  int _myConnectSeq = 0;
 
   /// 按住说话会话（长按语音按钮期间非 null；结束后置回 null）。
   HoldToTalkSession? _holdSession;
@@ -77,10 +104,6 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   /// 缓冲期内尚未定稿的会话（供 [_cancelPendingVoiceEnd] 丢弃/收尾）。
   HoldToTalkSession? _pendingVoiceSession;
-
-  /// 连续自动重连次数上限：防止"死循环连接"刷屏/耗尽资源。
-  static const int _maxReconnect = 5;
-  int _reconnectCount = 0;
 
   // ---- 页面缩放（CSS zoom，持久化保存比例）----
   static const String _zoomPrefKey = 'webview_zoom_scale';
@@ -205,7 +228,9 @@ class _WebViewScreenState extends State<WebViewScreen>
   // ---- WebView 页面加载状态 ----
   bool _pageLoading = false; // 远程页面加载中（隧道已通，页面未就绪）
   int _loadProgress = 0; // 0-100
-  String? _pageError; // 页面加载错误（区别于隧道错误 _error）
+  /// 页面加载错误（技术细节）。**只在链路健康时**才会被渲染成错误卡片，
+  /// 链路故障期间的呈现走 `_buildTunnelBanner`（见 `_buildBody` 的遮罩条件）。
+  String? _pageError;
   Timer? _loadTimeoutTimer;
 
   /// 页面处于错误态、待隧道恢复后需要重载。隧道不在位时页面重试必然
@@ -264,8 +289,8 @@ class _WebViewScreenState extends State<WebViewScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    // 监听隧道真实状态，状态变化时同步界面；仅在真正断开时自动重连。
-    _tunnelSub = TunnelService.instance.statusStream.listen(_onTunnelStatus);
+    // 订阅监督器状态流：界面只渲染，不再自行决定"重连几次、要不要报错"。
+    _tunnelSub = TunnelService.instance.stateStream.listen(_onTunnelState);
     _load();
     _loadZoomScale();
     _loadZoomControls();
@@ -303,7 +328,9 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 否则留在队列，由 onLoadStop 再次触发。
   Future<void> _processPendingShares() async {
     if (_pendingShares.isEmpty) return;
-    if (TunnelService.instance.status != TunnelStatus.connected ||
+    // 链路不健康时不注入：页面是上一份缓存，注入进去也只会静默丢失；
+    // 留在队列里，等 `_onTunnelState` 恢复健康 → 重载 → onLoadStop 再消费。
+    if (!_tunnel.healthy ||
         _pageLoading ||
         _pageError != null ||
         _controller == null) {
@@ -382,7 +409,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     debugPrint('[DSH] lifecycle: $state '
-        '(tunnel=${TunnelService.instance.status})');
+        '(tunnel=${TunnelService.instance.state.status})');
     switch (state) {
       case AppLifecycleState.inactive:
       case AppLifecycleState.hidden:
@@ -391,65 +418,24 @@ class _WebViewScreenState extends State<WebViewScreen>
       case AppLifecycleState.paused:
         // 确认进入后台
         _backgroundedAt ??= DateTime.now();
+        // 后台停掉主机采样：省电台电，也避免独立监控隧道与主隧道抢链路。
+        HostMonitor.instance.stop();
       case AppLifecycleState.resumed:
         // 回到前台：打印后台持续时长与当前隧道状态
         final bg = _backgroundedAt;
         debugPrint('[DSH] resumed from background, '
             'backgroundedMs=${bg == null ? '?' : DateTime.now().difference(bg).inMilliseconds}, '
-            'tunnel=${TunnelService.instance.status}');
+            'tunnel=${TunnelService.instance.state.status}');
         _backgroundedAt = null;
-        // 后台期间系统随时可能掐断 SSH socket（甚至冻结整个进程）：
-        // 回前台先做健康检查，断了/僵死了就自动重建并重载页面，
-        // 而不是把 ERR_CONNECTION_REFUSED 死错误页留给用户手动重试。
-        unawaited(_recoverAfterResume());
+        HostMonitor.instance.start();
+        // 后台期间系统随时可能掐断 SSH socket（甚至冻结整个进程）。回前台把
+        // "链路到底还活着吗"交给 TunnelService 判定：它做一次端到端探活，探不通
+        // 当场强制重建。旧实现在这里自己 HTTP 探测 + disconnect + connect，与
+        // 监督器并发互相打架（并且探测用的是带 token 的地址，每次回前台都重跑
+        // 一遍鉴权链）。
+        TunnelService.instance.notifyShouldReconnectNow('resume');
       case AppLifecycleState.detached:
         break;
-    }
-  }
-
-  /// 回前台自愈：后台期间隧道断开/僵死时自动重建，页面错误态自动补载。
-  ///
-  /// 三个入口对应三种状态：
-  /// - 隧道已断/失败（自动重连次数可能已在后台烧完）：重置计数重新连接；
-  ///   重连成功 → `_onTunnelStatus` connected 分支自动重载错误页；
-  /// - 隧道重连进行中：什么都不做，成功/失败事件自会驱动后续；
-  /// - 隧道自称 connected 但 socket 可能已死（后台被系统冻结后
-  ///   ERR_CONNECTION_REFUSED 的典型来源）：探测本地转发端口，
-  ///   探不通强制重建；探得通只补载页面错误态。
-  Future<void> _recoverAfterResume() async {
-    final status = TunnelService.instance.status;
-    if (status == TunnelStatus.connecting) return; // 重连已在路上
-    if (status != TunnelStatus.connected) {
-      _manualConnect();
-      return;
-    }
-    final alive = await _probeLocalPort();
-    if (!mounted) return;
-    if (!alive) {
-      debugPrint('[DSH] resume probe: 本地转发端口探不通，强制重建隧道');
-      await TunnelService.instance.disconnect();
-      if (!mounted) return;
-      _manualConnect();
-    } else if (_pageError != null) {
-      _retryLoad();
-    }
-  }
-
-  /// 探测本地转发端口是否真的可连：隧道状态可能滞留 connected 而底层
-  /// socket 已死。任何 HTTP 响应（含 303/401 鉴权跳转）都算隧道活着。
-  Future<bool> _probeLocalPort() async {
-    final client = HttpClient();
-    client.connectionTimeout = const Duration(seconds: 4);
-    try {
-      final req = await client.getUrl(Uri.parse(_targetUrl));
-      final res = await req.close().timeout(const Duration(seconds: 4));
-      await res.drain<void>();
-      return true;
-    } catch (e) {
-      debugPrint('[DSH] resume probe failed: $e');
-      return false;
-    } finally {
-      client.close(force: true);
     }
   }
 
@@ -881,53 +867,79 @@ class _WebViewScreenState extends State<WebViewScreen>
     _applyZoom();
   }
 
-  /// 隧道状态流回调：同步界面状态；断开/失败时带守卫自动重连。
+  /// 监督器状态流回调：**只渲染，不做重连决策**。
   ///
-  /// 首次异常（[_reconnectCount] == 0）不显示错误文案（静默重连，
-  /// 避免隐藏后台 / 黑屏一段时间后频繁闪现异常界面），
-  /// 但仍把状态置为 disconnected——顶栏不再显示"已连接"误导用户，
-  /// 回到前台时看到的是诚实的"隧道已断开"，而非残留的绿色状态点。
-  void _onTunnelStatus(TunnelStatus s) {
+  /// 三条渲染规则（正对应"别频繁弹没用的报错，但真断了要主动恢复"）：
+  /// 1. 连上过就把 WebView 留在树上（[_webViewAlive]）——闪断不再整棵销毁、
+  ///    重连后不再整站重载；
+  /// 2. 链路不可用时把"加载中/错误页"降级为**非阻塞横幅**，并挂起页面加载：
+  ///    隧道不在位时重试页面必然再失败，烧完 3 次只留下死错误页（历史 bug）；
+  /// 3. 恢复健康（端到端探活通过）时自动补载页面，用户不必手动点重试。
+  void _onTunnelState(TunnelState s) {
     if (!mounted) return;
-    final isBreak = s == TunnelStatus.disconnected || s == TunnelStatus.failed;
-    if (!_switching && isBreak) {
-      if (_reconnectCount == 0) {
-        if (_tunnelStatus == TunnelStatus.connected) {
-          // 仅更新状态（不设错误文案，_buildBody 的 disconnected 分支
-          // 显示"隧道已断开"，不会闪现红色错误界面）
-          setState(() => _tunnelStatus = TunnelStatus.disconnected);
-        }
-        _scheduleReconnect();
+    final wasHealthy = _tunnel.healthy;
+    setState(() {
+      _tunnel = s;
+      if (s.isConnected) _webViewAlive = true;
+      if (!s.healthy && _pageLoading) {
+        // 链路已断：这次加载永远等不到 onLoadStop，收掉进度遮罩，
+        // 别让用户对着一圈永不停下的转圈瞎猜。
+        _loadTimeoutTimer?.cancel();
+        _pageLoading = false;
+        _pageNeedsReload = true;
+      }
+    });
+    if (s.healthy && !wasHealthy) {
+      _snackThrottled('连接已恢复');
+      // 每次链路恢复都重新发放页面重试预算。不在 `_retryLoad()` 里清零：那样
+      // `_schedulePageRetry` 刚加完就会归零，3 次上限直接失效；而不清零的后果是
+      // 本会话早先烧完 3 次之后，断线重连的补载一旦失败就再无自动重试。
+      _pageRetryCount = 0;
+      if (_controller == null) {
+        // WebView 刚被建起来（首次连上 / 换实例）：它自己的 initialUrlRequest
+        // 就是这次"恢复补载"，此处再 loadUrl 只会多打一次。等 onLoadStop 收尾。
+        _pageNeedsReload = true;
         return;
       }
-    }
-    setState(() => _tunnelStatus = s);
-    if (!_switching && isBreak) {
-      _scheduleReconnect();
-    }
-    // 隧道重连成功而页面还停在错误态（后台断连期间的
-    // ERR_CONNECTION_REFUSED / 加载超时）：立即重载，避免"回到前台
-    // 面对死错误页手动点重试"。
-    if (s == TunnelStatus.connected && _pageError != null) {
-      unawaited(_retryLoad());
+      if (_pageError != null || _pageNeedsReload) {
+        unawaited(_retryLoad());
+      } else {
+        unawaited(_reloadIfUrlDrifted());
+      }
     }
   }
 
-  /// 带守卫的自动重连：避免重复/并发重连造成死循环；连续失败达到
-  /// [_maxReconnect] 次后停止自动重连，交由用户手动重试（防止无限循环）。
-  void _scheduleReconnect() {
-    if (_reconnecting) return;
-    if (_reconnectCount >= _maxReconnect) return;
-    _reconnecting = true;
-    _reconnectCount++;
-    // 递增退避：2s、4s、6s、8s、10s
-    // 注意：_reconnectCount 在调度时就已自增，第 5 次调度后值为
-    // _maxReconnect，此时仍应执行连接（否则实际只重试 4 次）。
-    final delay = Duration(seconds: 2 * _reconnectCount);
-    Future<void>.delayed(delay, () {
-      _reconnecting = false;
-      if (mounted && _reconnectCount <= _maxReconnect) _connect();
-    });
+  /// 隧道恢复 / 配置变更后校验实际地址：与目标地址不一致，或此前停在错误态，
+  /// 就强制重载。同一实例内改模式/端口时 body 不重建，页面可能仍停在旧地址
+  /// （曾在 Zcode 模式下残留 DSH 页面）。
+  Future<void> _reloadIfUrlDrifted() async {
+    final c = _controller;
+    if (c == null) return;
+    try {
+      final current = (await c.getUrl())?.toString();
+      if (current == null) return;
+      if (current != _targetUrl || _pageNeedsReload) {
+        debugPrint('[DSH] page reload after connect '
+            '(urlMismatch=${current != _targetUrl}, '
+            'pageNeedsReload=$_pageNeedsReload, '
+            'url=${current.replaceAll(RegExp(r'token=[^&]+'), 'token=***')})');
+        _pageNeedsReload = false;
+        await _loadTargetUrl();
+      }
+    } catch (_) {
+      // controller 未就绪：body 重建路径会自行加载
+    }
+  }
+
+  /// 低频提示：同一时间窗内只出现一次，避免自动重连过程刷屏。
+  void _snackThrottled(String message) {
+    final now = DateTime.now();
+    final last = _lastRefreshFeedback;
+    if (last != null && now.difference(last) < const Duration(seconds: 4)) {
+      return;
+    }
+    _lastRefreshFeedback = now;
+    _snack(message);
   }
 
   Future<void> _load() async {
@@ -963,30 +975,79 @@ class _WebViewScreenState extends State<WebViewScreen>
     TunnelService.instance.setupMonitorProfile(config, profileIndex: index);
   }
 
-  /// 用户主动连接：重置自动重连计数后连接（重试按钮 / 切换实例 / 初始加载）。
+  /// 用户主动发起连接（初始加载 / 切换实例 / 横幅"立即重试" / 回前台）。
+  ///
+  /// 只负责**提出诉求**：立即尝试、指数退避、永不放弃都归 TunnelService 监督器，
+  /// 结果经 [_onTunnelState] 回流到界面。UI 不再自行数失败次数（旧实现在这里
+  /// `_reconnectCount = 0; _connect();`，而 `_connect()` 里"await 返回即成功"
+  /// 的判断会在并发调用时点亮假绿灯并把计数清零，把整个退避节奏打乱）。
   void _manualConnect() {
-    _reconnectCount = 0;
-    _connect();
+    _authRetryCount = 0;
+    final fut = TunnelService.instance
+        .connect(_config, profileIndex: _activeIndex);
+    // 记名：这条隧道归本页面所有（dispose 时据此决定是否该断开）。
+    _myConnectSeq = TunnelService.instance.connectSeq;
+    unawaited(fut.then((s) {
+      // 用**返回值**判定成败，不看 `_tunnel`：状态流是异步派发的，此刻本地快照
+      // 很可能还是旧状态（读 `_tunnel.healthy` 会把刚连上的这次补载整个跳过）。
+      if (!mounted || !s.healthy) return;
+      unawaited(_reloadIfUrlDrifted());
+    }));
   }
 
-  /// 顶栏模式一键切换：同实例内翻转 DSH/Zcode。端口若仍是另一模式的默认值
-  /// 则落到本模式默认值（自定义端口保留），持久化后重载页面。
+  /// 顶栏「连接状态 / 主动刷新」按钮。
   ///
-  /// 同一台服务器的两种模式只是转发目标端口不同（DSH 3080 / Zcode 8787），
-  /// SSH 会话原样保留——转发通道按连接逐条拨号 _activeConfig.remotePort，
-  /// 就地更新内存配置后新连接自动走新端口，无需断开重连。
-  Future<void> _toggleMode() async {
-    final newMode =
-        _config.isZcodeMode ? SSHConfig.modeDsh : SSHConfig.modeZcode;
-    var newPort = _config.remotePort;
-    if (newMode == SSHConfig.modeZcode &&
-        newPort == SSHConfig.defaultRemotePort) {
-      newPort = SSHConfig.defaultZcodeRemotePort;
-    } else if (newMode == SSHConfig.modeDsh &&
-        newPort == SSHConfig.defaultZcodeRemotePort) {
-      newPort = SSHConfig.defaultRemotePort;
+  /// 旧版顶栏**没有任何重连入口**：隧道自称 connected 而实际半死时，用户在界面
+  /// 上无路可走，只能杀 App——正是"重试也不成功"里最气人的部分。现在一键 =
+  /// 立即端到端探活（探不通当场强制重建），并用一句话告诉用户结果。
+  Future<void> _refreshConnection() async {
+    final ok = await TunnelService.instance.forceRefresh();
+    if (!mounted) return;
+    _lastRefreshFeedback = null; // 用户主动操作：反馈不受节流限制
+    // 直接读监督器的实时状态：刚探活完，本地快照还是旧的，用它汇报会答非所问。
+    final live = TunnelService.instance.state;
+    // 同步一次本地快照，避免等下一帧流事件期间按钮显示旧颜色。
+    setState(() => _tunnel = live);
+    if (ok) {
+      _snack('链路正常，已刷新');
+      // **无条件重载**。按下刷新的人面对的一定是"点了没反应"：链路 healthy 而
+      // 页面卡死（SPA 挂了 / onLoadStop 早已触发）时，遮罩、错误卡、横幅三者一个
+      // 都不渲染，若再因为 `_pageError == null && !_pageNeedsReload` 跳过重载，
+      // 这个按钮就成了安慰剂，用户的唯一出路又退回杀 App。
+      await _retryLoad();
+    } else {
+      _snack(live.userMessage);
     }
-    final updated = _config.copyWith(mode: newMode, remotePort: newPort);
+  }
+
+  /// 打开「连接诊断」页：真机 + VPN 环境没有 adb，事件流是唯一能事后定位
+  /// "到底哪儿断了"的手段，必须给用户提供入口。
+  void _openTunnelDiagnostics() {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => const TunnelDiagnosticsScreen(),
+    ));
+  }
+
+  /// 服务模式显示名（顶栏切换器、提示条共用）。
+  static String _modeLabel(String mode) => switch (mode) {
+        SSHConfig.modeZcode => 'Zcode',
+        SSHConfig.modeWorkbuddy => 'WorkBuddy',
+        _ => 'DSH',
+      };
+
+  /// 顶栏模式切换：在同一实例的 [SSHConfig.availableModes] 之间切。
+  ///
+  /// 只改 `mode`：三模式的远端端口各自独立存储（DSH `remotePort` /
+  /// Zcode `zcodeRemotePort` / WorkBuddy `workbuddyRemotePort`），隧道按
+  /// `activeRemotePort` 逐条拨号（见 TunnelService._handleForward）。
+  /// 旧实现在这里顺带把 remotePort 在 3080/8787 之间翻转，三模式化之后
+  /// 等于拿 DSH 自己的端口去存 Zcode 的端口，会把 DSH 端口带歪。
+  ///
+  /// SSH 会话原样保留：就地更新内存配置后新连接自动走新端口，无需断开重连。
+  Future<void> _switchMode(String newMode) async {
+    if (newMode == _config.mode) return;
+    if (!_config.availableModes.contains(newMode)) return;
+    final updated = _config.copyWith(mode: newMode);
     await SSHConfig.saveProfile(_activeIndex, updated);
     if (!mounted) return;
     setState(() {
@@ -995,69 +1056,15 @@ class _WebViewScreenState extends State<WebViewScreen>
     });
     TunnelService.instance
         .updateActiveConfig(updated, profileIndex: _activeIndex);
-    final modeName = newMode == SSHConfig.modeZcode ? "Zcode" : "DSH";
-    if (TunnelService.instance.status == TunnelStatus.connected) {
+    final modeName = _modeLabel(newMode);
+    if (_tunnel.healthy) {
       _snack('已切换到 $modeName 模式');
+      _authRetryCount = 0;
       await _loadTargetUrl();
     } else {
       _snack('已切换到 $modeName 模式，连接中…');
       _manualConnect();
     }
-  }
-
-  Future<void> _connect() async {
-    // 已连接则跳过，避免冗余重连造成界面闪烁/循环
-    if (TunnelService.instance.status == TunnelStatus.connected) return;
-    setState(() {
-      _error = null;
-      _tunnelStatus = TunnelStatus.connecting;
-      _authError = false;
-      _pageError = null;
-      _pageLoading = false;
-    });
-    try {
-      await TunnelService.instance.connect(_config, profileIndex: _activeIndex);
-      if (!mounted) return;
-      _reconnectCount = 0; // 连接成功：重置重连计数
-      setState(() => _tunnelStatus = TunnelStatus.connected);
-      // WebView 只在 body 重建时用 initialUrlRequest 加载；同一实例内改
-      // 模式/端口（设置保存返回，body 不重建）时页面仍是旧地址——曾因此
-      // 在 Zcode 模式下残留 DSH 页面。校验实际地址，不一致就强制重载。
-      // 页面此前处于错误态（后台断连）也一并补载。
-      try {
-        final c = _controller;
-        final current = (await c?.getUrl())?.toString();
-        if (c != null && current != null &&
-            (current != _targetUrl || _pageNeedsReload)) {
-          debugPrint('[DSH] page reload after connect '
-              '(urlMismatch=${current != _targetUrl}, pageNeedsReload=$_pageNeedsReload, '
-              'url=${current.replaceAll(RegExp(r'token=[^&]+'), 'token=***')})');
-          _pageNeedsReload = false;
-          await _loadTargetUrl();
-        }
-      } catch (_) {
-        // controller 未就绪：body 重建路径会自行加载
-      }
-    } catch (e) {
-      if (!mounted) return;
-      _handleConnectFailure('$e');
-    }
-  }
-
-  /// 连接失败处理：首次失败不提示、直接默认重试；再次失败才显示错误
-  /// 提示界面，随后按退避策略自动重试。
-  void _handleConnectFailure(String message) {
-    if (_reconnectCount == 0) {
-      // 首次失败：不更新状态（界面不闪现错误提示），直接默认重试
-      _scheduleReconnect();
-      return;
-    }
-    // 再次失败：显示错误提示界面，随后自动重试
-    setState(() {
-      _tunnelStatus = TunnelStatus.failed;
-      _error = _appendQosHintIfTimeout(message);
-    });
-    _scheduleReconnect();
   }
 
   Future<void> _disconnect() async {
@@ -1075,15 +1082,18 @@ class _WebViewScreenState extends State<WebViewScreen>
     setState(() {
       _activeIndex = index;
       _config = _profiles[index];
-      _switching = true;
       _authError = false;
       _pageError = null;
       _pageLoading = false;
+      // 换实例 = 换服务端：常驻的 WebView 必须重建，否则它会带着上一个实例的
+      // SPA 状态和 cookie 继续跑在新地址上（旧实现靠"状态分支切换"顺带销毁，
+      // 现在 WebView 常驻了，这里要显式收掉，等隧道健康时再新建）。
+      _webViewAlive = false;
     });
+    _controller = null;
     await SSHConfig.setActiveIndex(index);
     await TunnelService.instance.disconnect();
     if (!mounted) return;
-    setState(() => _switching = false);
     _manualConnect();
   }
 
@@ -1097,7 +1107,15 @@ class _WebViewScreenState extends State<WebViewScreen>
     _zoomScaleNotifier.dispose();
     MoonLocation.observer.removeListener(_onMoonLocationChanged);
     HostMonitor.instance.stop();
-    _disconnect();
+    // 只有隧道仍归属本页面时才断开：路由替换（根路由重建 / pushReplacement）时
+    // 新页的 initState→connect() 可能早于本页 dispose，无条件 `_disconnect()` 会
+    // 掐掉新页刚拉起的隧道——而且它还会把 `_wantConnected` 置假，新页就此再也
+    // 连不上（表现：偶尔重启后第一次进入是空白页）。
+    if (_myConnectSeq == TunnelService.instance.connectSeq) {
+      unawaited(_disconnect());
+    } else {
+      debugPrint('[DSH] dispose: 隧道已被更新的页面接管，跳过 disconnect');
+    }
     super.dispose();
   }
 
@@ -1228,6 +1246,29 @@ class _WebViewScreenState extends State<WebViewScreen>
       afterActive: activeIndex,
     );
     if (changed) {
+      // 换服务器 / 换激活实例：常驻的 WebView 必须**重建**，只置 `_pageNeedsReload`
+      // 不够。CookieManager 与 SPA 状态属于上一个实例，带着实例 A 的 30 天签名
+      // cookie 去加载实例 B，B 会判定 token 无效 → 又落到手填 Token 的卡片上
+      // （`_switchInstance` 正是为此显式销毁 WebView 的，设置页这条路径同样能改
+      // host / 激活实例，必须同等处理）。
+      final before = _profiles[_activeIndex];
+      final after = profiles[activeIndex];
+      final crossServer = activeIndex != snapshotActive ||
+          before.host != after.host ||
+          before.username != after.username;
+      if (crossServer) {
+        setState(() {
+          _webViewAlive = false;
+          _controller = null;
+          _pageError = null;
+          _pageLoading = false;
+          _authError = false;
+        });
+      }
+      // 其它改动（token / 模式 / 端口）：新旧地址可能完全相同，也要强制重新加载
+      // 一次，否则常驻的 WebView 会停在旧会话上。
+      _pageNeedsReload = true;
+      _authRetryCount = 0;
       await TunnelService.instance.disconnect();
     }
     await _load();
@@ -1292,8 +1333,10 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   Future<void> _loadTargetUrl() async {
     final c = _controller;
-    // 隧道未连接或 controller 已失效时跳过，避免 MissingPluginException
-    if (c == null || _tunnelStatus != TunnelStatus.connected) return;
+    // 隧道未连接或 controller 已失效时跳过，避免 MissingPluginException。
+    // 注意这里只要求 isConnected、不要求探活通过：云端服务短暂没起时也要能让
+    // 页面重新发起加载（探活结论由横幅呈现，不该反过来拦住重载）。
+    if (c == null || !_tunnel.isConnected) return;
     try {
       await c.loadUrl(
         urlRequest: URLRequest(
@@ -1644,7 +1687,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   Future<void> _pickAndSendFile() async {
     final c = _controller;
     if (c == null) return;
-    if (TunnelService.instance.status != TunnelStatus.connected) {
+    if (!_tunnel.isConnected) {
       _snack('请先连接 SSH 隧道，再选择文件上传');
       return;
     }
@@ -1826,6 +1869,13 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   // ================= WebView 加载回调 =================
+  //
+  // 降噪总原则：**页面失败 ≠ 立刻报错**，先问一句"链路健康吗"。
+  //  - 不健康 → 这不是页面问题，是链路问题：不弹红色错误页、不烧页面重试次数，
+  //    只记下 `_pageNeedsReload` 并请监督器核实链路（它会判定假死并当场重建，
+  //    恢复后由 [_onTunnelState] 自动补载）。历史版本就是在隧道不在位时照样
+  //    弹全屏错误页 + 连试 3 次，用户看到的"无法加载远程界面"大多是这么来的。
+  //  - 健康 → 才是真正的页面问题：有限次自动重试，仍失败才给一张轻量错误卡。
 
   void _onPageLoadStart() {
     _loadTimeoutTimer?.cancel();
@@ -1841,10 +1891,15 @@ class _WebViewScreenState extends State<WebViewScreen>
       if (!mounted || !_pageLoading) return;
       setState(() {
         _pageLoading = false;
-        _pageError =
-            _appendQosHintIfTimeout('加载超时（${_loadTimeout.inSeconds} 秒未完成）。\n'
-                '请检查服务器状态、网络连接，或在设置中调大超时后重试。');
+        _pageError = _appendQosHintIfTimeout(
+            '加载超时（${_loadTimeout.inSeconds} 秒未完成）。\n'
+            '请检查服务器状态、网络连接，或在设置中调大超时后重试。');
       });
+      _pageNeedsReload = true;
+      // 无论隧道自称什么状态都请监督器复核：自称 connected 却拉不出页面，
+      // 正是"半开假死"最常见的现场。
+      TunnelService.instance.reportPageFailureAndAsk('timeout');
+      if (_tunnel.healthy) _schedulePageRetry();
     });
   }
 
@@ -1857,6 +1912,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     _loadTimeoutTimer?.cancel();
     _pageRetryCount = 0;
     _pageNeedsReload = false;
+    _authRetryCount = 0; // 成功加载 = 鉴权链走通，下次 401 重新给一次自动重试机会
     if (!mounted) return;
     setState(() {
       _pageLoading = false;
@@ -1866,34 +1922,53 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   int _pageRetryCount = 0;
 
+  /// 错误卡片的技术细节是否展开（默认折叠，避免一屏技术噪音）。
+  bool _pageErrorExpanded = false;
+
   void _onPageError(String message) {
     _loadTimeoutTimer?.cancel();
     if (!mounted) return;
+    _pageNeedsReload = true;
+    if (!_tunnel.healthy) {
+      // 链路问题，不是页面问题：错误文案只留作技术细节（界面不渲染它），
+      // 交给监督器判定假死并重建，恢复后自动补载。
+      setState(() {
+        _pageLoading = false;
+        _pageError = message;
+      });
+      TunnelService.instance.reportPageFailureAndAsk('onError');
+      return;
+    }
     setState(() {
       _pageLoading = false;
       _authError = false;
       _pageError = _appendQosHintIfTimeout(message);
     });
-    _pageNeedsReload = true;
-    // 隧道不在位（断开/重连中）时页面重试必然再失败——连接被拒的错误页
-    // 就是这么留下来的。不烧重试次数，等隧道重连成功（_onTunnelStatus 的
-    // connected 分支 / _connect 成功路径）自动重载页面。
-    if (TunnelService.instance.status != TunnelStatus.connected) return;
-    // 有限次自动重试：隧道在位但页面偶发失败（HTTP 5xx/资源超时）可自愈
+    // 隧道在位但页面偶发失败（HTTP 5xx / 资源超时）：有限次自动重试可自愈
     _schedulePageRetry();
   }
 
-  /// Token 鉴权失败（HTTP 401/403）：不走自动重试（填完 Token 前重试必然
-  /// 还是 401），错误页展示内嵌 Token 输入框，保存后立即重载。
+  /// Token 鉴权失败（HTTP 401/403）。
+  ///
+  /// 先**自动带已保存的 Token 重试一次**再下结论：服务端刚重启、30 天签名
+  /// cookie 尚未续上都可能瞬时 401，一上来就喊"你的 Token 已失效"是误报式
+  /// 打扰（[_loadTargetUrl] 带 `Cache-Control: no-cache`，重试会真正重跑
+  /// token → 303 → Set-Cookie 鉴权链）。仍然 401 才展示内嵌 Token 输入框。
   void _onAuthError(int statusCode) {
     _loadTimeoutTimer?.cancel();
     if (!mounted) return;
+    if (_authRetryCount == 0 && _config.activeModeToken.isNotEmpty) {
+      _authRetryCount = 1;
+      _snackThrottled('鉴权未通过，正在用已保存的 Token 重试…');
+      unawaited(_retryLoad());
+      return;
+    }
     setState(() {
       _pageLoading = false;
       _authError = true;
-      _pageError = '访问被拒绝（HTTP $statusCode）：远程 DSH 已启用 Token 鉴权，'
+      _pageError = '访问被拒绝（HTTP $statusCode）：远程服务已启用 Token 鉴权，'
           '当前保存的 Token 已失效（服务端重启后会轮换）。\n'
-          '请在下方填入最新的「DSH 访问 Token」，保存后自动重连。';
+          '请在下方填入最新的访问 Token，保存后自动重连。';
     });
   }
 
@@ -1918,12 +1993,21 @@ class _WebViewScreenState extends State<WebViewScreen>
     _onPageLoadStart();
   }
 
-  /// 页面加载失败后的有限自动重试（最多 3 次）。
+  /// 页面加载失败后的有限自动重试（最多 3 次，间隔递增 3s/6s/9s）。
+  ///
+  /// 到点时若链路已不健康，**不烧**页面重试次数——那是链路的事，交给监督器；
+  /// 页面重试只负责处理"链路好着但页面偶发抽风"。
   void _schedulePageRetry() {
     if (_pageRetryCount >= 3) return;
     _pageRetryCount++;
-    Future<void>.delayed(const Duration(seconds: 3), () {
-      if (mounted && _pageError != null) _retryLoad();
+    final delay = Duration(seconds: 3 * _pageRetryCount);
+    Future<void>.delayed(delay, () {
+      if (!mounted || _pageError == null) return;
+      if (!_tunnel.healthy) {
+        TunnelService.instance.reportPageFailureAndAsk('retry');
+        return;
+      }
+      _retryLoad();
     });
   }
 
@@ -1963,6 +2047,14 @@ class _WebViewScreenState extends State<WebViewScreen>
     // 与当前连接实例/隧道状态无关：任一实例连接时都显示监控实例的值。
     final showTrend = _hostMonitorEnabled &&
         TunnelService.instance.monitorProfileIndex != null;
+    // 顶栏图标一律紧凑密度：默认 IconButton 触摸目标 48dp，五个图标就吃掉
+    // 240dp，窄屏手机上（开 Unsloth + GitHub + 长实例别名时）会把最右边的
+    // "设置"整个挤出屏幕，谁都点不到。IconButton 的密度取
+    // visualDensity 参数，缺省落到 Theme.of(context).visualDensity，故在此
+    // 包一层 Theme 统一收小（只作用于图标簇与设置按钮这一小撮子树）。
+    final compactIconTheme = theme.copyWith(
+      visualDensity: VisualDensity.compact,
+    );
     return Container(
       color: theme.colorScheme.surface,
       child: SafeArea(
@@ -1993,44 +2085,136 @@ class _WebViewScreenState extends State<WebViewScreen>
                     padding: const EdgeInsets.symmetric(vertical: 2),
                     child: Text(
                       _config.isZcodeMode ? 'ZCode-Phone' : 'DSH-Phone',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: theme.textTheme.titleMedium,
                     ),
                   ),
                 ],
               ),
             ),
-            const Spacer(),
-            // 模式一键切换：与顶栏其它图标同款样式的 IconButton（点击翻转
-            // DSH/Zcode 并自动重连）。
-            IconButton(
-              tooltip: _config.isZcodeMode ? '切换到 DSH 模式' : '切换到 Zcode 模式',
-              icon: const Icon(Icons.swap_horiz, color: Colors.green),
-              onPressed: _toggleMode,
+            // 图标簇占满剩余宽度并右对齐（等价于"标题靠左 + 图标靠右"），
+            // 但多到放不下时改为横向滚动，而不是 RenderFlex overflow 把右边
+            // 按钮推出屏幕。这里刻意不用 Spacer + Flexible：两者都带权重会
+            // 平分剩余空间，图标明明放得下也得横着滑。
+            Expanded(
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: Theme(
+                  data: compactIconTheme,
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // 模式切换：只有 DSH 时不显示（见 _buildModeSwitcher）
+                        _buildModeSwitcher(),
+                        // 连接状态 / 主动刷新：旧版顶栏**没有任何重连入口**，隧道假死时
+                        // 用户只能杀 App。现在状态点一眼看出健康与否，点一下 = 立即端到端
+                        // 探活（探不通当场强制重建），并把结果一句话告诉用户。
+                        _buildConnectionButton(context),
+                        _buildInstanceSwitcher(context),
+                        // Unsloth 入口：全部实例未启用时隐藏（首页无意义）
+                        if (_unslothAvailable)
+                          IconButton(
+                            tooltip: 'Unsloth Studio',
+                            icon: const Icon(Icons.science_outlined),
+                            onPressed: _openUnsloth,
+                          ),
+                        // GitHub 入口：全局开关启用时显示
+                        if (_githubAvailable)
+                          IconButton(
+                            tooltip: 'GitHub',
+                            icon: const Icon(Icons.code_outlined),
+                            onPressed: _openGithub,
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
             ),
-            _buildInstanceSwitcher(context),
-            // Unsloth 入口：全部实例未启用时隐藏（首页无意义）
-            if (_unslothAvailable)
-              IconButton(
-                tooltip: 'Unsloth Studio',
-                icon: const Icon(Icons.science_outlined),
-                onPressed: _openUnsloth,
+            // 设置永远钉在最右侧、不参与滚动：它是唯一退出/改配置的入口，
+            // 被挤出屏幕等于把 App 锁死。
+            Theme(
+              data: compactIconTheme,
+              child: IconButton(
+                tooltip: '设置',
+                icon: const Icon(Icons.settings),
+                onPressed: _openSettings,
               ),
-            // GitHub 入口：全局开关启用时显示
-            if (_githubAvailable)
-              IconButton(
-                tooltip: 'GitHub',
-                icon: const Icon(Icons.code_outlined),
-                onPressed: _openGithub,
-              ),
-            IconButton(
-              tooltip: '设置',
-              icon: const Icon(Icons.settings),
-              onPressed: _openSettings,
             ),
             const SizedBox(width: 4),
           ],
         ),
       ),
+    );
+  }
+
+  /// 顶栏模式切换入口，形态由本实例可用模式数（[SSHConfig.availableModes]）决定：
+  ///
+  ///  - **只有 DSH**：不显示。Zcode / WorkBuddy 都关掉时，场上只有一个模式，
+  ///    摆一个"自己切自己"的图标既白占一格（还把"设置"挤下屏幕），又误导
+  ///    用户以为有隐藏模式；
+  ///  - **两个模式**：一键翻转到另一个；
+  ///  - **三个模式**：下拉直接选，省得连点两下才绕回来。
+  Widget _buildModeSwitcher() {
+    final modes = _config.availableModes;
+    if (modes.length < 2) return const SizedBox.shrink();
+    if (modes.length == 2) {
+      final other = modes.firstWhere((m) => m != _config.mode);
+      return IconButton(
+        tooltip: '切换到 ${_modeLabel(other)} 模式',
+        icon: const Icon(Icons.swap_horiz, color: Colors.green),
+        onPressed: () => _switchMode(other),
+      );
+    }
+    return PopupMenuButton<String>(
+      tooltip: '切换服务模式',
+      initialValue: _config.mode,
+      onSelected: _switchMode,
+      icon: const Icon(Icons.swap_horiz, color: Colors.green),
+      itemBuilder: (context) => [
+        for (final m in modes)
+          PopupMenuItem<String>(
+            value: m,
+            child: Row(
+              children: [
+                Icon(
+                  m == _config.mode ? Icons.check_circle : Icons.radio_button_unchecked,
+                  size: 18,
+                ),
+                const SizedBox(width: 8),
+                Text('${_modeLabel(m)} 模式'),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+
+  /// 顶栏连接状态按钮：图标即状态，点击即"主动刷新"。
+  Widget _buildConnectionButton(BuildContext context) {
+    final (icon, color, tip) = switch (_tunnel) {
+      TunnelState(
+        status: TunnelStatus.connected,
+        probeOk: true
+      ) =>
+        (Icons.cloud_done_outlined, Colors.green, '连接正常 · 点击刷新'),
+      TunnelState(status: TunnelStatus.connected) =>
+        (Icons.cloud_sync_outlined, Colors.orange, '${_tunnel.userMessage} · 点击立即检测'),
+      TunnelState(status: TunnelStatus.connecting) =>
+        (Icons.sync, Colors.orange, '${_tunnel.userMessage} · 点击立即重试'),
+      TunnelState(status: TunnelStatus.failed) =>
+        (Icons.cloud_off_outlined, Colors.red, '${_tunnel.userMessage} · 点击重试'),
+      TunnelState(status: TunnelStatus.disconnected) =>
+        (Icons.cloud_off_outlined, Colors.grey, '${_tunnel.userMessage} · 点击立即重试'),
+      _ => (Icons.cloud_outlined, Colors.grey, '未连接 · 点击连接'),
+    };
+    return IconButton(
+      tooltip: '$tip\n${_tunnelSubText()}',
+      icon: Icon(icon, color: color),
+      onPressed: () => unawaited(_refreshConnection()),
     );
   }
 
@@ -2042,6 +2226,7 @@ class _WebViewScreenState extends State<WebViewScreen>
       child: _InstanceChip(
         label: _config.label,
         status: _tunnelStatus,
+        healthy: _tunnel.healthy,
       ),
       itemBuilder: (context) => [
         for (var i = 0; i < SSHConfig.maxProfiles; i++)
@@ -2066,222 +2251,329 @@ class _WebViewScreenState extends State<WebViewScreen>
     );
   }
 
+  /// 主体：WebView **常驻**，链路状态用非阻塞横幅叠加在页面之上。
+  ///
+  /// 旧结构按 `_tunnelStatus` 切分支、`InAppWebView` 只存在于 connected 分支，
+  /// 于是每次闪断（以及每次连接过程中 idle→connecting→connected 的连续广播）
+  /// 都会 dispose 整棵 WebView：SPA 状态全丢、重连后整站重载——移动网络与
+  /// Tailscale 的瞬时抖动被放大成"页面老是重新加载 / 老是连不上"。
   Widget _buildBody() {
-    switch (_tunnelStatus) {
-      case TunnelStatus.idle:
-      case TunnelStatus.connecting:
-        return const Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              CircularProgressIndicator(),
-              SizedBox(height: 16),
-              Text('正在建立 SSH 隧道…'),
-            ],
-          ),
+    // 从未成功连上过：没有页面可保留，整屏显示连接进度或硬错误指引。
+    if (!_webViewAlive) return _buildInitialScreen();
+
+    // 用 LayoutBuilder 拿到对话区 Stack 的实际高度（顶栏之下），用于
+    // 浮动控件的定位与拖拽 clamp；并在此首次布局时设定控件默认位置。
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final stackHeight = constraints.maxHeight;
+        final stackWidth = constraints.maxWidth;
+        if (_bodyHeight == 0) {
+          _bodyHeight = stackHeight;
+          _zoomControlsTop = stackHeight * 0.5; // 默认屏幕中央
+          // 相机默认：底部往上约六分之一、再整体上移约 1 厘米；
+          // 用户拖动过则按上次保存的比例位置恢复（含吸附侧）。
+          _photoControlsTop = _savedPhotoTopRatio != null
+              ? (_savedPhotoTopRatio! * stackHeight)
+                  .clamp(0.0, stackHeight - _photoControlHeight)
+              : stackHeight * (1 - 1 / 6) - _photoDefaultRaise;
+          _photoControlsOnLeft = _savedPhotoOnLeft ?? true;
+          // 语音按钮默认吸附右侧、比相机入口略高一点（视觉上不对齐成一
+          // 条线，也避免与月相/天气动效拥挤）；可拖到左/右边缘吸附。
+          _voiceControlsTop =
+              (_photoControlsTop - 16).clamp(0.0, stackHeight);
+        } else if ((stackHeight - _bodyHeight).abs() > 1) {
+          // 容器高度变化（键盘弹出/收起、旋转等）：按高度比例上推/下拉
+          // 浮动控件，让相机/语音/缩放按钮跟随页面内容一起移动——键盘
+          // 上推页面时相机不会留在原地被键盘遮挡，天气动效锚定相机故
+          // 一并移动。
+          final ratio = stackHeight / _bodyHeight;
+          _zoomControlsTop = _zoomControlsTop * ratio;
+          _photoControlsTop = _photoControlsTop * ratio;
+          _voiceControlsTop = _voiceControlsTop * ratio;
+          _bodyHeight = stackHeight;
+        }
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            InAppWebView(
+              initialUrlRequest: URLRequest(url: WebUri(_targetUrl)),
+              initialSettings: InAppWebViewSettings(
+                // 缓存策略：LOAD_DEFAULT 尊重 HTTP 缓存头——zcode-phone-server
+                // 对 HTML 发 no-store，保证页面代码始终最新。曾因
+                // LOAD_CACHE_ELSE_NETWORK（哪怕过期也吃缓存）长期加载旧页面，
+                // 服务端修复全部无法到达手机；DSH 静态资源仍按其缓存头命中
+                cacheMode: CacheMode.LOAD_DEFAULT,
+                // DSH 是含 WebSocket 的 SPA
+                javaScriptEnabled: true,
+                transparentBackground: false,
+                // 原生双指缩放（保留手势），但禁用原生右下角缩放控件
+                // （原生控件位置固定、常覆盖发送按钮），改用自定义
+                // 左侧中央竖排浮动控件（_buildZoomControls）。
+                supportZoom: true,
+                displayZoomControls: false,
+                // 页面内语音输入（dsh 自带 mic 按钮，getUserMedia 采集
+                // 音频 → host 端 SenseVoice 转写）：自动播放策略放宽，
+                // 权限授予见 onPermissionRequest。
+                mediaPlaybackRequiresUserGesture: false,
+              ),
+              // 页面申请麦克风/摄像头（getUserMedia）时直接授予：
+              // 应用层的 RECORD_AUDIO 运行时权限在语音入口先申请。
+              onPermissionRequest: (controller, request) async {
+                debugPrint('[DSH] webview permission: '
+                    '${request.resources}');
+                return PermissionResponse(
+                  resources: request.resources,
+                  action: PermissionResponseAction.GRANT,
+                );
+              },
+              onWebViewCreated: (controller) {
+                _controller = controller;
+                _setupArtifactBridge(controller);
+                _setupPhotoBridge(controller);
+                _setupComposerBridge(controller);
+                _setupTaskBridge(controller);
+                _setupTerminalBridge(controller);
+              },
+              onLoadStart: (controller, url) => _onPageLoadStart(),
+              onProgressChanged: (controller, progress) =>
+                  _onPageProgress(progress),
+              onLoadStop: (controller, url) {
+                _onPageLoadStop();
+                // 页面就绪后应用持久化的缩放比例
+                _applyZoom();
+                // 每次页面导航后重新注入成果监听脚本
+                _injectArtifactBridge();
+                // 每次页面导航后重新注入图片直传桥
+                _injectPhotoBridge();
+                // 每次页面导航后重新注入文本注入桥
+                _injectComposerBridge();
+                // 每次页面导航后重新注入任务状态桥，并复位可能残留的
+                // 「任务进行中」通知（桥会对齐当前状态，运行中会重新上报）。
+                _injectTaskBridge();
+                TaskNotifier.instance.reset();
+                // 每次页面导航后重新注入终端按键桥
+                _injectTerminalBridge();
+                // 页面就绪：消费冷启动/排队中的分享内容
+                _processPendingShares();
+              },
+              onReceivedError: (controller, request, error) {
+                // 只有主框架加载失败才升级为整页错误。子资源/XHR/SSE 的
+                // 瞬时失败（EventSource 断开重连、切会话关闭旧流、轮询
+                // 抖动等）在长连接页面里是常态，整页报错会反复打断使用
+                // （表现为一点会话切换就「无法加载远程界面 net::ERR_FAILED」）。
+                if (request.isForMainFrame != true) return;
+                _onPageError(
+                  '加载失败：${error.description}\n'
+                  '（${error.type}）',
+                );
+              },
+              onReceivedHttpError: (controller, request, errorResponse) {
+                // 只处理主文档响应；子资源（图标等）的 401/404 不打扰页面
+                if (request.isForMainFrame != true) return;
+                final code = errorResponse.statusCode ?? 0;
+                if (code == 401 || code == 403) {
+                  // Token 鉴权未通过：停掉自动重试，错误页内嵌 Token 输入
+                  _onAuthError(code);
+                } else if (code >= 400) {
+                  _onPageError('服务器返回错误（HTTP $code），'
+                      '请确认远程服务正常运行后重试。');
+                }
+              },
+            ),
+            // 页面加载中：进度遮罩（不透明白底，避免黑屏观感）。
+            // 链路不健康时不显示——那时该看的是横幅上的"正在自动重连"，
+            // 而不是一圈和链路状态无关的进度条。
+            if (_pageLoading && _pageError == null && _tunnel.healthy)
+              _buildPageLoading(context),
+            // 页面加载失败/超时：错误界面。链路不健康时**不弹**——隧道没在
+            // 位时页面必然失败，弹出来的只是误导性的红色死错误页（历史 bug），
+            // 恢复后 _onTunnelState 会自动补载。
+            if (_pageError != null && _tunnel.healthy)
+              _buildPageError(context),
+            // 自定义缩放控件：左侧、竖排，可拖拽上下移动，避开右下角发送按钮。
+            // 默认关闭，仅在设置页开启后显示。
+            if (_zoomControlsEnabled && !_pageLoading && _pageError == null)
+              _buildZoomControls(context, stackHeight),
+            // 相机入口浮动按钮：默认对话区左侧靠屏幕边，可拖拽上下/左右
+            // 移动并吸附到最近边缘（方便左右手操作），默认开启。
+            if (_photoControlsEnabled &&
+                !_pageLoading &&
+                _pageError == null)
+              _buildPhotoControls(context, stackHeight, stackWidth),
+            // 语音输入浮动按钮：对话区右侧靠屏幕边（与相机入口对称），
+            // 可拖拽上下移动，长按按住说话，默认开启。
+            // 语音并入相机开启时隐藏右侧麦克风按钮（相机按钮承担语音）。
+            if (_voiceControlsEnabled &&
+                !_voiceMergeToCamera &&
+                !_pageLoading &&
+                _pageError == null)
+              _buildVoiceControls(context, stackHeight, stackWidth),
+            // 天气动效：云/雨/雪/雾/雷锚定相机按钮当前位置（拖拽上下/左右
+            // 均跟随），绘制在按钮上层、低不透明度且不拦截触摸；相机入口
+            // 隐藏时一并隐藏。
+            if (_photoControlsEnabled &&
+                _weatherEffectsEnabled &&
+                !_pageLoading &&
+                _pageError == null)
+              _buildWeatherOverlay(context, stackWidth),
+            // 侧边栏终端按键条：xterm 面板可见时显示在底部中央
+            //（手机软键盘没有 Esc/Ctrl/方向键，这些是终端刚需）
+            if (_terminalVisible && !_pageLoading && _pageError == null)
+              _buildTerminalKeyBar(context),
+            // 链路状态横幅：非阻塞、不弹全屏、不出现异常原文（降噪核心）。
+            if (!_tunnel.healthy) _buildTunnelBanner(context),
+          ],
         );
-      case TunnelStatus.failed:
-        return Center(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
+      },
+    );
+  }
+
+  // ==================== 链路状态呈现（降噪后的唯一出口）====================
+  //
+  // 设计约束（本次专项整改的落点）：
+  //  1. 链路类问题**永远不出现红色全屏**，也绝不把异常原文糊上主界面；
+  //  2. 必须始终告诉用户"系统正在自己恢复"（第几次、大约多久），
+  //     否则用户只能靠重启 App 来表达不耐烦——这正是"重试也不成功"的体验来源；
+  //  3. 必须提供一个**真的能刷新**的入口（横幅按钮 / 顶栏按钮）；
+  //  4. 技术细节收进「连接诊断」页，不进主界面。
+
+  /// 首次连接（从未成功连上）时的整屏引导。
+  Widget _buildInitialScreen() {
+    final hard = _tunnel.alertLevel == TunnelAlertLevel.hard;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(hard ? Icons.error_outline : Icons.dns_outlined,
+                size: 48, color: hard ? Colors.red : Colors.indigo),
+            const SizedBox(height: 16),
+            if (!hard) const CircularProgressIndicator(),
+            if (!hard) const SizedBox(height: 16),
+            Text(_tunnel.userMessage, textAlign: TextAlign.center),
+            const SizedBox(height: 8),
+            Text(_tunnelSubText(),
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.grey, fontSize: 12)),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: _manualConnect,
+              icon: const Icon(Icons.refresh),
+              label: const Text('立即重试'),
+            ),
+            const SizedBox(height: 8),
+            Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const Icon(Icons.error_outline, size: 48, color: Colors.red),
-                const SizedBox(height: 16),
-                Text('连接失败：\n$_error', textAlign: TextAlign.center),
-                const SizedBox(height: 16),
-                FilledButton.icon(
-                  onPressed: _manualConnect,
-                  icon: const Icon(Icons.refresh),
-                  label: const Text('重试'),
-                ),
-                const SizedBox(height: 8),
                 TextButton(
                   onPressed: _openSettings,
                   child: const Text('修改设置'),
                 ),
+                TextButton(
+                  onPressed: _openTunnelDiagnostics,
+                  child: const Text('连接诊断'),
+                ),
               ],
             ),
-          ),
-        );
-      case TunnelStatus.connected:
-        // 用 LayoutBuilder 拿到对话区 Stack 的实际高度（顶栏之下），用于
-        // 浮动控件的定位与拖拽 clamp；并在此首次布局时设定控件默认位置。
-        return LayoutBuilder(
-          builder: (context, constraints) {
-            final stackHeight = constraints.maxHeight;
-            final stackWidth = constraints.maxWidth;
-            if (_bodyHeight == 0) {
-              _bodyHeight = stackHeight;
-              _zoomControlsTop = stackHeight * 0.5; // 默认屏幕中央
-              // 相机默认：底部往上约六分之一、再整体上移约 1 厘米；
-              // 用户拖动过则按上次保存的比例位置恢复（含吸附侧）。
-              _photoControlsTop = _savedPhotoTopRatio != null
-                  ? (_savedPhotoTopRatio! * stackHeight)
-                      .clamp(0.0, stackHeight - _photoControlHeight)
-                  : stackHeight * (1 - 1 / 6) - _photoDefaultRaise;
-              _photoControlsOnLeft = _savedPhotoOnLeft ?? true;
-              // 语音按钮默认吸附右侧、比相机入口略高一点（视觉上不对齐成一
-              // 条线，也避免与月相/天气动效拥挤）；可拖到左/右边缘吸附。
-              _voiceControlsTop =
-                  (_photoControlsTop - 16).clamp(0.0, stackHeight);
-            } else if ((stackHeight - _bodyHeight).abs() > 1) {
-              // 容器高度变化（键盘弹出/收起、旋转等）：按高度比例上推/下拉
-              // 浮动控件，让相机/语音/缩放按钮跟随页面内容一起移动——键盘
-              // 上推页面时相机不会留在原地被键盘遮挡，天气动效锚定相机故
-              // 一并移动。
-              final ratio = stackHeight / _bodyHeight;
-              _zoomControlsTop = _zoomControlsTop * ratio;
-              _photoControlsTop = _photoControlsTop * ratio;
-              _voiceControlsTop = _voiceControlsTop * ratio;
-              _bodyHeight = stackHeight;
-            }
-            return Stack(
-              fit: StackFit.expand,
-              children: [
-                InAppWebView(
-                  initialUrlRequest: URLRequest(url: WebUri(_targetUrl)),
-                  initialSettings: InAppWebViewSettings(
-                    // 缓存策略：LOAD_DEFAULT 尊重 HTTP 缓存头——zcode-phone-server
-                    // 对 HTML 发 no-store，保证页面代码始终最新。曾因
-                    // LOAD_CACHE_ELSE_NETWORK（哪怕过期也吃缓存）长期加载旧页面，
-                    // 服务端修复全部无法到达手机；DSH 静态资源仍按其缓存头命中
-                    cacheMode: CacheMode.LOAD_DEFAULT,
-                    // DSH 是含 WebSocket 的 SPA
-                    javaScriptEnabled: true,
-                    transparentBackground: false,
-                    // 原生双指缩放（保留手势），但禁用原生右下角缩放控件
-                    // （原生控件位置固定、常覆盖发送按钮），改用自定义
-                    // 左侧中央竖排浮动控件（_buildZoomControls）。
-                    supportZoom: true,
-                    displayZoomControls: false,
-                    // 页面内语音输入（dsh 自带 mic 按钮，getUserMedia 采集
-                    // 音频 → host 端 SenseVoice 转写）：自动播放策略放宽，
-                    // 权限授予见 onPermissionRequest。
-                    mediaPlaybackRequiresUserGesture: false,
-                  ),
-                  // 页面申请麦克风/摄像头（getUserMedia）时直接授予：
-                  // 应用层的 RECORD_AUDIO 运行时权限在语音入口先申请。
-                  onPermissionRequest: (controller, request) async {
-                    debugPrint('[DSH] webview permission: '
-                        '${request.resources}');
-                    return PermissionResponse(
-                      resources: request.resources,
-                      action: PermissionResponseAction.GRANT,
-                    );
-                  },
-                  onWebViewCreated: (controller) {
-                    _controller = controller;
-                    _setupArtifactBridge(controller);
-                    _setupPhotoBridge(controller);
-                    _setupComposerBridge(controller);
-                    _setupTaskBridge(controller);
-                    _setupTerminalBridge(controller);
-                  },
-                  onLoadStart: (controller, url) => _onPageLoadStart(),
-                  onProgressChanged: (controller, progress) =>
-                      _onPageProgress(progress),
-                  onLoadStop: (controller, url) {
-                    _onPageLoadStop();
-                    // 页面就绪后应用持久化的缩放比例
-                    _applyZoom();
-                    // 每次页面导航后重新注入成果监听脚本
-                    _injectArtifactBridge();
-                    // 每次页面导航后重新注入图片直传桥
-                    _injectPhotoBridge();
-                    // 每次页面导航后重新注入文本注入桥
-                    _injectComposerBridge();
-                    // 每次页面导航后重新注入任务状态桥，并复位可能残留的
-                    // 「任务进行中」通知（桥会对齐当前状态，运行中会重新上报）。
-                    _injectTaskBridge();
-                    TaskNotifier.instance.reset();
-                    // 每次页面导航后重新注入终端按键桥
-                    _injectTerminalBridge();
-                    // 页面就绪：消费冷启动/排队中的分享内容
-                    _processPendingShares();
-                  },
-                  onReceivedError: (controller, request, error) {
-                    // 只有主框架加载失败才升级为整页错误。子资源/XHR/SSE 的
-                    // 瞬时失败（EventSource 断开重连、切会话关闭旧流、轮询
-                    // 抖动等）在长连接页面里是常态，整页报错会反复打断使用
-                    // （表现为一点会话切换就「无法加载远程界面 net::ERR_FAILED」）。
-                    if (request.isForMainFrame != true) return;
-                    _onPageError(
-                      '加载失败：${error.description}\n'
-                      '（${error.type}）',
-                    );
-                  },
-                  onReceivedHttpError: (controller, request, errorResponse) {
-                    // 只处理主文档响应；子资源（图标等）的 401/404 不打扰页面
-                    if (request.isForMainFrame != true) return;
-                    final code = errorResponse.statusCode ?? 0;
-                    if (code == 401 || code == 403) {
-                      // Token 鉴权未通过：停掉自动重试，错误页内嵌 Token 输入
-                      _onAuthError(code);
-                    } else if (code >= 400) {
-                      _onPageError('服务器返回错误（HTTP $code），'
-                          '请确认远程服务正常运行后重试。');
-                    }
-                  },
-                ),
-                // 页面加载中：进度遮罩（不透明白底，避免黑屏观感）
-                if (_pageLoading && _pageError == null)
-                  _buildPageLoading(context),
-                // 页面加载失败/超时：错误界面
-                if (_pageError != null) _buildPageError(context),
-                // 自定义缩放控件：左侧、竖排，可拖拽上下移动，避开右下角发送按钮。
-                // 默认关闭，仅在设置页开启后显示。
-                if (_zoomControlsEnabled && !_pageLoading && _pageError == null)
-                  _buildZoomControls(context, stackHeight),
-                // 相机入口浮动按钮：默认对话区左侧靠屏幕边，可拖拽上下/左右
-                // 移动并吸附到最近边缘（方便左右手操作），默认开启。
-                if (_photoControlsEnabled &&
-                    !_pageLoading &&
-                    _pageError == null)
-                  _buildPhotoControls(context, stackHeight, stackWidth),
-                // 语音输入浮动按钮：对话区右侧靠屏幕边（与相机入口对称），
-                // 可拖拽上下移动，长按按住说话，默认开启。
-                // 语音并入相机开启时隐藏右侧麦克风按钮（相机按钮承担语音）。
-                if (_voiceControlsEnabled &&
-                    !_voiceMergeToCamera &&
-                    !_pageLoading &&
-                    _pageError == null)
-                  _buildVoiceControls(context, stackHeight, stackWidth),
-                // 天气动效：云/雨/雪/雾/雷锚定相机按钮当前位置（拖拽上下/左右
-                // 均跟随），绘制在按钮上层、低不透明度且不拦截触摸；相机入口
-                // 隐藏时一并隐藏。
-                if (_photoControlsEnabled &&
-                    _weatherEffectsEnabled &&
-                    !_pageLoading &&
-                    _pageError == null)
-                  _buildWeatherOverlay(context, stackWidth),
-                // 侧边栏终端按键条：xterm 面板可见时显示在底部中央
-                //（手机软键盘没有 Esc/Ctrl/方向键，这些是终端刚需）
-                if (_terminalVisible && !_pageLoading && _pageError == null)
-                  _buildTerminalKeyBar(context),
-              ],
-            );
-          },
-        );
-      case TunnelStatus.disconnected:
-        return Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 非阻塞状态横幅：贴在对话区顶部，**不遮挡内容、不弹全屏、无异常原文**。
+  ///
+  /// 这是"不要频繁弹没用的报错"的落点：链路抖动期间用户看到的是一行可解释、
+  /// 可操作的状态 + 一个能按的按钮，而不是反复弹出的红色"连接失败"整屏。
+  Widget _buildTunnelBanner(BuildContext context) {
+    final level = _tunnel.alertLevel;
+    final scheme = Theme.of(context).colorScheme;
+    final hard = level == TunnelAlertLevel.hard;
+    final bg = hard ? scheme.errorContainer : scheme.tertiaryContainer;
+    final fg = hard ? scheme.onErrorContainer : scheme.onTertiaryContainer;
+    return Positioned(
+      left: 0,
+      right: 0,
+      top: 0,
+      child: Material(
+        color: bg,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+          child: Row(
             children: [
-              const Icon(Icons.link_off, size: 48),
-              const SizedBox(height: 16),
-              const Text('隧道已断开'),
-              const SizedBox(height: 16),
-              FilledButton.icon(
-                onPressed: _manualConnect,
-                icon: const Icon(Icons.refresh),
-                label: const Text('重新连接'),
+              Icon(hard ? Icons.error_outline : Icons.sync,
+                  size: 18, color: fg),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(_tunnel.userMessage,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: fg, fontSize: 13)),
+                    Text(_tunnelSubText(),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            color: fg.withValues(alpha: 0.75), fontSize: 11)),
+                  ],
+                ),
+              ),
+              TextButton(
+                onPressed: () => unawaited(_refreshConnection()),
+                child: Text(hard ? '重试' : '立即重试',
+                    style: TextStyle(color: fg)),
+              ),
+              // 配置类错误（认证/主机密钥/私钥/本地端口）：重试不会让它变好，
+              // 直接把"改设置"摆出来，别让用户在死路上反复按同一个按钮。
+              if (hard)
+                TextButton(
+                  onPressed: _openSettings,
+                  child: Text('改设置', style: TextStyle(color: fg)),
+                ),
+              IconButton(
+                tooltip: '连接诊断',
+                iconSize: 18,
+                visualDensity: VisualDensity.compact,
+                icon: Icon(Icons.info_outline, color: fg),
+                onPressed: _openTunnelDiagnostics,
               ),
             ],
           ),
-        );
+        ),
+      ),
+    );
+  }
+
+  /// 横幅/整屏共用的第二行小字：让"自动恢复"这件事变得可见。
+  ///
+  /// 例：`第 4 次尝试 · 约 12 秒后自动重试 · 127.0.0.1:3081`。用户知道系统在
+  /// 自己试、且知道大概多久，就不会反复手点，也不会以为 App 卡死了。
+  String _tunnelSubText() {
+    final parts = <String>[];
+    if (_tunnel.attempt > 0) {
+      parts.add('第 ${_tunnel.attempt} 次尝试');
     }
+    final next = _tunnel.nextRetryAt;
+    if (next != null) {
+      final secs = next.difference(DateTime.now()).inSeconds;
+      parts.add(secs > 0 ? '约 $secs 秒后自动重试' : '正在重试…');
+    }
+    final port = _config.localPort;
+    if (port > 0) parts.add('127.0.0.1:$port');
+    final since = _tunnel.connectedSince;
+    if (_tunnel.healthy && since != null) {
+      parts.add('已连接 ${_humanDuration(DateTime.now().difference(since))}');
+    }
+    return parts.join(' · ');
+  }
+
+  static String _humanDuration(Duration d) {
+    if (d.inMinutes < 1) return '${d.inSeconds} 秒';
+    if (d.inHours < 1) return '${d.inMinutes} 分钟';
+    return '${d.inHours} 小时 ${d.inMinutes % 60} 分';
   }
 
   /// WebView 加载中的进度遮罩。
@@ -2336,10 +2628,33 @@ class _WebViewScreenState extends State<WebViewScreen>
               const SizedBox(height: 12),
               ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 320),
-                child: Text(
-                  '$_pageError',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.grey, fontSize: 13),
+                child: Column(
+                  children: [
+                    Text(
+                      '$_pageError',
+                      textAlign: TextAlign.center,
+                      maxLines: _pageErrorExpanded ? null : 3,
+                      overflow: _pageErrorExpanded
+                          ? TextOverflow.visible
+                          : TextOverflow.ellipsis,
+                      style:
+                          const TextStyle(color: Colors.grey, fontSize: 13),
+                    ),
+                    // 长文（VPN/QoS 排查提示）默认折叠：主界面只给结论，
+                    // 技术细节想看再展开，别一上来糊一屏。
+                    if ('$_pageError'.length > 60)
+                      TextButton(
+                        onPressed: () => setState(
+                            () => _pageErrorExpanded = !_pageErrorExpanded),
+                        child: Text(_pageErrorExpanded
+                            ? '收起详情'
+                            : '展开详情（含网络排查提示）'),
+                      ),
+                    TextButton(
+                      onPressed: _openTunnelDiagnostics,
+                      child: const Text('连接诊断'),
+                    ),
+                  ],
                 ),
               ),
               if (_authError) ...[
@@ -2549,33 +2864,48 @@ class _WebViewScreenState extends State<WebViewScreen>
 
 /// 顶部实例切换器的展示 Chip：实例标签 + 连接状态点。
 class _InstanceChip extends StatelessWidget {
-  const _InstanceChip({required this.label, required this.status});
+  const _InstanceChip({
+    required this.label,
+    required this.status,
+    this.healthy = true,
+  });
 
   final String label;
   final TunnelStatus status;
 
+  /// 端到端探活是否通过。自称 connected 但探活失败时显示橙色而不是绿色——
+  /// "顶栏一片绿、页面却打不开"是最消耗信任的误导（用户会以为是自己网差）。
+  final bool healthy;
+
   @override
   Widget build(BuildContext context) {
-    final (color) = switch (status) {
-      TunnelStatus.idle => Colors.grey,
-      TunnelStatus.connecting => Colors.orange,
-      TunnelStatus.connected => Colors.green,
-      TunnelStatus.failed => Colors.red,
-      TunnelStatus.disconnected => Colors.grey,
+    final (color) = switch ((status, healthy)) {
+      (TunnelStatus.connected, false) => Colors.orange,
+      (TunnelStatus.idle, _) => Colors.grey,
+      (TunnelStatus.connecting, _) => Colors.orange,
+      (TunnelStatus.connected, _) => Colors.green,
+      // 红色只留给真正的配置类错误：链路抖动是 disconnected（灰），不是失败。
+      (TunnelStatus.failed, _) => Colors.red,
+      (TunnelStatus.disconnected, _) => Colors.grey,
     };
     return Padding(
       padding: const EdgeInsets.only(right: 4),
-      child: Chip(
-        // 服务器图标标识"实例/主机"，避免与顶栏绿色模式切换图标撞脸
-        avatar: Icon(Icons.dns_outlined, size: 16, color: color),
-        label: Text(
-          label,
-          style: const TextStyle(fontSize: 12),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
+      // 别名是用户自填的，长度不设上限就会把右边图标整排挤下屏幕；
+      // 封顶 120dp，超出走省略号（完整名在弹出菜单里看）。
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 120),
+        child: Chip(
+          // 服务器图标标识"实例/主机"，避免与顶栏绿色模式切换图标撞脸
+          avatar: Icon(Icons.dns_outlined, size: 16, color: color),
+          label: Text(
+            label,
+            style: const TextStyle(fontSize: 12),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          backgroundColor: color.withValues(alpha: 0.15),
+          visualDensity: VisualDensity.compact,
         ),
-        backgroundColor: color.withValues(alpha: 0.15),
-        visualDensity: VisualDensity.compact,
       ),
     );
   }

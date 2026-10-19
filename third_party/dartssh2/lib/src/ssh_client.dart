@@ -451,15 +451,30 @@ class SSHClient {
   /// Shutdown the entire SSH connection. Sessions and channels will also be
   /// closed immediately.
   void close() {
-    _closeChannels();
-    _transport.close();
+    // [fork] `channel.destroy()` 需要活的传输层：传输已关闭时它会同步抛
+    // SSHStateError('Transport is closed')（见 ssh_transport.dart `sendPacket`）。
+    // 原来这里毫无防护——一旦抛出，后续通道不清理、`_channels` 不清空，而且
+    // **`_transport.close()` 永远不会执行**：socket 不 destroy、fd 与远端 sshd 的
+    // 连接槽一起泄漏，异常还被调用方 catch 掉，完全无声。
+    try {
+      _closeChannels();
+    } finally {
+      _transport.close();
+    }
   }
 
   /// Close all channels that are currently open.
   void _closeChannels() {
     for (final channel in _channels.values) {
-      channel.destroy();
-      _channelIdAllocator.release(channel.localId);
+      // [fork] 尽力清理：单条通道 destroy 失败不能拖垮整批收尾（销毁 EOF/CLOSE 包
+      // 依赖传输层，而调用方往往正是在传输层已死时才来收尾）。
+      try {
+        channel.destroy();
+      } catch (e) {
+        printDebug?.call('SSHClient._closeChannels: destroy failed: $e');
+      } finally {
+        _channelIdAllocator.release(channel.localId);
+      }
     }
 
     _channels.clear();
@@ -478,7 +493,39 @@ class SSHClient {
       );
     }
     _keepAlive?.stop();
-    _closeChannels();
+    // [fork] 传输层已关闭，但 `_channelOpenReplyWaiters` 里等待 channel
+    // confirmation 的 Future 上游从不清理：`forwardLocal()` 会**永远挂起**
+    // （既不返回也不报错），本地转发的 socket 也就一直吊着。这里统一以
+    // "打开失败(connectFailed)"收尾，让调用方能立刻拿到错误并重连。
+    _failPendingChannelOpens();
+    // [fork] _closeChannels() 里 channel.destroy() 会尝试发 EOF/CLOSE 包，
+    // 传输已关闭时 sendPacket 同步抛 SSHStateError —— 一旦抛出，后面的
+    // `_channels.clear()` 就被跳过，通道表永久残留，后续 client.close()
+    // 还会在同一处再抛。尽力清理，不让它影响收尾。
+    try {
+      _closeChannels();
+    } catch (e) {
+      printDebug?.call('SSHClient._onTransportClosed: _closeChannels failed: $e');
+      _channels.clear();
+    }
+  }
+
+  /// [fork] 用 connectFailed 收尾所有还在等待 channel open 回复的请求。
+  void _failPendingChannelOpens() {
+    if (_channelOpenReplyWaiters.isEmpty) return;
+    for (final entry in _channelOpenReplyWaiters.entries.toList()) {
+      _channelOpenReplyWaiters.remove(entry.key);
+      // 这些 id 已 `allocate()` 但对应的 channel 永远不会被 `_acceptChannel`
+      // 登记，不归还就会一路占用分配器（配合超时后迟到的 OPEN_CONFIRM 更明显）。
+      _channelIdAllocator.release(entry.key);
+      entry.value.complete(
+        SSH_Message_Channel_Open_Failure(
+          recipientChannel: entry.key,
+          reasonCode: SSH_Message_Channel_Open_Failure.codeConnectFailed,
+          description: 'Transport closed before channel confirmation',
+        ),
+      );
+    }
   }
 
   void _handlePacket(Uint8List payload) {

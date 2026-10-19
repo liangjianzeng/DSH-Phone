@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:charset/charset.dart' show Charset, gbk;
@@ -10,12 +11,182 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'config.dart';
 import 'foreground_service.dart';
+import 'tunnel_diagnostics.dart';
+import 'tunnel_policy.dart';
 
 /// 隧道连接状态。
+///
+/// 语义约定（配合 [TunnelState] / [TunnelAlertPolicy] 使用，UI 侧不要再自行
+/// 推断"该不该报错"）：
+/// - [idle] 从未连接 / 用户主动断开；
+/// - [connecting] 正在握手（首次或自动重试中）；
+/// - [connected] 传输层在位（是否真的可用看 [TunnelState.probeOk]）；
+/// - [disconnected] 链路类中断，**监督器仍在后台退避重试**，界面只需非阻塞提示；
+/// - [failed] 配置类失败（密码/指纹/端口/端口占用），重试不会自己变好，
+///   必须告诉用户并给"改设置"入口。
 enum TunnelStatus { idle, connecting, connected, failed, disconnected }
+
+/// 隧道对外可见的完整状态快照（单一事实来源）。
+///
+/// 取代"UI 自己数重连次数 + 自己决定弹不弹错误"的旧结构：次数、下次重试
+/// 时间、故障类别、探活结果全部由监督器拥有，界面只是渲染。
+class TunnelState {
+  const TunnelState({
+    this.status = TunnelStatus.idle,
+    this.kind = TunnelFailureKind.none,
+    this.attempt = 0,
+    this.nextRetryAt,
+    this.lastError,
+    this.lastProbeAt,
+    this.probeOk = false,
+    this.connectedSince,
+    this.profileIndex,
+    this.everConnected = false,
+  });
+
+  final TunnelStatus status;
+
+  /// 最近一次失败的类别（[TunnelFailureKind.none] = 无故障）。
+  final TunnelFailureKind kind;
+
+  /// 本次中断以来已尝试的次数（0 = 尚未失败或刚连上）。
+  final int attempt;
+
+  /// 下一次自动重试的时刻；null = 暂无计划（已连上或用户主动断开）。
+  final DateTime? nextRetryAt;
+
+  /// 最近一次失败的技术细节（只进"详情/诊断页"，不上主界面）。
+  final String? lastError;
+
+  final DateTime? lastProbeAt;
+
+  /// 最近一次端到端探活是否成功。connected 但 probeOk=false 表示"自称连着、
+  /// 实际探测不通"——即半开假死，正在判定中。
+  final bool probeOk;
+
+  /// 当前会话建立时刻（null = 未连接）。
+  final DateTime? connectedSince;
+
+  final int? profileIndex;
+
+  /// 本进程内是否**曾经**成功连上过。分级策略用它区分"链路抖动"与"压根没通过"。
+  ///
+  /// 不能用 `connectedSince != null` 代替：两条失败路径都带 `clearConnectedSince`，
+  /// 于是它永远是 null，`attentionAfterAttempts=3` 成了死代码（任何抖动都在第 2
+  /// 次就升格成 attention）。
+  final bool everConnected;
+
+  bool get isConnected => status == TunnelStatus.connected;
+
+  /// 端到端可用：传输层在位且最近一次探活通过。
+  bool get healthy => isConnected && probeOk;
+
+  /// 监督器是否仍在后台自动重试（用户不需要动手）。
+  bool get retryScheduled => nextRetryAt != null;
+
+  /// 主界面横幅文案：短、有结论、带"接下来会怎样"。
+  ///
+  /// 历史上界面把异常原文 + VPN QoS 长文一起糊屏（`_appendQosHintIfTimeout`），
+  /// 用户看到的是噪音而不是信息。技术细节去诊断页看。
+  String get userMessage {
+    switch (status) {
+      case TunnelStatus.connected:
+        if (probeOk) return '连接正常';
+        return kind == TunnelFailureKind.remoteDown
+            ? 'SSH 已连通，但云端服务没有应答：请确认远端服务正在运行'
+            : '网络波动，正在检测链路…';
+      case TunnelStatus.connecting:
+        return attempt == 0
+            ? '正在建立 SSH 隧道…'
+            : '正在自动重连（第 ${attempt + 1} 次）…';
+      case TunnelStatus.failed:
+        return tunnelFailureSummary(kind);
+      case TunnelStatus.disconnected:
+        final base = kind == TunnelFailureKind.none
+            ? '隧道已断开'
+            : tunnelFailureSummary(kind);
+        return retryScheduled
+            ? '$base · 正在自动重试（第 ${attempt + 1} 次）'
+            : '$base · 正在等待网络恢复';
+      case TunnelStatus.idle:
+        return '未连接';
+    }
+  }
+
+  /// 提示分级（界面据此决定"静默 / 非阻塞横幅 / 红色指引"）。
+  ///
+  /// 特例：**自称连着但探活不过**（半开假死判定中、或云端服务不应答）时用户
+  /// 正在实打实地经历"点了没反应"，此时绝不能静默——必须给非阻塞横幅说明
+  /// "正在检测/云端服务没起"，否则就是当年那种"顶栏绿灯、页面死转圈"。
+  TunnelAlertLevel get alertLevel {
+    if (isConnected) {
+      if (probeOk) return TunnelAlertLevel.silent;
+      return TunnelAlertLevel.busy;
+    }
+    if (status == TunnelStatus.idle) return TunnelAlertLevel.silent;
+    return const TunnelAlertPolicy().levelFor(
+      attempt: attempt,
+      kind: kind,
+      connectedBefore: everConnected,
+    );
+  }
+
+  TunnelState copyWith({
+    TunnelStatus? status,
+    TunnelFailureKind? kind,
+    int? attempt,
+    DateTime? nextRetryAt,
+    bool clearNextRetry = false,
+    String? lastError,
+    bool clearLastError = false,
+    DateTime? lastProbeAt,
+    bool? probeOk,
+    DateTime? connectedSince,
+    bool clearConnectedSince = false,
+    int? profileIndex,
+    bool? everConnected,
+  }) {
+    return TunnelState(
+      status: status ?? this.status,
+      kind: kind ?? this.kind,
+      attempt: attempt ?? this.attempt,
+      nextRetryAt: clearNextRetry ? null : (nextRetryAt ?? this.nextRetryAt),
+      lastError: clearLastError ? null : (lastError ?? this.lastError),
+      lastProbeAt: lastProbeAt ?? this.lastProbeAt,
+      probeOk: probeOk ?? this.probeOk,
+      connectedSince:
+          clearConnectedSince ? null : (connectedSince ?? this.connectedSince),
+      profileIndex: profileIndex ?? this.profileIndex,
+      everConnected: everConnected ?? this.everConnected,
+    );
+  }
+}
 
 /// 远程主机类型（用于选择采集命令）。
 enum HostType { linux, windows }
+
+/// 本次建链已被取消（用户断开 / 切换目标 / dispose）。
+///
+/// 单独成类型是为了让 `_attemptOnce` 的 catch 能把它与真正的故障区分开：取消
+/// **不记失败、不分类、不排退避**，否则会凭空多出一次"隧道已断开·正在自动重试"。
+class TunnelAbortedException implements Exception {
+  const TunnelAbortedException();
+  @override
+  String toString() => '隧道连接已取消';
+}
+
+/// 主机密钥指纹不匹配（TOFU 拒绝）。
+///
+/// 以前用一个服务级 `bool _hostKeyMismatch` 传递，而主隧道、`testConnection`、
+/// 监控隧道、Unsloth 隧道**共用同一个标志**：设置页点一下"测试连接"连到另一台
+/// 指纹已变的主机，主隧道下一次因 DNS 失败进 catch 就被误判成 hostKey，弹出
+/// 红色"服务器主机密钥与上次记录不一致"，用户照着去清指纹也治不好。改为随
+/// 单次连接上下文抛出的异常类型。
+class TunnelHostKeyMismatchException implements Exception {
+  const TunnelHostKeyMismatchException();
+  @override
+  String toString() => 'SSHHostkeyError: Hostkey verification failed';
+}
 
 /// 远程文件读取失败（带用户可读原因，查看器据此展示）。
 class RemoteReadException implements Exception {
@@ -61,15 +232,75 @@ class TunnelService {
   /// 大文件应走 [DownloadManager] 的下载/断点续传流程。
   static const int maxRemoteReadBytes = 8 * 1024 * 1024;
 
-  final StreamController<TunnelStatus> _statusController =
-      StreamController<TunnelStatus>.broadcast();
+  // ==================== 连接监督器（单一事实来源）====================
+  //
+  // 旧结构把「重连」散落在 UI 里（`_scheduleReconnect` / `_reconnectCount` /
+  // `_maxReconnect = 5`），造成三个必现故障：
+  //   1. 5 次线性退避（2/4/6/8/10s，共 30 秒）烧完后**彻底放弃且不留任何定时器**
+  //      → 移动网络/Tailscale 重拨通常要 30 秒以上，于是每次真实断线都永远停在
+  //      死错误页，只能用户手动点重试；
+  //   2. `connect()` 并发时「早退即成功」，UI 拿到正常返回就点亮绿灯并把重连
+  //      计数清零 → 假 connected + 退避节奏被打乱；
+  //   3. dartssh2 的 `forwardLocal` 与 keepalive **都没有响应超时**，TCP 半开时
+  //      状态会无限期滞留 connected、转发请求永久挂起 → 「看着连着其实死了」。
+  // 现在：重试计划 / 周期探活 / 故障分类 / 事件日志全部收拢在本单例（不随根路由
+  // 重建而丢失），UI 只订阅 [stateStream] 做渲染，不再自行数次数、自行决定报错。
+
+  /// 连接期间的端到端探活周期。
+  static const Duration probeInterval = Duration(seconds: 15);
+
+  /// 单次探活的整体超时（含 TCP + HTTP 应答）。
+  static const Duration probeTimeout = Duration(seconds: 5);
+
+  /// 连续探活失败多少次判定"假死"并强制重建。
+  static const int probeFailThreshold = 3;
+
+  /// `client.forwardLocal()` 等待上限。dartssh2 内部该 Future **无超时**，
+  /// 半开传输层下会永久挂起（见 `_handleForward`）。
+  static const Duration forwardOpenTimeout = Duration(seconds: 8);
+
+  /// 连续转发建链超时多少次判定传输层已死。
+  static const int forwardOpenFailThreshold = 2;
+
+  /// 最近有转发流量即视为端到端存活的时间窗（SSE/下载期间不重复探活，
+  /// 避免拥塞导致的单次误判把好好一条隧道拆掉）。
+  static const Duration forwardFreshWindow = Duration(seconds: 10);
+
+  /// 断线期间轮询网络接口变化的周期：用来替代 connectivity_plus（不引新依赖），
+  /// WiFi⇄蜂窝切换、Tailscale 重拨后**秒级感知**并立即重试，而不是干等退避定时器。
+  static const Duration networkPollInterval = Duration(seconds: 15);
+
+  /// 网络接口变化触发"立即重试"的冷却时间。
+  ///
+  /// 接口签名是个很吵的信号：WiFi⇄蜂窝交接、Tailscale tun0 反复出现/消失，都会
+  /// 让它每 15 秒就变一次。没有冷却时，每次变化都等于发起一轮全量 TCP+KEX+认证
+  /// （单次最长 35 秒），等于自己给服务端造认证风暴。
+  static const Duration networkRetryCooldown = Duration(seconds: 12);
+
+  /// 重连退避：**永不放弃**。800ms 起指数增长，60 秒封顶后无限次继续。
+  static const TunnelBackoff _backoff = TunnelBackoff(
+    first: Duration(milliseconds: 800),
+    cap: Duration(seconds: 60),
+  );
+
+  static final math.Random _rng = math.Random();
+
+  final StreamController<TunnelState> _stateController =
+      StreamController<TunnelState>.broadcast();
+
+  TunnelState _state = const TunnelState();
+
+  /// 当前完整状态（界面渲染的唯一依据）。
+  TunnelState get state => _state;
+
+  /// 状态流：每次状态变化广播一次完整快照。
+  Stream<TunnelState> get stateStream => _stateController.stream;
+
+  /// 兼容旧调用点的状态视图（等价于 `state.status`）。
+  TunnelStatus get status => _state.status;
 
   SSHClient? _client;
   ServerSocket? _server;
-  bool _connecting = false;
-
-  /// 主机密钥指纹不匹配标志：连接失败时用于追加明确提示。
-  bool _hostKeyMismatch = false;
 
   /// 当前激活（已连接/正在连接）的实例索引，null 表示无。
   int? _activeProfileIndex;
@@ -79,130 +310,749 @@ class TunnelService {
   SSHConfig? _activeConfig;
 
   /// 已建立的转发连接（本地侧 Socket）。模式切换时必须全部销毁：WebView
-  /// 按 127.0.0.1:<localPort> 复用 HTTP keep-alive 连接，而每条 TCP 连接在
+  /// 按 `127.0.0.1/localPort` 复用 HTTP keep-alive 连接，而每条 TCP 连接在
   /// 建立时已固定转发到"当时"的远端端口——不销毁的话，切换后复用的旧连接
   /// 会把请求送到另一台服务上（DSH⇄Zcode token 互不认，报「token 无效」，
   /// 多切几次连接池里全是错配连接，必现）。
   final Set<Socket> _forwardConns = {};
 
-  TunnelStatus _status = TunnelStatus.idle;
-  TunnelStatus get status => _status;
+  /// 已 accept 但还在等 `forwardLocal` 的本地连接。
+  ///
+  /// 这些 socket 既没进转发、也没人销毁，会在半开场景下无限吊着 WebView 的
+  /// 连接池（旧实现 `_forwardConns.clear()` 只清集合不管它们）。重建时必须
+  /// 一并 destroy，否则重连成功后 WebView 仍可能复用这条僵尸连接。
+  final Set<Socket> _pendingForwards = {};
 
-  Stream<TunnelStatus> get statusStream => _statusController.stream;
+  // ---- 监督器内部状态 ----
+  bool _wantConnected = false;
+  int _connectSeq = 0;
 
-  void _setStatus(TunnelStatus s) {
-    _status = s;
-    // 广播流无监听者时 add 会被安全丢弃，无需 _disposed 守卫。
-    _statusController.add(s);
-    _syncForegroundService(s);
+  /// 最近一次 `connect()` 的序号（见 [_connectSeq] 的用途）。
+  int get connectSeq => _connectSeq;
+
+  SSHConfig? _desiredConfig;
+  int? _desiredProfileIndex;
+
+  /// 进行中的尝试：并发 `connect()` 共享同一次结果（修「早退即成功」）。
+  ///
+  /// 必须连**目标**一起比对（[_inflightKey]）：曾经 `connect(B)` 直接复用了 A 实例
+  /// 的在建尝试并把它当成 B 的成功返回，于是"实例 B 的页面跑在实例 A 的隧道上"。
+  Future<TunnelState>? _inflight;
+  String _inflightKey = '';
+
+  /// 世代号：`disconnect()` / 切换目标 / `dispose()` 时自增，用来作废**在途**的建链
+  /// 与已排定的退避定时器。没有它会出两类鬼故事：
+  ///  · 用户已断开，一条正在 `SSHSocket.connect`（最长 15s）的尝试回来后照样把
+  ///    隧道连回来、绑定本地端口并启动看门狗（没人再会去关它）；
+  ///  · 早先某次失败排下的退避定时器，在十几秒后把刚建好的健康隧道整条拆掉重连。
+  int _generation = 0;
+
+  Timer? _retryTimer;
+  Timer? _watchdogTimer;
+  Timer? _networkTimer;
+  bool _rebuilding = false;
+  int _attempt = 0;
+  int _probeFailures = 0;
+  int _forwardOpenFailures = 0;
+  DateTime? _lastForwardActivity;
+  String? _networkSignature;
+  DateTime? _lastNetworkRetryAt;
+
+  /// 作废一切在途尝试与已排定的重试。
+  ///
+  /// 只改 `_wantConnected` 不够：`_attemptOnce` 里 `await SSHSocket.connect(...)`
+  /// 回来后无人复查，会把已经"断开"的隧道重新连上；同理 `_retryTimer` 也已排好。
+  void _bumpGeneration(String reason) {
+    _generation += 1;
+    _log('supervisor', '作废旧尝试与重试计划（$reason，gen=$_generation）');
   }
 
-  /// 前台服务与隧道状态联动：connected 启动保活服务，其余状态停止。
-  /// 后台/关屏时进程保持运行，SSH 保活持续发送，避免远端空闲断开。
-  void _syncForegroundService(TunnelStatus s) {
-    if (s == TunnelStatus.connected) {
+  static String _targetKey(SSHConfig? c, int? profileIndex) => c == null
+      ? ''
+      : '${profileIndex ?? -1}|${c.host}:${c.sshPort}|${c.username}'
+          '|local=${c.localPort}|auth=${c.authType}';
+
+  void _setState(TunnelState next) {
+    _state = next;
+    // 广播流无监听者时 add 会被安全丢弃，无需 _disposed 守卫。
+    _stateController.add(next);
+    _syncForegroundService(next);
+  }
+
+  /// 前台服务与隧道联动。
+  ///
+  /// 旧实现只在 `connected` 时启动、其余一律 stop，结果**正在后台重连时
+  /// wakelock 被释放**——Doze 下最容易被打断的恰好就是重连过程。改为：
+  /// 只要用户期望保持连接（`_wantConnected`）且不是主动断开，就一直持有。
+  void _syncForegroundService(TunnelState s) {
+    final shouldKeepAlive = _wantConnected && s.status != TunnelStatus.idle;
+    if (shouldKeepAlive) {
       ForegroundTunnelService.instance.start();
     } else {
       ForegroundTunnelService.instance.stop();
     }
   }
 
-  /// 建立隧道。已连接或正在连接时幂等返回，避免重复/并发连接造成死循环。
-  /// [profileIndex] 为当前激活实例索引（用于记录），可空。
-  Future<void> connect(SSHConfig config, {int? profileIndex}) async {
-    // 已在连接中：忽略并发调用
-    if (_connecting) return;
-    // 已连接且配置未变：无需重连
-    if (_status == TunnelStatus.connected) return;
+  // ---------------- 对外连接入口 ----------------
 
-    _connecting = true;
-    // 每次新连接重置主机密钥不匹配标志（仅主连接路径消费该提示）
-    _hostKeyMismatch = false;
+  /// 建立并保持隧道：**幂等、并发安全、不抛异常**。
+  ///
+  /// 与旧实现的三点关键区别：
+  /// - 并发调用共享同一次尝试（旧的 `if (_connecting) return;` 会让第二个调用
+  ///   拿到"成功"，UI 于是点亮假绿灯 —— 这是"绿灯但打不开"的根因）；
+  /// - 失败不抛，而是返回带故障类别的 [TunnelState]，由监督器按 [TunnelBackoff]
+  ///   无限次自动重试（旧实现抛异常 + UI 数 5 次就永久放弃）；
+  /// - 已端到端可用且目标未变才幂等早退，否则一律发起尝试（半开假死也能救回）。
+  Future<TunnelState> connect(SSHConfig config, {int? profileIndex}) async {
+    // 认领序号：页面 dispose 时据此判断隧道是否已被"更新的页面"接管（路由替换时
+    // 旧页的 dispose 晚于新页的 connect，无条件 disconnect 会掐掉新页刚拉起的隧道）。
+    _connectSeq += 1;
+    _wantConnected = true;
+    _desiredConfig = config;
+    _desiredProfileIndex = profileIndex;
+
+    final active = _activeConfig;
+    if (_state.healthy &&
+        _client != null &&
+        _server != null &&
+        active != null &&
+        _isSameTarget(active, config)) {
+      return _state;
+    }
+    // 目标与在途尝试不一致（典型：A 还在认证，用户切到 B）：不能把 A 的结果当
+    // B 的成功返回，先作废 A，再为 B 发起全新尝试。
+    final key = _targetKey(config, profileIndex);
+    if (_inflight != null && _inflightKey != key) {
+      _bumpGeneration('连接目标切换');
+    }
+    return _runAttempt(key);
+  }
+
+  /// 主动断开（切实例 / 退出 / 改配置前）：停止监督器的自动重试。
+  Future<void> disconnect() async {
+    _wantConnected = false;
+    _bumpGeneration('用户主动断开');
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
+    _networkTimer?.cancel();
+    _networkTimer = null;
+    _networkSignature = null;
+    _attempt = 0;
+    _probeFailures = 0;
+    _forwardOpenFailures = 0;
+    await _teardown();
+    // 回到空闲态，但保留「本进程曾经连上过」这一事实：它决定后续失败的升级
+    // 节奏（连上过又断 = 链路抖动；从未连上 = 地址/网络根本不对，更早升级）。
+    _setState(const TunnelState().copyWith(everConnected: _state.everConnected));
+  }
+
+  /// 顶栏「主动刷新」：立刻端到端探活；探不通直接强制重建，探得通也清掉可能
+  /// 悬挂的转发连接，逼 WebView 重新建连。用户永远有一个能按的按钮。
+  Future<bool> forceRefresh() async {
+    _log('ui', '用户主动刷新连接');
+    if (_client != null) {
+      final ok =
+          await _probeEndpoint(reason: 'manual', forceRebuildOnFail: true);
+      if (ok) {
+        _destroyForwardConns(reason: '手动刷新');
+        return true;
+      }
+      return _state.healthy;
+    }
+    _resetAttempt();
+    await _runAttempt();
+    return _state.healthy;
+  }
+
+  /// 外部事件（回前台、用户点横幅"重试"等）：立刻重试/探活，不等退避定时器。
+  ///
+  /// [reason] 进诊断日志，便于事后区分是谁触发的连接风暴。
+  void notifyShouldReconnectNow(String reason) {
+    if (!_wantConnected) return;
+    _log('supervisor', '外部事件 → 立即处理（$reason）');
+    if (_client != null) {
+      // 自称连着：先探一次，探不通当场重建（回前台时不等 3 次阈值）。
+      unawaited(_probeEndpoint(reason: reason, forceRebuildOnFail: true));
+      return;
+    }
+    _resetAttempt();
+    unawaited(_runAttempt());
+  }
+
+  /// 页面加载失败/超时：请监督器核实链路真伪。
+  ///
+  /// WebView 报"加载失败"而隧道自称 connected 时，多半是半开假死而不是页面问题；
+  /// 交给探活判定，比在 UI 里"再试三次然后弹红字"更接近真相。
+  void reportPageFailureAndAsk(String reason) {
+    if (_client == null) return; // 本来就没连上，监督器自有安排
+    unawaited(_probeEndpoint(reason: 'page:$reason', forceRebuildOnFail: false));
+  }
+
+  // ---------------- 监督器内核 ----------------
+
+  Future<TunnelState> _runAttempt([String? key]) async {
+    if (!_wantConnected) return _state;
+    final wantKey = key ?? _targetKey(_desiredConfig, _desiredProfileIndex);
+    final inflight = _inflight;
+    // 并发去重：共享同一次尝试。**只有目标相同才算同一次**——否则切实例时会把
+    // 上一个实例的建链结果当成本次的成功返回（跨实例串档）。
+    if (inflight != null && _inflightKey == wantKey) return inflight;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    final fut = _attemptOnce(wantKey);
+    _inflight = fut;
+    _inflightKey = wantKey;
     try {
-      await _disconnectInternal();
+      return await fut;
+    } finally {
+      if (identical(_inflight, fut)) {
+        _inflight = null;
+        _inflightKey = '';
+      }
+    }
+  }
 
-      _activeProfileIndex = profileIndex;
-      _setStatus(TunnelStatus.connecting);
-      debugPrint('[DSH] connecting to ${config.host}:${config.sshPort} '
-          '(auth=${config.authType}) ...');
+  Future<TunnelState> _attemptOnce(String key) async {
+    final config = _desiredConfig;
+    if (config == null) return _state;
+    final gen = _generation;
+    bool aborted() => !_wantConnected || gen != _generation;
 
-      // 1) 建立底层 TCP 到 SSH 服务器
-      final socket = await SSHSocket.connect(config.host, config.sshPort,
-          timeout: const Duration(seconds: 15));
+    await _teardown();
+    // teardown 会让出事件循环：期间用户可能已断开 / 目标已切换。
+    if (aborted()) {
+      _log('connect', '尝试在排队阶段已被取消，不再建链');
+      return _state;
+    }
+    _setState(_state.copyWith(
+      status: TunnelStatus.connecting,
+      probeOk: false,
+      clearNextRetry: true,
+      clearConnectedSince: true,
+      profileIndex: _desiredProfileIndex,
+    ));
 
-      // 2) 认证：密钥优先，密码兜底
-      final List<SSHKeyPair>? identities = config.useKey
-          ? SSHKeyPair.fromPem(config.privateKeyPem,
-              config.keyPassphrase.isEmpty ? null : config.keyPassphrase)
-          : null;
+    final started = DateTime.now();
+    _log('connect',
+        '第 ${_attempt + 1} 次尝试 ssh://${config.username}@${config.host}:${config.sshPort}'
+        ' → 本地 :${config.localPort} → 远端 :${config.activeRemotePort}'
+        '（目标 $key）');
+    try {
+      await _openTunnel(config, aborted: aborted);
+      // 建链期间被断开/换了目标：这条会话已经没人要了，当场收掉，绝不点亮
+      // connected、绝不启动看门狗（旧实现在这里留下一条没人管的活隧道）。
+      if (aborted()) {
+        _log('connect', '建链完成时已被取消，立即回收会话');
+        await _teardown();
+        return _state;
+      }
+      final at = DateTime.now();
+      _probeFailures = 0;
+      _forwardOpenFailures = 0;
+      _attempt = 0;
+      // 成功即撤销**一切**遗留的退避定时器：`clearNextRetry` 只清界面字段，
+      // 定时器若还在，十几秒后会回调 `_runAttempt` → 无条件 `_teardown` → 把刚
+      // 建好的健康隧道整条拆掉重来（表现：连上十几秒莫名重载一次）。
+      _retryTimer?.cancel();
+      _retryTimer = null;
+      _setState(_state.copyWith(
+        status: TunnelStatus.connected,
+        kind: TunnelFailureKind.none,
+        attempt: 0,
+        probeOk: true,
+        lastProbeAt: at,
+        connectedSince: at,
+        clearLastError: true,
+        clearNextRetry: true,
+        everConnected: true,
+      ));
+      _startWatchdog();
+      _stopNetworkWatcher();
+      _log('connect',
+          '隧道就绪（${at.difference(started).inMilliseconds}ms），看门狗已启动（每 ${probeInterval.inSeconds}s 探活）');
+      return _state;
+    } on TunnelAbortedException {
+      _log('connect', '本次尝试已取消（断开/切换目标），不落状态、不排重试');
+      return _state;
+    } catch (e) {
+      // 用户主动断开/切换目标之后不再落"失败"状态、也不再排重试：否则界面会
+      // 在用户按下断开之后显示"隧道已断开·正在自动重试（第 1 次）"这种鬼话。
+      if (aborted()) {
+        _log('connect', '失败发生在取消之后，忽略（$e）');
+        return _state;
+      }
+      final kind =
+          e is TunnelHostKeyMismatchException
+              ? TunnelFailureKind.hostKey
+              : classifyTunnelFailure(e);
+      _attempt += 1;
+      final delay = _backoff.delayFor(_attempt, random: _rng.nextDouble);
+      final next = DateTime.now().add(delay);
+      final hard = isConfigurationFailure(kind);
+      _setState(_state.copyWith(
+        status: hard ? TunnelStatus.failed : TunnelStatus.disconnected,
+        kind: kind,
+        attempt: _attempt,
+        lastError: '$e',
+        nextRetryAt: next,
+        probeOk: false,
+        clearConnectedSince: true,
+      ));
+      _log('connect',
+          '第 $_attempt 次尝试失败（$kind）：$e',
+          level: hard ? TunnelEventLevel.error : TunnelEventLevel.warn);
+      _log('connect',
+          hard
+              ? '配置类故障：暂停快速重试，每 ${delay.inSeconds}s 兜底再试一次'
+              : '${delay.inSeconds}s 后自动重试（永不放弃）');
+      _scheduleRetry(delay);
+      _startNetworkWatcher();
+      return _state;
+    }
+  }
 
-      final client = SSHClient(
-        socket,
-        username: config.username,
-        identities: identities,
-        onPasswordRequest:
-            config.useKey ? null : () async => config.password,
-        // SSH 保活：每 10s 发一次 keep-alive，降低移动网络空闲断连概率
-        keepAliveInterval: const Duration(seconds: 10),
-        // 主机密钥 TOFU：首次记录指纹，后续比对（见 _verifyHostKey）
-        onVerifyHostKey: (hostkeyType, fingerprint) =>
-            _verifyHostKey(config, hostkeyType, fingerprint),
-      );
+  /// 真正的建链过程：TCP → KEX → 认证 → 本地监听。抛出的异常交给 [TunnelBackoff] 重试。
+  ///
+  /// 失败时**立即关掉已建立的会话**：dartssh2 的 `SSHSocket.connect(timeout:)`
+  /// 只覆盖 TCP 三次握手，KEX/认证阶段对端沉默不会自己报错（库内全程没有
+  /// timer），我们外层的 20s 超时是唯一护网——若不在此处补 `close()`，这条
+  /// 半死的 socket 会一直挂到下一次重试才被发现和回收。
+  Future<void> _openTunnel(SSHConfig config,
+      {bool Function() aborted = _neverAborted}) async {
+    // 1) 建立底层 TCP 到 SSH 服务器
+    final socket = await SSHSocket.connect(config.host, config.sshPort,
+        timeout: const Duration(seconds: 15));
 
-      _client = client;
-      _activeConfig = config;
+    // 2) 认证：密钥优先，密码兜底
+    final List<SSHKeyPair>? identities = config.useKey
+        ? SSHKeyPair.fromPem(config.privateKeyPem,
+            config.keyPassphrase.isEmpty ? null : config.keyPassphrase)
+        : null;
 
-      // 传输异常/断开时通知，并清理资源
-      client.done.then(
-        (_) => _onTransportClosed(client),
-        onError: (Object e) {
-          debugPrint('[DSH] transport error: $e');
-          _onTransportClosed(client, failed: true);
-        },
-      );
+    // 主机密钥不匹配是**本次连接**的属性，用局部变量承接（见
+    // [TunnelHostKeyMismatchException] 的说明：全局标志会被并发连接串档）。
+    var hostKeyMismatch = false;
+    final client = SSHClient(
+      socket,
+      username: config.username,
+      identities: identities,
+      onPasswordRequest: config.useKey ? null : () async => config.password,
+      // SSH 保活：每 10s 发一次 keepalive，降低移动网络/Tailscale 空闲断连概率。
+      // 注意：库内 `ping()` 发 `keepalive@openssh.com` 后 **await 一个没有超时的
+      // reply queue**（ssh_client.dart `_globalRequestReplyQueue.next`），半开链路
+      // 上永久挂起，因此它**不能**直接用来判定断开——所有 ping 调用都必须由调用方
+      // 包 `.timeout(...)`（见 [_pingTransport]），链路是否真活着以端到端探活为准。
+      keepAliveInterval: const Duration(seconds: 10),
+      // 主机密钥 TOFU：首次记录指纹，后续比对（见 _verifyHostKey）
+      onVerifyHostKey: (hostkeyType, fingerprint) => _verifyHostKey(
+            config,
+            hostkeyType,
+            fingerprint,
+            onMismatch: () => hostKeyMismatch = true,
+          ),
+    );
 
-      // 3) 等待认证完成
+    // 建链过程中用户可能已经断开（`SSHSocket.connect` + KEX 最长十几秒）。
+    // 在登记为"当前会话"**之前**收口：否则会出现"用户已断开、这里却把会话
+    // 连回来并启动看门狗"的孤儿隧道。
+    if (aborted()) {
+      try {
+        client.close();
+      } catch (_) {}
+      throw const TunnelAbortedException();
+    }
+
+    _client = client;
+    _activeConfig = config;
+
+    // 传输异常/断开时通知监督器，并清理资源
+    client.done.then(
+      (_) => _onTransportClosed(client),
+      onError: (Object e) => _onTransportClosed(client, failed: true, error: e),
+    );
+
+    try {
+      // 3) 等待认证完成（库内此阶段无任何超时，20s 是唯一护网）
       await client.authenticated
           .timeout(const Duration(seconds: 20), onTimeout: () {
-        debugPrint('[DSH] SSH authentication timed out');
+        _log('connect', 'SSH 认证超时', level: TunnelEventLevel.warn);
         throw const SocketException('SSH 认证超时');
       });
       // 3.5) 认证完成后确认未被并发断开/替换（竞态守卫）：
       // 若期间 disconnect() 已执行（_client 被置空/替换），放弃本次连接，
       // 避免绑定一个已失效 client 的"假隧道"并误报 connected。
-      if (_client != client) {
-        client.close();
-        throw const SocketException('隧道已断开，放弃连接');
+      if (_client != client || aborted()) {
+        throw const TunnelAbortedException();
       }
-      debugPrint('[DSH] authenticated, opening local tunnel on '
-          '127.0.0.1:${config.localPort}');
 
       // 4) 本地监听端口
       final server = await ServerSocket.bind(
           InternetAddress.loopbackIPv4, config.localPort);
-      // 绑定后再确认一次：期间被断开则释放端口，防止残留占用
-      if (_client != client) {
+      // 绑定后再确认一次：期间被断开则释放端口，防止端口被本类残留占住，
+      // 也避免给一条没人要的会话挂上监听。
+      if (_client != client || aborted()) {
         await server.close();
-        client.close();
-        throw const SocketException('隧道已断开，放弃连接');
+        throw const TunnelAbortedException();
       }
       _server = server;
       server.listen(_handleLocalConnection);
-
-      debugPrint('[DSH] tunnel up: 127.0.0.1:${config.localPort} -> '
-          '127.0.0.1:${config.activeRemotePort}');
-      _setStatus(TunnelStatus.connected);
     } catch (e) {
-      debugPrint('[DSH] connect failed: $e');
-      if (_hostKeyMismatch) {
-        _hostKeyMismatch = false;
-        throw SocketException('主机密钥指纹与上次不一致，已拒绝连接。'
-            '若为服务器重装/更换密钥，请确认后清除保存的指纹再试。');
+      // 立即回收半途而废的会话：否则这条 socket 会挂到下一次重试才被 close，
+      // 期间既占着远端 sshd 的连接配额，也可能继续往已死的 TCP 里塞保活包。
+      if (_client == client) {
+        _client = null;
+        _activeConfig = null;
+        _activeProfileIndex = null;
+        try {
+          client.close();
+        } catch (_) {}
       }
+      // TOFU 拒绝要带类型上抛，供上层判成"配置类"而不是泛泛的链路故障。
+      if (hostKeyMismatch) throw const TunnelHostKeyMismatchException();
       rethrow;
-    } finally {
-      _connecting = false;
     }
+  }
+
+  static bool _neverAborted() => false;
+
+  void _scheduleRetry(Duration delay) {
+    // 定时器也要绑世代：`_wantConnected` 可能被下一轮 `connect()` 又置回 true，
+    // 于是上一段故障排下的旧票会在不该重试的时刻触发重试（最坏情况：把刚建好的
+    // 健康隧道拆掉重来）。世代不符即视为作废。
+    final gen = _generation;
+    _retryTimer?.cancel();
+    _retryTimer = Timer(delay, () {
+      _retryTimer = null;
+      if (!_wantConnected || gen != _generation) return;
+      unawaited(_runAttempt());
+    });
+  }
+
+  void _resetAttempt() {
+    _attempt = 0;
+    _probeFailures = 0;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _setState(_state.copyWith(clearNextRetry: true, attempt: 0));
+  }
+
+  /// 探活判定为死 → 当场重建（不等用户、也不等下一次退避）。
+  Future<void> _forceRebuild(String reason) async {
+    if (!_wantConnected) return;
+    // 并发探活（看门狗 / 回前台 / 转发超时）可能同时判定已死：只允许一个重建在跑。
+    if (_rebuilding) {
+      _log('supervisor', '重建已在进行中，忽略重复请求（$reason）');
+      return;
+    }
+    _rebuilding = true;
+    try {
+      await _forceRebuildInner(reason);
+    } finally {
+      _rebuilding = false;
+    }
+  }
+
+  Future<void> _forceRebuildInner(String reason) async {
+    _log('supervisor', '判定链路已死 → 强制重建（$reason）',
+        level: TunnelEventLevel.warn);
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
+    await _teardown();
+    // kind 留给接下来的尝试去判定：这里写死 remoteDown 会让"转发建链超时"这类
+    // 明明是该重建的场景，闪现一句"云端服务没有应答"的误导性文案。
+    _attempt = 0; // 新的一段故障：从快退避重新开始，让用户尽快看到恢复
+    _setState(_state.copyWith(
+      status: TunnelStatus.disconnected,
+      kind: TunnelFailureKind.none,
+      probeOk: false,
+      // 界面计数必须跟着内部计数一起归零，否则横幅会显示"第 5 次尝试"而内部
+      // 其实已经开始第 1 次快退避（纯展示不一致，但正是这种不一致最伤信任）。
+      attempt: 0,
+      clearConnectedSince: true,
+      clearNextRetry: true,
+    ));
+    await _runAttempt();
+  }
+
+  /// 传输层关闭的统一处理：清理 + 交给监督器按退避重连。
+  void _onTransportClosed(SSHClient client,
+      {bool failed = false, Object? error}) {
+    if (_client != client) return; // 旧连接的迟到回调，忽略
+    _log('transport',
+        failed ? 'SSH 传输层异常关闭：$error' : 'SSH 传输层已关闭',
+        level: failed ? TunnelEventLevel.warn : TunnelEventLevel.info);
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
+    _destroyForwardConns(reason: '传输层关闭');
+
+    final server = _server;
+    _server = null;
+    server?.close();
+    _client = null;
+    _activeProfileIndex = null;
+    _activeConfig = null;
+
+    if (!_wantConnected) {
+      _setState(
+          const TunnelState().copyWith(everConnected: _state.everConnected));
+      return;
+    }
+    // 对端干净地关掉了会话（sshd 重启、服务端 idle 超时）没有异常对象：这是
+    // "断开"而不是"故障"，文案该是"隧道已断开"，不该出现"连接异常"。
+    final kind =
+        error == null ? TunnelFailureKind.none : classifyTunnelFailure(error);
+    _attempt += 1;
+    final delay = _backoff.delayFor(_attempt, random: _rng.nextDouble);
+    final hard = isConfigurationFailure(kind);
+    _setState(_state.copyWith(
+      status: hard ? TunnelStatus.failed : TunnelStatus.disconnected,
+      kind: kind,
+      attempt: _attempt,
+      lastError: error?.toString(),
+      nextRetryAt: DateTime.now().add(delay),
+      probeOk: false,
+      clearConnectedSince: true,
+    ));
+    _scheduleRetry(delay);
+    _startNetworkWatcher();
+  }
+
+  // ---------------- 周期探活（治"假死"）----------------
+
+  void _startWatchdog() {
+    _watchdogTimer?.cancel();
+    _watchdogTimer = Timer.periodic(
+      probeInterval,
+      (_) => unawaited(_probeEndpoint(reason: 'periodic')),
+    );
+  }
+
+  /// 端到端探活。返回 true 表示链路确实可用。
+  ///
+  /// **为什么不能只做 TCP connect**：本地 `ServerSocket` 是我们自己 accept 的，
+  /// 即使 SSH 传输层已经半死，TCP 连接照样立刻成功——它证明不了任何东西。只有
+  /// 走到"发出请求并收到响应"才真正跑完 `forwardLocal`（SSH 通道打开的往返）
+  /// 与远端服务应答，这才是可用的证据。
+  ///
+  /// 任何 HTTP 响应（含 303/401 鉴权跳转）都算活着：目的是证明往返，不是鉴权。
+  /// 故用**不带 token** 的裸地址，既省一次鉴权链，也不会反复消耗 token 会话。
+  Future<bool> _probeEndpoint({
+    required String reason,
+    bool forceRebuildOnFail = false,
+  }) async {
+    if (_client == null) return false;
+    // 已有建链在途：那条路自己会给出结论，此时探测必然不准，直接跳过。
+    if (_inflight != null || _rebuilding) return false;
+    final port = _activeConfig?.localPort ?? _desiredConfig?.localPort;
+    if (port == null) return false;
+
+    final last = _lastForwardActivity;
+    if (reason == 'periodic' &&
+        _state.probeOk &&
+        last != null &&
+        DateTime.now().difference(last) < forwardFreshWindow) {
+      // 最近 10 秒有**来自远端**的真实数据 = 端到端可用，SSE / 大文件传输期间
+      // 不做多余探测（拥塞造成的单次探测失败不该把好好一条隧道拆掉）。
+      //
+      // 两条硬约束（都是真出过事的）：
+      //  · 只有**下行**数据算数（见 `_pipe`）：上行 `forward.sink.add` 只是入队，
+      //    半开链路上本地也能"一直在发"，把它当存活证据等于让假死永不可发现；
+      //  · 捷径只能**维持**已确认的健康，不能翻案：`probeOk` 为 false 时必须真
+      //    做一次探活才能回到 true，不能被陈旧流量单方面点亮（曾经就是这里无条件
+      //    写 probeOk=true，把该弹的横幅也一起藏了）。
+      _setState(_state.copyWith(lastProbeAt: DateTime.now()));
+      return true;
+    }
+
+    final ok = await _probeLocalPort(port);
+    final at = DateTime.now();
+    if (ok) {
+      if (_probeFailures > 0) _log('probe', '探活恢复（$reason）');
+      _probeFailures = 0;
+      _forwardOpenFailures = 0;
+      _setState(_state.copyWith(probeOk: true, lastProbeAt: at));
+      return true;
+    }
+    _probeFailures += 1;
+    // 区分两种"探活失败"，处置方式完全不同：
+    //   · SSH 传输层还活着 → 是**云端服务**没应答。重建 SSH 会话毫无意义（还会
+    //     白白重载 WebView、把好端端的隧道拆掉），只标记 remoteDown 并让看门狗
+    //     继续探；服务一起来立刻自动恢复。
+    //   · SSH 也不回包 → 半开假死，当场强制重建。
+    final transportAlive = await _pingTransport();
+    if (transportAlive) {
+      _setState(_state.copyWith(
+        probeOk: false,
+        lastProbeAt: at,
+        kind: TunnelFailureKind.remoteDown,
+      ));
+      _log('probe',
+          'SSH 传输层正常但远端服务无应答（$reason）：判定云端服务未就绪，'
+          '不重建隧道，继续周期探活',
+          level: TunnelEventLevel.warn);
+      return false;
+    }
+    _setState(_state.copyWith(probeOk: false, lastProbeAt: at));
+    _log('probe',
+        '探活失败 第 $_probeFailures/$probeFailThreshold 次（$reason）：'
+        '127.0.0.1:$port ${probeTimeout.inSeconds}s 内无应答，且 SSH 传输层无回包',
+        level: TunnelEventLevel.warn);
+    if (_probeFailures >= probeFailThreshold || forceRebuildOnFail) {
+      await _forceRebuild('探活失败（$reason，连续 $_probeFailures 次）');
+      return false;
+    }
+    return false;
+  }
+
+  /// 传输层级探活：复用 dartssh2 公开的 `ping()`（全局请求 keepalive@openssh.com）。
+  ///
+  /// 库内 `ping()` 是 `await _globalRequestReplyQueue.next`——**没有超时**，半开
+  /// 连接下会永久挂起，所以超时必须由调用方给。它比 HTTP 探活更轻，用来回答
+  /// "是 SSH 死了还是云端服务没起"这一个问题。
+  Future<bool> _pingTransport() async {
+    final c = _client;
+    if (c == null) return false;
+    try {
+      await c.ping().timeout(const Duration(seconds: 4));
+      return true;
+    } catch (e) {
+      debugPrint('[DSH] transport ping failed: $e');
+      return false;
+    }
+  }
+
+  Future<bool> _probeLocalPort(int port) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 3);
+    try {
+      final req = await client.getUrl(Uri.parse('http://127.0.0.1:$port/'));
+      req.headers.set('Cache-Control', 'no-cache');
+      // 只证明往返，不跟跳转：303/401 同样算"链路活着"，跟随后会多打一次请求。
+      req.followRedirects = false;
+      final res = await req.close().timeout(probeTimeout);
+      await res.drain<void>();
+      return true;
+    } catch (e) {
+      debugPrint('[DSH] probe failed: $e');
+      return false;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  // ---------------- 网络恢复感知（不引 connectivity_plus）----------------
+
+  /// 断线期间才轮询网络接口；连上即停，避免常态开销。
+  void _startNetworkWatcher() {
+    if (!_wantConnected) return;
+    _networkTimer ??=
+        Timer.periodic(networkPollInterval, (_) => _checkNetworkChange());
+  }
+
+  void _stopNetworkWatcher() {
+    _networkTimer?.cancel();
+    _networkTimer = null;
+    _networkSignature = null;
+  }
+
+  Future<void> _checkNetworkChange() async {
+    try {
+      final ifaces = await NetworkInterface.list(type: InternetAddressType.IPv4);
+      final sig = (ifaces
+          .expand((i) => i.addresses.map((a) => '${i.name}/${a.address}'))
+          .toList()
+        ..sort())
+          .join(',');
+      final prev = _networkSignature;
+      _networkSignature = sig;
+      if (prev != null && prev != sig && !_state.healthy) {
+        // 冷却：接口抖一下不等于"网络恢复了"。旧实现在这里 `_resetAttempt()`
+        // （`_attempt = 0` + 取消定时器），于是每次签名变化都把指数退避清零，
+        // 每 15 秒一轮完整握手，60 秒封顶永远不生效。
+        final now = DateTime.now();
+        final since = _lastNetworkRetryAt;
+        if (since != null && now.difference(since) < networkRetryCooldown) {
+          _log('network', '接口再次变化，冷却中忽略（${now.difference(since).inSeconds}s）');
+          return;
+        }
+        _lastNetworkRetryAt = now;
+        _log('network', '检测到网络接口变化 → 提前重试一次（保留退避计数）');
+        // 降级而非归零：真恢复了可以马上再试，仍然失败则继续按原节奏变慢。
+        _attempt = _attempt > 2 ? _attempt - 2 : 0;
+        _retryTimer?.cancel();
+        _retryTimer = null;
+        await _runAttempt();
+      }
+    } catch (e) {
+      debugPrint('[DSH] network watcher failed: $e');
+    }
+  }
+
+  // ---------------- 资源清理 ----------------
+
+  /// 释放隧道相关的全部本地资源（不含 SSH 会话本身的关闭策略）。
+  Future<void> _teardown() async {
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
+    // **同步**把所有权摘走，再做任何 await。顺序很关键：`await server.close()`
+    // 会让出事件循环，若此时旧 client 报错，`_onTransportClosed(oldClient)` 的
+    // `if (_client != client) return` 守卫因为 `_client` 还没置空而**通过**，
+    // 于是给一条即将成功的新隧道排了个退避定时器 → 十几秒后新隧道被自己拆掉。
+    final server = _server;
+    final client = _client;
+    _server = null;
+    _client = null;
+    _activeProfileIndex = null;
+    _activeConfig = null;
+    // 上一会话的流量时间不能带进新会话：否则新隧道的第一次周期探活会吃到旧的
+    // "10 秒内有流量"窗口而跳过探测。
+    _lastForwardActivity = null;
+    _destroyForwardConns();
+    if (server != null) {
+      try {
+        await server.close();
+      } catch (_) {}
+    }
+    if (client != null) {
+      try {
+        client.close();
+      } catch (_) {}
+    }
+  }
+
+  void _destroyForwardConns({String? reason}) {
+    final all = <Socket>{..._forwardConns, ..._pendingForwards};
+    _forwardConns.clear();
+    _pendingForwards.clear();
+    if (all.isEmpty) return;
+    var n = 0;
+    for (final s in all) {
+      try {
+        s.destroy();
+        n++;
+      } catch (_) {}
+    }
+    _log('forward', '销毁 $n 条遗留转发连接${reason == null ? '' : '（$reason）'}');
+  }
+
+  /// 目标主机/凭据是否等价：决定能否复用当前会话（模式与远端端口变化不影响，
+  /// 那类切换走 [updateActiveConfig] 就地改转发目标）。
+  static bool _isSameTarget(SSHConfig a, SSHConfig b) =>
+      a.host == b.host &&
+      a.sshPort == b.sshPort &&
+      a.username == b.username &&
+      a.authType == b.authType &&
+      a.password == b.password &&
+      a.privateKeyPem == b.privateKeyPem &&
+      a.keyPassphrase == b.keyPassphrase &&
+      a.localPort == b.localPort;
+
+  void _log(String tag, String message,
+      {TunnelEventLevel level = TunnelEventLevel.info}) {
+    TunnelDiagnostics.instance.record(level, tag, message);
+    debugPrint('[DSH][${level.name}] $tag: $message');
   }
 
   /// 仅验证 SSH 认证是否成功（设置页"测试连接"专用）。
@@ -247,25 +1097,6 @@ class TunnelService {
     }
   }
 
-  /// 传输关闭时的统一清理：仅当仍是当前 client 才处理，避免旧连接误改状态。
-  void _onTransportClosed(SSHClient client, {bool failed = false}) {
-    if (_client != client) return;
-    debugPrint('[DSH] transport closed'
-        '${failed ? ' (with error)' : ''} '
-        '(activeProfile=$_activeProfileIndex)');
-    _client = null;
-    _activeProfileIndex = null;
-    _activeConfig = null;
-
-    final server = _server;
-    _server = null;
-    server?.close();
-    // 已建立的转发连接随 SSH channel 关闭自然结束，集合显式清空防残留
-    _forwardConns.clear();
-
-    _setStatus(failed ? TunnelStatus.failed : TunnelStatus.disconnected);
-  }
-
   /// 处理一条本地 TCP 连接：打开远程直连隧道并双向透传。
   void _handleLocalConnection(Socket localSocket) {
     _handleForward(localSocket);
@@ -279,18 +1110,32 @@ class TunnelService {
   /// 端口重建连接，否则复用的 keep-alive 连接会把请求送到旧服务上。
   /// 仅当 [profileIndex] 与当前激活实例一致时生效，防止迟到的旧实例调用串线。
   void updateActiveConfig(SSHConfig config, {int? profileIndex}) {
-    if (profileIndex != null && profileIndex != _activeProfileIndex) return;
+    if (profileIndex != null &&
+        _activeProfileIndex != null &&
+        profileIndex != _activeProfileIndex) {
+      return; // 不是当前实例的更新：忽略
+    }
+    final previous = _activeConfig;
+    final sameSshTarget = previous != null && _isSameTarget(previous, config);
     _activeConfig = config;
+    // 关键：监督器重试读的是 `_desiredConfig`。以前这里只改 `_activeConfig`，
+    // 于是"断开期间在设置页改了地址/端口/模式"→ 退避到点仍按**旧**目标重连，
+    // 用户观感就是"改了设置也没用，还是连不上"。
+    if (_desiredConfig == null ||
+        profileIndex == null ||
+        profileIndex == _desiredProfileIndex) {
+      _desiredConfig = config;
+      if (profileIndex != null) _desiredProfileIndex = profileIndex;
+    }
     if (_client == null) return;
-    var killed = 0;
-    for (final s in Set<Socket>.of(_forwardConns)) {
-      s.destroy();
-      killed++;
+    if (!sameSshTarget) {
+      // 换的是 SSH 目标本身（地址/端口/用户名/凭据/本地端口）：整条会话都得重建。
+      unawaited(_forceRebuild('配置变更'));
+      return;
     }
-    _forwardConns.clear();
-    if (killed > 0) {
-      debugPrint('[DSH] mode switch: destroyed $killed stale forward conn(s)');
-    }
+    // 只是转发目标端口变了（DSH↔Zcode↔WorkBuddy）：会话保留，通道重建。
+    // 含"还在等 forwardLocal"的连接：它们同样会在建好后固定拨向旧端口。
+    _destroyForwardConns(reason: '模式切换');
   }
 
   Future<void> _handleForward(Socket local) async {
@@ -303,14 +1148,66 @@ class TunnelService {
     unawaited(local.done
         .whenComplete(() => _forwardConns.remove(local))
         .catchError((Object _) => _forwardConns.remove(local)));
+    // 关键修复：dartssh2 的 `forwardLocal()` 等的是一个**没有超时**的 completer
+    // （ssh_client.dart `_waitChannelOpenReply`），传输层半开时既不返回也不报错。
+    // 旧实现直接 await 它 → 本地 socket 既不 pipe 也不 destroy → WebView 这条连接
+    // 永久吊住（用户观感：隧道"已连接"，页面一直转圈，最后报加载失败）。
+    _pendingForwards.add(local);
+    SSHForwardChannel? forward;
+    // 远端服务监听 127.0.0.1:<activeRemotePort>（DSH Web UI=3080 / zcode-phone-server=8787 / WorkBuddy=8790）
+    //
+    // 必须**自己持有源 Future**：`Future.timeout` 不会取消被等待的 future，超时
+    // 之后服务端若晚一拍回 OPEN_CONFIRM，dartssh2 仍会把这条 channel 登记进
+    // `SSHClient._channels` 并在远端建立一条到 127.0.0.1:3080 的连接（见
+    // ssh_client.dart `_acceptChannel`）。旧实现只 destroy 了本地 socket → 每次
+    // 超时永久泄漏一条 SSH channel + 一条远端 TCP（抖动一晚上就能把 sshd 的
+    // channel 配额吃光，且 channel id 也不归还）。
+    final openFuture = client
+        .forwardLocal('127.0.0.1', _activeConfig?.activeRemotePort ?? 3080);
     try {
-      // 远端服务监听 127.0.0.1:<activeRemotePort>（DSH Web UI=3080 / zcode-phone-server=8787 / WorkBuddy=8790）
-      final forward = await client
-          .forwardLocal('127.0.0.1', _activeConfig?.activeRemotePort ?? 3080);
-      _pipe(local, forward);
-    } catch (_) {
+      forward = await openFuture.timeout(forwardOpenTimeout);
+    } on TimeoutException {
+      _pendingForwards.remove(local);
       local.destroy();
+      unawaited(openFuture.then<void>((channel) {
+        _log('forward', '回收超时后迟到的转发通道', level: TunnelEventLevel.warn);
+        try {
+          channel.destroy();
+        } catch (_) {}
+      }, onError: (Object _) {}));
+      _forwardOpenFailures += 1;
+      _log('forward',
+          'forwardLocal 超时（第 $_forwardOpenFailures/$forwardOpenFailThreshold 次，'
+          '${forwardOpenTimeout.inSeconds}s）：传输层可能已半开',
+          level: TunnelEventLevel.warn);
+      if (_forwardOpenFailures >= forwardOpenFailThreshold) {
+        await _forceRebuild('连续 $_forwardOpenFailures 次转发建链超时');
+      }
+      return;
+    } catch (e) {
+      _pendingForwards.remove(local);
+      local.destroy();
+      // 迟到成功的兜底：若源 future 稍后才完成，同样要把它销毁，不能留给会话。
+      unawaited(openFuture.then<void>((channel) {
+        try {
+          channel.destroy();
+        } catch (_) {}
+      }, onError: (Object _) {}));
+      debugPrint('[DSH] forwardLocal failed: $e');
+      return;
     }
+    _pendingForwards.remove(local);
+    // 建链期间隧道可能已被监督器重建/切换：这条 channel 属于旧会话，直接丢弃，
+    // 否则会把请求转发到一个已死的 SSH 会话上。
+    if (!identical(_client, client)) {
+      try {
+        forward.destroy();
+      } catch (_) {}
+      local.destroy();
+      return;
+    }
+    _forwardOpenFailures = 0;
+    _pipe(local, forward);
   }
 
   /// 双向透传（不自我节流）。
@@ -324,9 +1221,16 @@ class TunnelService {
   /// - 下载方向（远端→本地）由 loopback Socket 自然缓冲，WebView 持续读取即自动排空；
   /// - 上传方向（本地→远端）请求体通常很小；
   /// - 真正的吞吐上限来自 SSH 通道窗口与 dartssh2 的解密速率，不应由应用层节流。
+  ///
+  /// 顺带把每条有数据进出的时间记进 [_lastForwardActivity]：看门狗据此判断
+  /// "最近有真实流量 = 端到端活着"，SSE / 大文件传输期间不再做多余探测，
+  /// 也避免因一次拥塞误判把好好的隧道拆掉重建。
   void _pipe(Socket local, SSHForwardChannel forward) {
     final localSub = local.listen(
       (data) {
+        // 故意**不**在这里记"转发活跃"：`forward.sink.add` 只是把数据塞进
+        // dartssh2 的发送队列，传输层半开时它既不报错也不真的出去。用它当端到端
+        // 存活的证据，会让假死永远探测不到（见 `_probeEndpoint` 的新鲜窗捷径）。
         try {
           forward.sink.add(data);
         } catch (_) {
@@ -340,6 +1244,7 @@ class TunnelService {
 
     final forwardSub = forward.stream.listen(
       (data) {
+        _noteForwardActivity();
         try {
           local.add(data);
         } catch (_) {
@@ -360,6 +1265,15 @@ class TunnelService {
       forwardSub.cancel().catchError((_) {});
       forward.destroy();
     });
+  }
+
+  /// 记录转发流量活跃时刻（1 秒节流，避免每个包都取时钟）。
+  void _noteForwardActivity() {
+    final now = DateTime.now();
+    final last = _lastForwardActivity;
+    if (last == null || now.difference(last) > const Duration(seconds: 1)) {
+      _lastForwardActivity = now;
+    }
   }
 
   /// 通过现有 SSH 会话读取云端主机上的文件内容（用于成果查看）。
@@ -642,8 +1556,16 @@ class TunnelService {
   /// 指纹按 `host:port + 算法类型` 分别持久化，互不干扰。
   ///
   /// 返回 true 表示信任（首次连接时同时完成记录）；false 表示拒绝。
+  /// TOFU 校验：首次记录指纹、后续比对。
+  ///
+  /// [onMismatch] 只在**本次连接**的上下文里回传"指纹不匹配"，让调用方抛出带类型
+  /// 的 [TunnelHostKeyMismatchException]；不设全局标志（并发连接会互相串档）。
   Future<bool> _verifyHostKey(
-      SSHConfig config, String hostkeyType, Uint8List fingerprint) async {
+    SSHConfig config,
+    String hostkeyType,
+    Uint8List fingerprint, {
+    void Function()? onMismatch,
+  }) async {
     final key = 'ssh_hostkey_${config.host}_${config.sshPort}_$hostkeyType';
     final hex =
         fingerprint.map((b) => b.toRadixString(16).padLeft(2, '0')).join(':');
@@ -663,7 +1585,7 @@ class TunnelService {
       // 指纹变化：拒绝连接并提示（可能是中间人，也可能是服务器重装）
       debugPrint('[DSH] host key MISMATCH for $key: '
           'saved=$saved current=$hex');
-      _hostKeyMismatch = true;
+      onMismatch?.call();
       return false;
     } catch (e) {
       // 存储异常时退回"信任"以保持可用性，但记录日志便于排查
@@ -706,8 +1628,17 @@ class TunnelService {
 
   // ================= 主机监控：远程命令采集 =================
 
-  /// 按 SSH 会话缓存主机类型探测结果（活动隧道与监控隧道可能指向不同主机）。
-  final Map<SSHClient, HostType> _hostTypes = {};
+  /// 主机类型缓存。
+  ///
+  /// **按 `host:port:用户名` 缓存，而不是按 SSHClient 实例**：旧实现用 client 做
+  /// key，每次重连都留下一个永不回收的条目（泄漏），而且重连后缓存全部失效、
+  /// 每台机器每次重连都要重新跑一遍 `uname -s`。主机类型是服务器的属性，与是哪
+  /// 条会话无关——换成按主机缓存后，重连不再触发重复探测。
+  final Map<String, HostType> _hostTypes = {};
+
+  /// 由配置生成主机类型缓存键。
+  static String? _hostKeyOf(SSHConfig? c) =>
+      c == null ? null : '${c.host}:${c.sshPort}:${c.username}';
 
   /// 在指定 SSH 会话上执行命令，返回合并后的 stdout+stderr 文本。
   ///
@@ -737,17 +1668,26 @@ class TunnelService {
     return _execOn(client, command, timeout: timeout);
   }
 
-  /// 探测指定 SSH 会话的主机类型（按会话缓存）。
+  /// 探测指定 SSH 会话的主机类型（**按主机 `host:port:user` 缓存**，见 [_hostTypes]）。
   ///
   /// Windows（默认 cmd）执行 `uname -s` 会返回"命令不存在"的 GBK 错误文本，
   /// 因此不能仅凭"输出非空"判定 Unix：须识别命令不存在 / Windows bash 环境
   /// 标识（MINGW / MSYS / CYGWIN / *_NT），否则视为 Unix 系。
-  Future<HostType> _detectHostType(SSHClient client) async {
-    final cached = _hostTypes[client];
+  Future<HostType> _detectHostType(SSHClient client, {String? hostKey}) async {
+    final key = hostKey ?? _hostKeyOf(_activeConfig) ?? 'unknown';
+    final cached = _hostTypes[key];
     if (cached != null) return cached;
     final out = await _execOn(client, 'uname -s');
     final t = (out ?? '').trim();
-    final isWindows = t.isEmpty ||
+    if (t.isEmpty) {
+      // **采样失败绝不能当成"这是 Windows"**。`_execOn` 超时/链路抖动返回 null，
+      // 旧实现把空串归为 windows 并永久写进缓存：Linux 主机从此用 PowerShell 采集
+      // （恒失败、曲线停在旧值），`ensureUploadDir` 也开始按 `C:/Users/...` 探测。
+      // 失败就不缓存、下次重探，本次按 linux 兜底走。
+      debugPrint('[DSH] host type probe got no output; not caching (fallback linux)');
+      return HostType.linux;
+    }
+    final isWindows =
         t.contains('MINGW') ||
         t.contains('MSYS') ||
         t.contains('CYGWIN') ||
@@ -760,15 +1700,15 @@ class TunnelService {
         t.contains('not found') ||
         t.contains('找不到');
     final type = isWindows ? HostType.windows : HostType.linux;
-    _hostTypes[client] = type;
+    _hostTypes[key] = type;
     debugPrint('[DSH] detected host type: $type (uname="$t")');
     return type;
   }
 
   /// 在指定 SSH 会话上采集一次主机使用率（CPU / 内存 / GPU）。
   /// 会话断开或采集失败返回 null。
-  Future<HostSample?> _sampleFrom(SSHClient client) async {
-    final type = await _detectHostType(client);
+  Future<HostSample?> _sampleFrom(SSHClient client, [String? hostKey]) async {
+    final type = await _detectHostType(client, hostKey: hostKey);
     final command = _buildSampleCommand(type);
     final out = await _execOn(client, command);
     if (out == null || out.trim().isEmpty) return null;
@@ -779,7 +1719,7 @@ class TunnelService {
   Future<HostSample?> collectHostSample() async {
     final client = _client;
     if (client == null) return null;
-    return _sampleFrom(client);
+    return _sampleFrom(client, _hostKeyOf(_activeConfig));
   }
 
   /// 按主机类型构造采集命令：输出 `CPU=xx` / `MEM=xx` / `GPU=xx` / `GPUTEMP=xx`。
@@ -942,19 +1882,35 @@ class TunnelService {
   }
 
   /// 处理一条 Unsloth Studio 本地连接：经独立 SSH 会话转发到远程端口。
+  ///
+  /// 与主隧道的 `_handleForward` 同样必须给 `forwardLocal` 加超时：库内该
+  /// Future 无超时，会话半死时会永久挂起并把这条本地连接吊住。
   Future<void> _handleUnslothForward(Socket local) async {
     final client = _unslothClient;
     if (client == null) {
       local.destroy();
       return;
     }
+    // 同 `_handleForward`：持有源 future，超时/失败后仍要收尾迟到的 channel。
+    final openFuture = client.forwardLocal('127.0.0.1', _unslothRemotePort);
     try {
       // 远程 Unsloth Studio 监听 127.0.0.1:<unslothRemotePort>
-      final forward =
-          await client.forwardLocal('127.0.0.1', _unslothRemotePort);
+      final forward = await openFuture.timeout(forwardOpenTimeout);
+      if (!identical(_unslothClient, client)) {
+        try {
+          forward.destroy();
+        } catch (_) {}
+        local.destroy();
+        return;
+      }
       _pipe(local, forward);
     } catch (_) {
       local.destroy();
+      unawaited(openFuture.then<void>((channel) {
+        try {
+          channel.destroy();
+        } catch (_) {}
+      }, onError: (Object _) {}));
     }
   }
 
@@ -976,28 +1932,7 @@ class TunnelService {
     if (c != null) c.close();
   }
 
-  /// 主动断开隧道并清理。
-  Future<void> disconnect() async {
-    await _disconnectInternal();
-  }
-
-  Future<void> _disconnectInternal() async {
-    final server = _server;
-    _server = null;
-    if (server != null) {
-      await server.close();
-    }
-    final client = _client;
-    _client = null;
-    _activeProfileIndex = null;
-    _activeConfig = null;
-    if (client != null) {
-      client.close();
-    }
-    if (_status != TunnelStatus.idle) {
-      _setStatus(TunnelStatus.idle);
-    }
-  }
+  // 主动断开见 [disconnect]（监督器统一拥有重试计划，这里不再单独实现一套）。
 
   // ================= 实例级主机资源监控（独立采集隧道）=================
 
@@ -1008,6 +1943,10 @@ class TunnelService {
   /// 独立的监控采集 SSH 客户端（与活动隧道分开，用于采集指定实例的主机数据）。
   SSHClient? _monitorClient;
   bool _monitorConnecting = false;
+
+  /// 监控隧道的重连退避状态（见 [_ensureMonitorClient] 的说明）。
+  int _monitorAttempt = 0;
+  DateTime? _monitorNextAllowedAt;
 
   /// 当前监控实例索引（null 表示无）。
   int? get monitorProfileIndex => _monitorProfileIndex;
@@ -1020,8 +1959,8 @@ class TunnelService {
       SSHConfig? config, {int? profileIndex}) async {
     _monitorProfileIndex = profileIndex;
     _monitorConfig = (config != null && config.isConfigured) ? config : null;
-    // 监控实例可能变化：清空按会话的主机类型缓存
-    _hostTypes.clear();
+    _monitorAttempt = 0;
+    _monitorNextAllowedAt = null;
     await _closeMonitorClient();
     final c = _monitorConfig;
     if (c == null) return;
@@ -1051,22 +1990,30 @@ class TunnelService {
       client.done.then(
         (_) => _onMonitorClosed(client),
         onError: (Object e) {
-          debugPrint('[DSH] monitor transport error: $e');
+          _log('monitor', '监控传输层异常：$e', level: TunnelEventLevel.warn);
           _onMonitorClosed(client, failed: true);
         },
       );
       await client.authenticated
           .timeout(const Duration(seconds: 20), onTimeout: () {
-        debugPrint('[DSH] monitor auth timed out');
         throw const SocketException('监控连接认证超时');
       });
-      debugPrint('[DSH] monitor tunnel ready '
-          '(profile=$_monitorProfileIndex ${config.host}:${config.sshPort})');
+      _monitorAttempt = 0;
+      _monitorNextAllowedAt = null;
+      _log('monitor',
+          '监控隧道就绪（profile=$_monitorProfileIndex ${config.host}:${config.sshPort}）');
     } catch (e) {
-      debugPrint('[DSH] monitor connect failed: $e');
+      _monitorAttempt += 1;
+      final delay = _backoff.delayFor(_monitorAttempt, random: _rng.nextDouble);
+      _monitorNextAllowedAt = DateTime.now().add(delay);
+      _log('monitor',
+          '监控隧道连接失败（第 $_monitorAttempt 次）：$e → ${delay.inSeconds}s 内不再尝试',
+          level: TunnelEventLevel.warn);
       final mc = _monitorClient;
       _monitorClient = null;
-      mc?.close();
+      try {
+        mc?.close();
+      } catch (_) {}
     } finally {
       _monitorConnecting = false;
     }
@@ -1075,8 +2022,14 @@ class TunnelService {
   void _onMonitorClosed(SSHClient client, {bool failed = false}) {
     if (_monitorClient != client) return;
     _monitorClient = null;
-    debugPrint('[DSH] monitor transport closed'
-        '${failed ? ' (with error)' : ''}');
+    // 传输层掉线同样要退避：否则下一条采样立刻重开握手，服务器不可达时
+    // 又是"每 10 秒一次认证"的老问题。
+    _monitorAttempt += 1;
+    final delay = _backoff.delayFor(_monitorAttempt, random: _rng.nextDouble);
+    _monitorNextAllowedAt = DateTime.now().add(delay);
+    _log('monitor',
+        '监控传输层关闭${failed ? '（异常）' : ''} → ${delay.inSeconds}s 后才允许重连',
+        level: failed ? TunnelEventLevel.warn : TunnelEventLevel.info);
   }
 
   Future<void> _closeMonitorClient() async {
@@ -1086,10 +2039,18 @@ class TunnelService {
   }
 
   /// 确保监控隧道存在（懒连接）；无法建立返回 null。
+  ///
+  /// **退避保护**：旧实现每次采样（10s 一次）都会无条件重开一次完整 SSH 握手
+  /// ——最坏 15s(TCP)+20s(auth)——服务器不可达时就是一场每 10 秒一次的认证风暴：
+  /// 抢带宽、拖慢主隧道重连，还可能踩中 sshd `MaxStartups` 被临时封禁。
+  /// 现在失败后按 [TunnelBackoff] 退避，期间直接返回 null（曲线停在最后一条，
+  /// 而不是假装还在采样）。
   Future<SSHClient?> _ensureMonitorClient() async {
     if (_monitorClient != null) return _monitorClient;
     final c = _monitorConfig;
     if (c == null || _monitorConnecting) return null;
+    final next = _monitorNextAllowedAt;
+    if (next != null && DateTime.now().isBefore(next)) return null;
     await _connectMonitor(c);
     return _monitorClient;
   }
@@ -1101,11 +2062,11 @@ class TunnelService {
   Future<HostSample?> collectMonitorSample() async {
     if (_monitorProfileIndex == null) return null;
     if (_activeProfileIndex == _monitorProfileIndex && _client != null) {
-      return _sampleFrom(_client!);
+      return _sampleFrom(_client!, _hostKeyOf(_activeConfig));
     }
     final mc = await _ensureMonitorClient();
     if (mc == null) return null;
-    return _sampleFrom(mc);
+    return _sampleFrom(mc, _hostKeyOf(_monitorConfig));
   }
 
   void dispose() {
@@ -1117,11 +2078,26 @@ class TunnelService {
     ForegroundTunnelService.instance.stop();
     // 关闭 Unsloth Studio 转发
     stopUnslothForward();
+    // 关掉监督器的全部定时器：新的 WebViewScreen 挂载时会重新 connect() 拉起。
+    _wantConnected = false;
+    // 作废在途尝试：否则一条正在 `SSHSocket.connect` 的尝试会在 dispose 之后
+    // 把隧道连回来、绑端口、起看门狗，而已经没人负责再关它了。
+    _bumpGeneration('服务释放');
+    _inflight = null;
+    _inflightKey = '';
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
+    _networkTimer?.cancel();
+    _networkTimer = null;
     // 关闭独立的监控采集隧道
     final mc = _monitorClient;
     _monitorClient = null;
-    mc?.close();
-    // 断开活动隧道（含本地端口监听与 SSH 会话）
-    _disconnectInternal();
+    try {
+      mc?.close();
+    } catch (_) {}
+    // 断开活动隧道（含本地端口监听、转发 socket 与 SSH 会话）
+    unawaited(_teardown());
   }
 }

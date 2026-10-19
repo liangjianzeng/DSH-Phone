@@ -284,8 +284,15 @@ class SSHTransport {
       _processData();
     } on SSHError catch (e, stackTrace) {
       closeWithError(e, stackTrace);
-    } catch (e) {
-      rethrow;
+    } catch (e, stackTrace) {
+      // [fork] 原来这里是 `rethrow`。Dart 里 onData 回调抛出的异常**不会**路由到
+      // 同一订阅的 onError，而是变成 uncaught zone error：于是解密/解压/解析抛出
+      // 非 SSHError（FormatException、RangeError、ZLibException…）时，传输层既不
+      // 关闭也不 complete `done`，肇事字节还留在 _buffer 里，之后每个 socket
+      // 事件都在同一处再炸一次 —— 接收循环永久卡死而 isClosed 仍是 false。
+      // 这正是「隧道显示 connected 但其实已经死了」的一种成因。
+      // 改为按错误关闭：上层（SSHClient.done）能感知并触发重连。
+      closeWithError(SSHInternalError(e), stackTrace);
     }
   }
 
