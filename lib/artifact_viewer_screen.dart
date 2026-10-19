@@ -12,6 +12,7 @@ import 'package:flutter_widget_from_html_core/flutter_widget_from_html_core.dart
 import 'package:share_plus/share_plus.dart';
 
 import 'artifact_recognizer.dart';
+import 'artifact_render_html.dart';
 import 'tunnel_service.dart' show RemoteReadException;
 
 /// 原生成果查看器：按类型渲染 md / html / 代码，关闭即返回对话。
@@ -69,6 +70,19 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
   /// 渲染模式：原生渲染 vs 网页式兜底。
   bool _webFallback = false;
 
+  /// 主渲染方式：null = 未由用户指定，按内容类型给默认值。
+  ///
+  /// 默认走**系统 WebView**（`loadData` + `baseUrl` 指向隧道 origin）：
+  /// `flutter_widget_from_html_core` 不执行脚本、外链 CSS/flex 基本无效，
+  /// DSH 的报告渲染成裸文本；`flutter_markdown` 又没有 imageBuilder /
+  /// onTapLink，相对图片与链接都点不动。原生那条路保留为"快速模式"
+  /// （超长代码、低配机型、WebView 起不来时更有优势）。
+  bool? _useWebRenderer;
+
+  /// 图片成果的字节（延迟加载）。图片以前只能下载，连看都看不了。
+  Uint8List? _imageBytes;
+  bool _loadingImage = false;
+
   /// 异步加载中的内容（loader 拉取后填充）。
   String? _asyncContent;
   bool _loading = false;
@@ -101,7 +115,47 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
       // JS 侧 fetch 失败带来的原因（401 / 超时 / 超大），不再只是"无内容可查看"。
       _loadError = widget.initialError;
     }
-    _startLoad();
+    if (_isImage) {
+      _loadImage();
+    } else {
+      _startLoad();
+    }
+  }
+
+  /// 是否为图片成果（用 InteractiveViewer 看字节，绝不进任何文本渲染器）。
+  bool get _isImage {
+    if (widget.type != ArtifactType.resource) return false;
+    final key = (widget.fileName?.isNotEmpty ?? false)
+        ? widget.fileName!
+        : widget.url;
+    return key.isNotEmpty && ArtifactRules.isImageSuffix(key);
+  }
+
+  /// 图片：读原始字节交给 Image.memory + InteractiveViewer（可双指缩放）。
+  Future<void> _loadImage() async {
+    final loader = widget.rawBytesLoader;
+    if (loader == null) {
+      setState(() => _loadError = '这张图片没有可读取的云端路径');
+      return;
+    }
+    setState(() {
+      _loadingImage = true;
+      _loadError = null;
+    });
+    try {
+      final bytes = await loader();
+      if (!mounted) return;
+      setState(() {
+        _imageBytes = bytes;
+        _loadingImage = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loadError = _errorText(e);
+        _loadingImage = false;
+      });
+    }
   }
 
   /// 启动一次异步加载（initState 与"重试"共用一条路径）。
@@ -171,6 +225,21 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
             onPressed: _saving ? null : _save,
           ),
           IconButton(
+            // 主渲染方式开关：WebView 效果最好（CSS/图片/表格/脚本），
+            // 原生更快也更抗超长文件——两者都保留，用户按需切。
+            tooltip: _shouldUseWeb(_renderKindFor(_effectiveContent))
+                ? '改用原生渲染（更快，超长文件更稳）'
+                : '改用网页渲染（样式/图片/表格更完整）',
+            icon: Icon(_shouldUseWeb(_renderKindFor(_effectiveContent))
+                ? Icons.phone_android_outlined
+                : Icons.html_outlined),
+            onPressed: _isImage || (_effectiveContent.isEmpty && !_loading)
+                ? null
+                : () => setState(() =>
+                    _useWebRenderer =
+                        !_shouldUseWeb(_renderKindFor(_effectiveContent))),
+          ),
+          IconButton(
             tooltip: '网页式打开（兜底）',
             icon: const Icon(Icons.open_in_new),
             onPressed: widget.url.isEmpty
@@ -224,6 +293,17 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
     // 网页式兜底：原生渲染不可用/用户主动切换时，用嵌套 WebView 打开成果 URL。
     if (_webFallback && widget.url.isNotEmpty) {
       return _buildWebFallback();
+    }
+    // 图片：永远不进文本渲染器（旧实现把 png 当文本读，8M 字符乱码 + 卡顿）。
+    if (_isImage) {
+      if (_loadingImage) {
+        return const Center(child: CircularProgressIndicator());
+      }
+      final bytes = _imageBytes;
+      if (bytes == null || bytes.isEmpty) {
+        return _buildLoadError('无法显示这张图片。');
+      }
+      return _buildImageView(bytes);
     }
     if (_loading) {
       return const Center(child: CircularProgressIndicator());
@@ -428,45 +508,351 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
       ..showSnackBar(SnackBar(content: Text(message)));
   }
 
-  /// 网页式兜底：嵌套 WebView 打开成果 URL（复杂 HTML 可完整渲染）。
+  /// 网页式兜底：嵌套 WebView 直接打开成果 URL（复杂 HTML 可完整渲染）。
   Widget _buildWebFallback() {
     return InAppWebView(
       initialUrlRequest: URLRequest(url: WebUri(widget.url)),
       initialSettings: InAppWebViewSettings(
         javaScriptEnabled: true,
-        cacheMode: CacheMode.LOAD_CACHE_ELSE_NETWORK,
+        // 原来写死 LOAD_CACHE_ELSE_NETWORK：成果文件被 agent 覆盖后，
+        // "网页式打开"看到的还是上一版，排查问题时极容易被这份旧缓存误导。
+        cacheMode: CacheMode.LOAD_NO_CACHE,
       ),
     );
   }
 
+  /// 内容 → 渲染种类。
+  ///
+  /// 以前 `file` 型一律先试 HTML、否则 Markdown，于是 `.csv`（没有 `|`）被挤成
+  /// 一段、`.json` 的缩进被 Markdown 吃掉且无高亮——这两类现在单独走自己的路。
+  ArtifactRenderKind _renderKindFor(String content) {
+    final name = (widget.fileName ?? '').toLowerCase();
+    final lang = widget.language.trim().toLowerCase();
+    if (name.endsWith('.json') || lang == 'json') {
+      return ArtifactRenderKind.json;
+    }
+    if (name.endsWith('.csv') || name.endsWith('.tsv') || lang == 'csv') {
+      return ArtifactRenderKind.csv;
+    }
+    if (widget.type == ArtifactType.code) return ArtifactRenderKind.code;
+    if (widget.type == ArtifactType.html) return ArtifactRenderKind.html;
+    if (widget.type == ArtifactType.markdown) return ArtifactRenderKind.markdown;
+    final lower = content.trimLeft().toLowerCase();
+    if (lower.startsWith('<!doctype') ||
+        lower.startsWith('<html') ||
+        // 片段式 HTML / SVG（DSH 报告常直接给 `<div …>`、`<svg …>`）：
+        // 交给 Markdown 会把标签当字面文本吐出来。
+        RegExp(r'^<[a-z][a-z0-9-]*[\s>/]').hasMatch(lower)) {
+      return ArtifactRenderKind.html;
+    }
+    return ArtifactRenderKind.markdown;
+  }
+
+  /// 是否用系统 WebView 渲染（用户可切换，默认除代码外都用）。
+  bool _shouldUseWeb(ArtifactRenderKind kind) {
+    final explicit = _useWebRenderer;
+    if (explicit != null) return explicit;
+    return kind != ArtifactRenderKind.code;
+  }
+
+  /// 相对资源的基址：不传 baseUrl，HTML/Markdown 里的相对图片与 CSS 必然 404。
+  WebUri? _baseUrl() {
+    final url = widget.url;
+    if (url.isEmpty) return null;
+    try {
+      final uri = Uri.parse(url);
+      if (uri.scheme != 'http' && uri.scheme != 'https') return null;
+      return WebUri('${uri.origin}/');
+    } catch (_) {
+      return null;
+    }
+  }
+
   Widget _buildContent() {
     final content = _effectiveContent;
-    // 按类型分发渲染。
-    switch (widget.type) {
-      case ArtifactType.html:
-        return SingleChildScrollView(
-          padding: const EdgeInsets.all(16),
-          child: HtmlWidget(content),
-        );
-      case ArtifactType.code:
+    final kind = _renderKindFor(content);
+    if (_shouldUseWeb(kind)) return _buildWebView(kind, content);
+    switch (kind) {
+      case ArtifactRenderKind.code:
         return _buildCodeRenderer(content);
-      case ArtifactType.markdown:
-      case ArtifactType.file:
-      case ArtifactType.resource:
-      case ArtifactType.none:
-        // 文件型/未知类型：按内容自动识别 HTML 还是 Markdown。
-        final lower = content.trim().toLowerCase();
-        if (lower.startsWith('<!doctype') || lower.startsWith('<html')) {
-          return SingleChildScrollView(
-            padding: const EdgeInsets.all(16),
-            child: HtmlWidget(content),
-          );
-        }
+      case ArtifactRenderKind.json:
+        return _buildCodeRenderer(ArtifactWebDocument.prettyJson(content),
+            language: 'json');
+      case ArtifactRenderKind.csv:
+        return _buildCsvNative(content);
+      case ArtifactRenderKind.html:
         return SingleChildScrollView(
           padding: const EdgeInsets.all(16),
-          child: MarkdownBody(data: content, styleSheet: _markdownStyle()),
+          child: HtmlWidget(content, baseUrl: _baseUrl()),
         );
+      case ArtifactRenderKind.markdown:
+        return _buildMarkdownNative(content);
     }
+  }
+
+  /// 系统 WebView 主渲染：CSS/字体/表格/图片/脚本交给 Chromium。
+  Widget _buildWebView(ArtifactRenderKind kind, String content) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final html = ArtifactWebDocument.document(
+      kind: kind,
+      content: content,
+      dark: dark,
+      title: widget.fileName ?? _title,
+      language: widget.language,
+    );
+    return InAppWebView(
+      initialData: InAppWebViewInitialData(
+        data: html,
+        mimeType: 'text/html',
+        encoding: 'utf-8',
+        baseUrl: _baseUrl(),
+      ),
+      initialSettings: InAppWebViewSettings(
+        javaScriptEnabled: true,
+        cacheMode: CacheMode.LOAD_NO_CACHE,
+        builtInZoomControls: true,
+        displayZoomControls: false,
+      ),
+      onWebViewCreated: (controller) {
+        // 预览页里的链接不许把预览页替换掉：复制链接并提示。
+        controller.addJavaScriptHandler(
+          handlerName: 'onViewerLink',
+          callback: (args) async {
+            final href = args.isNotEmpty ? '${args.first}' : '';
+            if (href.isEmpty) return;
+            try {
+              await Clipboard.setData(ClipboardData(text: href));
+            } catch (_) {}
+            if (!mounted) return;
+            _toast('链接已复制：$href');
+          },
+        );
+      },
+    );
+  }
+
+  /// 图片预览：双指缩放 + 真实像素尺寸提示。
+  Widget _buildImageView(Uint8List bytes) {
+    return InteractiveViewer(
+      maxScale: 8,
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Image.memory(
+            bytes,
+            fit: BoxFit.contain,
+            errorBuilder: (context, error, stack) => Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text('图片解码失败：$error',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.red)),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 原生 Markdown：补上 selectable / onTapLink / imageBuilder 三个必需能力。
+  Widget _buildMarkdownNative(String content) {
+    final base = widget.url.isEmpty ? null : Uri.tryParse(widget.url);
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: MarkdownBody(
+        data: content,
+        selectable: true, // 之前整页不可选中，想复制一段只能"复制全文"
+        styleSheet: _markdownStyle(),
+        onTapLink: (text, href, title) async {
+          if (href == null || href.isEmpty) return;
+          try {
+            await Clipboard.setData(ClipboardData(text: href));
+          } catch (_) {}
+          if (!mounted) return;
+          _toast('链接已复制：$href');
+        },
+        sizedImageBuilder: (config) {
+          // 相对路径必须手动 resolve：没有 baseUrl 时相对图片一律 404，
+          // 于是"报告里所有截图都显示不出来"。
+          var target = config.uri;
+          if (target.scheme.isEmpty && base != null) {
+            try {
+              target = base.resolveUri(target);
+            } catch (_) {}
+          }
+          return ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 640),
+            child: Image.network(
+              target.toString(),
+              fit: BoxFit.contain,
+              errorBuilder: (context, error, stack) => Text(
+                '[图片加载失败：${config.alt ?? target.path}]',
+                style: const TextStyle(color: Colors.grey),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  /// 原生 CSV 表格（横向可滚）。网页渲染才有"全部行"，这里为速度设上限。
+  Widget _buildCsvNative(String content) {
+    final rows = ArtifactWebDocument.parseDelimited(content);
+    if (rows.isEmpty) {
+      return const Center(child: Text('没有可解析的表格内容'));
+    }
+    const maxRows = 300;
+    final shown = rows.length > maxRows ? rows.sublist(0, maxRows) : rows;
+    final cols = shown.fold<int>(0, (m, r) => r.length > m ? r.length : m);
+    if (cols == 0) {
+      return const Center(child: Text('没有可解析的表格内容'));
+    }
+    final header = shown.first;
+    final scheme = Theme.of(context).colorScheme;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(12),
+      scrollDirection: Axis.horizontal,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          DataTable(
+            columns: [
+              for (var c = 0; c < cols; c++)
+                DataColumn(
+                  label: SizedBox(
+                    width: 160,
+                    child: Text(
+                      c < header.length ? header[c] : '',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ),
+            ],
+            rows: [
+              for (final r in shown.skip(1))
+                DataRow(
+                  cells: [
+                    for (var c = 0; c < cols; c++)
+                      DataCell(SizedBox(
+                        width: 160,
+                        child: Text(
+                          c < r.length ? r[c] : '',
+                          maxLines: 3,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      )),
+                  ],
+                ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '共 ${rows.length - 1} 行 · $cols 列'
+            '${rows.length > shown.length ? '（原生模式仅显示前 ${shown.length - 1} 行，切"网页渲染"看全部）' : ''}',
+            style: TextStyle(fontSize: 12, color: scheme.outline),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ---- 代码渲染参数：行号与代码必须用同一套字号/行高，否则行号会错位 ----
+  static const double _codeFontSize = 13.5;
+  static const double _codeLineHeight = 1.55;
+
+  /// 高亮上限：超长文本让 highlight 库做全量着色会把 UI 线程卡死。
+  static const int _maxHighlightedChars = 400 * 1024;
+
+  TextStyle get _codeTextStyle => TextStyle(
+        fontFamily: 'monospace',
+        fontFamilyFallback: const <String>['Menlo', 'Courier New'],
+        fontSize: _codeFontSize,
+        height: _codeLineHeight,
+      );
+
+  /// 代码渲染：flutter_highlight 语法高亮，主题跟随系统深浅色。
+  ///
+  /// 三处硬伤一起修掉：① 外层原来只有纵向滚动 → 长行被折行，缩进全毁；
+  /// ② 无行号，报"第 37 行"要自己数；③ 不可选中，想拷一段代码只能整篇复制。
+  Widget _buildCodeRenderer(String content, {String? language}) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final theme = dark ? atomOneDarkTheme : atomOneLightTheme;
+    final lang = (language ?? widget.language).trim();
+    var text = content;
+    var truncated = false;
+    if (text.length > _maxHighlightedChars) {
+      text = text.substring(0, _maxHighlightedChars);
+      truncated = true;
+    }
+    final lineCount = '\n'.allMatches(text).length + 1;
+    final showGutter = lineCount <= 5000;
+    final gutterWidth =
+        showGutter ? (30.0 + (lineCount.toString().length - 1) * 8.0) : 0.0;
+    final scheme = Theme.of(context).colorScheme;
+    return Column(
+      children: [
+        if (truncated)
+          Container(
+            width: double.infinity,
+            color: scheme.surfaceContainerHighest,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+            child: Text(
+              '内容过长，仅显示前 ${(_maxHighlightedChars / 1024).round()}KB'
+              '（切"网页渲染"或"另存为"可看全文）',
+              style: TextStyle(fontSize: 12, color: scheme.outline),
+            ),
+          ),
+        Expanded(
+          child: SingleChildScrollView(
+      // 纵向在前、横向在后：外层给无限高、内层给无限宽，
+      // RichText 因此不会折行，长行的缩进得以保住。
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(8, 12, 20, 24),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (showGutter)
+                SizedBox(
+                  width: gutterWidth,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      for (var i = 1; i <= lineCount; i++)
+                        Text('$i',
+                            textAlign: TextAlign.right,
+                            style: _codeTextStyle.copyWith(
+                              color: scheme.outlineVariant,
+                            )),
+                    ],
+                  ),
+                ),
+              if (showGutter) const SizedBox(width: 10),
+              // SelectionArea 而不是 HighlightView.selectable：这版
+              // flutter_highlight 没有 selectable 参数，想选中一段代码只能整篇
+              // 走右上角"复制全文"。
+              SelectionArea(
+                child: HighlightView(
+                  text,
+                  // 语言为空时以前完全不高亮：至少保留等宽 + 主题底色。
+                  language: lang.isEmpty ? null : lang,
+                  theme: theme,
+                  textStyle: _codeTextStyle,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+          ),
+        ),
+      ],
+    );
   }
 
   /// 跟随主题的 Markdown 样式：深色模式下代码块背景不再刺眼。
@@ -491,21 +877,4 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
   }
 
   /// 代码渲染：flutter_highlight 语法高亮，主题跟随系统深浅色。
-  Widget _buildCodeRenderer(String content) {
-    final dark = Theme.of(context).brightness == Brightness.dark;
-    final theme = dark ? atomOneDarkTheme : atomOneLightTheme;
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
-      child: HighlightView(
-        content,
-        language: widget.language.isEmpty ? null : widget.language,
-        theme: theme,
-        textStyle: const TextStyle(
-          fontFamily: 'monospace',
-          fontSize: 14,
-          height: 1.4,
-        ),
-      ),
-    );
-  }
 }

@@ -243,3 +243,47 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 - **修复**：新增 `settleLiveText(m)`（落库文本总长追平直播块前只记数据不渲染副本，追平即移除直播块）；挂在 part.upserted/part.delta/renderTail 三个正文入口；`model.streaming` 增加 hasReal 守卫（真实部件已接管就不再重建直播块，思考/正文同款）；part.delta 的 reasoning `!pe` 分支补上与 upserted 同款的直播去重。
 - **教训**：给"直播+落库"双通道页面加渲染路径时，两条通道必须同一时刻只渲染一份——新增部件类型（text/reasoning/tool）都要过一遍 settle 去重，漏一个就是"重复输出"类用户报告。
 
+---
+
+## 成果预览/下载"成片失败"根因与渲染层重做（2026-11，P0 commit 8ce86d4）
+
+- **一次泄漏拖垮全部预览与下载**：`TunnelService.ensureUploadDir` 成功路径 `return dir`
+  从不 `sftp.close()`。每上传一次泄漏一条 SSH 通道，远端 sshd `MaxSessions=10` 打满后
+  **所有** SFTP 操作一起失败——预览报"路径不存在或无权限"、下载报"隧道可能未连接"。
+  教训：任何 `await client.sftp()` 都必须有 `finally` 收尾，成功分支尤其容易漏。
+- **`SftpFile.close()` 会抛，不能裸放 `finally`**：dartssh2 的 `close()` 是
+  `await _close()`，通道已死时抛错**顶掉已成功的返回值**（表现为"点开偶尔失败、再点就好"），
+  并跳过同块后续的 `sftp.close()` → 会话泄漏。统一走 `TunnelService.closeRemoteFile()`
+  （best-effort，内部吞异常）。
+- **唤醒卡死的 await 只有一个办法**：`SftpClient` 构造时**不注册** onDone/onError，
+  `_waitReply` 无超时 → 链路半开时 await 永久悬挂，监督器重建隧道也救不回旧 await。
+  唯一解法是 `SftpClient.close()`（`void`，会把 `_replyWaiters` 全部以
+  `SftpAbortError` 完成）。因此所有活跃会话登记进 `_liveSftpClients`，`_teardown()`
+  调 `abortLiveSftpSessions()`；其余路径一律用 `TimeoutException` 显式限时。
+- **短读会留下"看起来成功"的洞**：fork 里 `onProgress` 累加的是**请求**长度
+  （`bytessRecieved += chunkLength`）而非实收，服务端短读即进度虚高。续传偏移一律以
+  `_chunks` 缓冲区实际字节数为准，完成时再校验 `downloadedBytes == totalBytes`，
+  否则判"下载不完整（x/y 字节）"——**绝不相信库的进度计数**。
+- **在途流必须用世代号作废**：`_generation` 递增 + 取消订阅 + `closeRemoteFile`，
+  否则"暂停后继续"两条流写同一缓冲区、"取消后迟到的 completed"会存出只有尾包的坏文件。
+- **0 字节与失败是两件事**：`readRemoteFileBytes` 原来失败返回 `null`，上层拿空内容
+  继续 `saveFile` → 存出 0 字节文件还 toast"保存成功"。现在失败一律抛
+  `RemoteReadException(kind: …)`，UI 按 `RemoteFailureKind` 给分类建议。
+- **`?token=` 让后缀判定全线失效**：判定必须先过 `ArtifactRules.normalizeForSuffix`
+  （剥 `?`/`#` 与结尾分隔符）。同一份后缀表在桥脚本里写了 4 遍且各自漂移，
+  现在收敛为 `RESOURCE_EXT`/`TEXT_EXT` 两个 JS 常量（新增后缀两处同步：JS + Dart）。
+- **渲染主路径改系统 WebView**（`lib/artifact_render_html.dart`）：
+  `flutter_widget_from_html_core` 不执行脚本、外链 CSS/flex 无效，`flutter_markdown`
+  无 `imageBuilder`/`onTapLink` 且不传 `baseUrl` → 报告里的截图全 404。`InAppWebView`
+  `initialData` + `baseUrl` 指向隧道 origin 一次解决。原生渲染保留为"快速模式"
+  （AppBar 的 html/手机图标可切）；代码类默认仍走原生（超长文件更稳）。
+  原生侧补齐：横向滚动（此前长行被折行毁掉缩进）+ 行号 + `SelectionArea`
+  （`flutter_highlight` 0.7.0 **没有** `selectable` 参数）。
+- **CSV/JSON 必须单独分发**：`.csv` 走 MarkdownBody 会被挤成一段（Markdown 表格要 `|`），
+  `.json` 缩进被吃掉。`ArtifactWebDocument.parseDelimited` 是手写解析器（引号内
+  分隔符/换行、`""` 转义、CRLF、`,;\t|` 自动识别），有独立测试。
+- **SVG 不能进"图片"分支**：`Image.memory` 不认 SVG，只会得到"图片解码失败"；
+  `.svg` 走文本读取 + HTML 渲染。`isImageSuffix` 因此刻意不含 `.svg`。
+- **PDF 保持下载**：Android WebView 不内嵌渲染 PDF，硬塞只得到空白页。
+- **测试基线**：`flutter test` 现为 102 例（新增 artifact_render_html 13 例、
+  识别/下载 11 例）；`flutter analyze` 允许且仅有 third_party 的 10 条 info。

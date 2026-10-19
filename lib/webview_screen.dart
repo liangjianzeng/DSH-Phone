@@ -1788,6 +1788,66 @@ class _WebViewScreenState extends State<WebViewScreen>
     // 资源型成果（apk/压缩包等）：转下载页（含断点续传 + 另存为）。
     // 工具开关：资源下载关闭时不触发下载能力。
     if (hit.type == ArtifactType.resource) {
+      // 图片类资源：先给"看"，再给"存"。以前 png/jpg 只能整包下载——
+      // 想确认一张截图长什么样也得先存到本机再去文件管理器打开。
+      final imageKey = hit.path.isNotEmpty ? hit.path : hit.url;
+      if (imageKey.toLowerCase().contains('.svg')) {
+        // SVG 是文本：读内容交给网页渲染（Flutter 的 Image.memory 不认 SVG，
+        // 而归进"图片"就只会得到"图片解码失败"）。
+        if (!_resourceViewEnabled) {
+          _toastToolDisabled('资源查看', '已在设置中关闭，重新打开后可预览');
+          return;
+        }
+        final path = hit.path;
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            fullscreenDialog: true,
+            builder: (_) => ArtifactViewerScreen(
+              type: ArtifactType.html,
+              url: hit.url,
+              language: '',
+              content: hit.content,
+              fileName: path.isNotEmpty ? _basename(path) : _basename(hit.url),
+              loader: path.isEmpty
+                  ? null
+                  : () => TunnelService.instance.readRemoteFile(path),
+              rawBytesLoader: path.isEmpty
+                  ? null
+                  : () => TunnelService.instance.readRemoteFileBytes(path),
+              initialError: hit.error,
+            ),
+          ),
+        );
+        return;
+      }
+      if (imageKey.isNotEmpty && ArtifactRules.isImageSuffix(imageKey)) {
+        if (hit.path.isEmpty || !_resourceViewEnabled) {
+          // 拿不到云端路径就读不了字节；查看开关关闭时退回下载，至少还能用。
+          if (_resourceDownloadEnabled) {
+            _openResourceDownload(hit);
+          } else {
+            _toastToolDisabled('资源查看', '已在设置中关闭，重新打开后可预览');
+          }
+          return;
+        }
+        final path = hit.path;
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            fullscreenDialog: true,
+            builder: (_) => ArtifactViewerScreen(
+              type: ArtifactType.resource,
+              url: hit.url,
+              language: '',
+              content: '',
+              fileName: _basename(path),
+              // 读原始字节交 Image.memory：绝不能再走一遍文本解码。
+              rawBytesLoader: () =>
+                  TunnelService.instance.readRemoteFileBytes(path),
+            ),
+          ),
+        );
+        return;
+      }
       if (_resourceDownloadEnabled) {
         _openResourceDownload(hit);
       } else {
