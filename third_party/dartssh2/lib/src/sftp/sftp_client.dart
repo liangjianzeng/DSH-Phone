@@ -575,13 +575,20 @@ class SftpFile {
       throw SftpError('Length must be positive: $length');
     }
 
+    // `length` 是可空参数：新版 Dart 不再把"外层已经判过非空"的流分析结论带进
+    // 局部函数/闭包，下面 readChunk 里的 `bytessRecieved >= length` 会报
+    // "A value of type 'int?' can't be assigned to a variable of type 'num'"
+    // （CI 的最新 stable 那条 leg 就挂在这里）。捕获一个非空局部量给闭包用，
+    // 语义不变，老版本也照样通过。
+    final int totalLength = length;
+
     final streamController = StreamController<Uint8List>();
 
     var bytessRecieved = 0;
     var bytessRequested = 0;
 
     Future<void> readChunk(int chunkStart) async {
-      final chunkEnd = min(chunkStart + chunkSize, offset + length!);
+      final chunkEnd = min(chunkStart + chunkSize, offset + totalLength);
       final chunkLength = chunkEnd - chunkStart;
 
       bytessRequested += chunkLength;
@@ -608,7 +615,7 @@ class SftpFile {
 
       if (onProgress != null) onProgress(bytessRecieved);
 
-      if (bytessRecieved >= length) {
+      if (bytessRecieved >= totalLength) {
         streamController.close();
         return;
       }
@@ -619,7 +626,7 @@ class SftpFile {
         return;
       }
 
-      while (bytessRequested < length!) {
+      while (bytessRequested < totalLength) {
         final bytesOnTheWire = bytessRequested - bytessRecieved;
         if (bytesOnTheWire >= maxBytesOnTheWire) return;
         readChunk(bytessRequested + offset).then((_) => scheduleRead());

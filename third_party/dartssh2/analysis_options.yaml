@@ -4,6 +4,7 @@ linter:
   rules:
     prefer_function_declarations_over_variables: false
 
-analyzer:
-  plugins:
-    - dart_code_metrics_presets
+# 去掉上游的 legacy analyzer plugin：新版 Dart 对 `plugins:` 报 warning
+# （Support for legacy plugins is deprecated），而 tool/ci_gate.sh 里的 fork
+# 门禁把 warning 也当失败。该插件只是上游自查用的 dart_code_metrics 预设，
+# 本项目构建与分析都不需要；同步上游若再带回来，照此删除。
