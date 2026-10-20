@@ -192,6 +192,22 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
   - 落地：`gen_snapshot` 位置换成薄包装（真身改名 `gen_snapshot.bin`），有 FEX 走 FEX、没有则退回 binfmt。只动这一个文件，**不改系统 binfmt**（amd64 容器仍依赖 qemu）。
   - aapt2 / NDK clang 用 qemu 就够，不需要 FEX。
 - **验证过的成功路径**：`git worktree` 干净检出 HEAD 后 `tool/build_apk.sh --fix-artifacts` → `✓ Built build/app/outputs/flutter-apk/app-release.apk (23.4MB)`，约 6 分钟；抽出的 `libapp.so` 是真 arm64 AOT（`file` 报 ARM aarch64，`_kDartIsolateSnapshotInstructions` 在位）。
+- **GitHub Releases 现状与三个坑（2026-10-20 查）**：仓库只有 **v0.2.0** 一个 release，
+  asset 是 **181,786,477 bytes（173 MB）的 debug 签名包**——不是发版包，别拿它升级线上版。
+  三个独立故障：① `on: push` 只写了 `branches: [main]`，**tag push 根本不触发 workflow**，
+  所以"有 tag 才跑"的 build-apk 从未执行，v0.2.1/v0.2.2 没有 asset；② 证书被 `.gitignore`
+  排除（`android/key.jks`、`key.properties` 只在本机），CI 里没有证书 → Gradle **静默回退
+  debug 签名**；③ asset 名固定 `app-release.apk` 不带版本号，多版本混在一起分不清。
+  现在：workflow 加 `tags: ['v*']`；缺 Secrets 时 job **直接失败**并在摘要里写出该配哪两个
+  secret（`ANDROID_KEYSTORE_BASE64`、`ANDROID_KEY_PROPERTIES_BASE64`）；上传前用 apksigner
+  比对指纹（与 `tool/build_apk.sh` 的 `EXPECTED_FP` 同源，换证书两处一起改），不符禁止上传；
+  asset 改名 `app-release-v<tag>.apk`，摘要里给大小与 sha256。
+- **发版闭环（写进 BUILD.md 交付规范，`tool/build_apk.sh` 会主动提醒）**：打完 release 包
+  必须 ① 推 tag 让 CI 上传 Releases，② 回 README.md/README.html 同步「安装包」的最新
+  正式版说明（版本号、大小、sha256、asset 名）。只发本地 APK 不改 README 视为发版未完成。
+- **本机已有证书**：`android/key.jks` 与 `android/key.properties` 在本机（未入库，
+  `tool/build_apk.sh` 的签名验收据此通过），下面这条已过时，保留仅作历史参照：
+
 - **本机仍不等于能发正式包**：`android/key.properties` 与 `key.jks` 不在这台机器上，release 会**静默回退 debug 签名**（能装能跑，但不能覆盖安装已装正式版、不能上 Releases）。正式包继续走 CI（打 tag → GitHub Actions x86-64 runner）或 Windows 打包机，直到证书拷来。
 - **DSH 沙箱注意**：策略 `workspace-write` 时 flutter 启动即挂在 `bin/internal/update_engine_version.sh: .../engine.version: 权限不够`（它要写 `~/flutter/bin/cache`），跑 flutter/dart 需 `danger-full-access`。
 

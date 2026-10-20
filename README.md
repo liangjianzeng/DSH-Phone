@@ -6,9 +6,13 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 
 - **开源地址**：https://github.com/liangjianzeng/DSH-Phone
 - **当前版本**：v0.2.2（build 18）
-- **安装包**：最新构建产物见 `build/app/outputs/flutter-apk/app-release.apk`；历史版本请在 **GitHub Releases** 下载（仓库不再提交 APK 二进制）。
+- **安装包**：
+  - **最新正式版（推荐）**：Releases 最新版本页 <https://github.com/liangjianzeng/DSH-Phone/releases/latest> —— asset 命名 `app-release-v<版本号>.apk`，release 签名 `CN=TongYiLite`，约 23.6 MB，装机前请比对页面上列出的 sha256
+  - **历史版本**：<https://github.com/liangjianzeng/DSH-Phone/releases>（仓库不再提交 APK 二进制）
+  - **本机最新构建产物**：`build/app/outputs/flutter-apk/app-release.apk`（由 `tool/build_apk.sh` 产出；脚本结尾的「交付信息」块给出绝对地址、大小、sha256 与签名，规范见 [BUILD.md](BUILD.md)）
+  - ⚠️ **只装 release 签名的包**：证书不入库，改由 CI Secrets 注入，缺证书时发版 job 直接失败而不是回退 debug 签名。历史遗留的 `v0.2.0` asset（173 MB）正是缺证书时的 debug 签名产物，**不能覆盖安装线上正式版**，别拿它升级。
 
-<!-- 发版检查清单：1) pubspec.yaml 的 version（唯一版本来源，构建 versionName/versionCode）；2) 同步下方「当前版本」；3) lib/config.dart 的 fallbackAppVersion 仅作读取失败兜底，正常 release 自动读取构建版本无需改；4) 打 tag 触发 CI 构建 Releases。 -->
+<!-- 发版检查清单：1) pubspec.yaml 的 version（唯一版本来源，构建 versionName/versionCode）；2) 同步下方「当前版本」；3) lib/config.dart 的 fallbackAppVersion 仅作读取失败兜底，正常 release 自动读取构建版本无需改；4) 打 tag（v*）触发 CI 的 build-apk job 构建并上传 Releases；5) 上传成功后必须回到本文件核对「安装包」的最新正式版说明（版本号、大小、sha256、asset 名），未同步视为发版未完成——规范见 BUILD.md「打完包必须交付」。 -->
 
 ## 工作原理
 

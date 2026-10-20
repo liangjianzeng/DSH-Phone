@@ -355,6 +355,17 @@ echo "提示　　：装机方比对 sha256；抽查新增文案用"
 echo "           unzip -oq \"$APK_ABS\" lib/arm64-v8a/libapp.so -d /tmp/x"
 echo "           然后 python3 判 '\"文案\"' in open('/tmp/x/lib/arm64-v8a/libapp.so','rb').read().decode('utf-16-le','ignore')"
 echo "           （中文串在 Dart 快照里按 UTF-16 存，grep UTF-8 会误报缺失）"
+if [[ "$MODE" == release ]]; then
+  PUB_VER="$(grep -m1 '^version:' pubspec.yaml | awk '{print $2}' | cut -d+ -f1)"
+  echo "发版　　：这是 release 包，交付尚未完成——还差两件（规范见 BUILD.md）："
+  echo "           1) 打 tag 触发 CI 上传 Releases：git tag v${PUB_VER} && git push origin v${PUB_VER}"
+  echo "              （证书不入库：需先在仓库 Settings → Secrets 配 ANDROID_KEYSTORE_BASE64"
+  echo "                与 ANDROID_KEY_PROPERTIES_BASE64，否则 job 按设计直接失败，"
+  echo "                而不是静默发一个 debug 签名的包）"
+  echo "           2) 回 README.md / README.html 核对「安装包」的最新正式版说明："
+  echo "              版本号、大小、sha256、asset 名（app-release-v<版本>.apk）"
+  echo "           有 API 令牌时可手动补传：gh release upload v${PUB_VER} \"$APK_ABS\" --clobber"
+fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 if [[ "$RUN_INSTALL" == 1 ]]; then

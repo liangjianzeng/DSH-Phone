@@ -8,6 +8,10 @@ name: CI
 on:
   push:
     branches: [main]
+    # 必须显式列出 tags：只写 branches 时 **tag push 根本不触发 workflow**，
+    # 于是下面那个"有 tag 才跑"的 build-apk job 从未执行过——Releases 里
+    # 至今只有 v0.2.0 一个包（还是缺证书时的 debug 签名产物）就是这个原因。
+    tags: ['v*']
   pull_request:
     branches: [main]
 
@@ -64,10 +68,73 @@ jobs:
       - name: pub get
         run: flutter pub get
 
+      # 证书不入库（.gitignore 排除 android/key.properties 与 key.jks），只能走
+      # Secrets。缺证书时 Gradle 会**静默回退 debug 签名**：能装能跑，但不能覆盖
+      # 安装线上正式版——所以这里宁可失败，也不要把一个伪装成 release 的 debug 包
+      # 发进 Releases（Releases 里那个 173MB 的 v0.2.0 就是这么来的）。
+      - name: 还原 release 签名证书
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEY_PROPS_B64: ${{ secrets.ANDROID_KEY_PROPERTIES_BASE64 }}
+        run: |
+          set -e
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$KEY_PROPS_B64" ]; then
+            echo "::error::缺少 release 签名 Secrets：ANDROID_KEYSTORE_BASE64 / ANDROID_KEY_PROPERTIES_BASE64"
+            {
+              echo '### 发版被拦下：没有 release 签名证书'
+              echo
+              echo '仓库里不含 android/key.jks 与 android/key.properties（已被 .gitignore 排除）。'
+              echo '不注入证书时 Gradle 会静默改用 debug 签名，那种包**不能覆盖安装线上正式版**，'
+              echo '所以本 job 选择直接失败，而不是发一个伪装成 release 的 debug 包。'
+              echo
+              echo '配置方法（在有证书的机器上执行，把输出填进仓库 Settings → Secrets and variables → Actions）：'
+              echo
+              echo '```bash'
+              echo 'base64 -w0 android/key.jks          # → ANDROID_KEYSTORE_BASE64'
+              echo 'base64 -w0 android/key.properties   # → ANDROID_KEY_PROPERTIES_BASE64'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > android/key.jks
+          printf '%s' "$KEY_PROPS_B64" | base64 -d > android/key.properties
+
       - name: 构建 release APK
         run: flutter build apk --release
+
+      - name: 签名与完整性验收（不合格禁止上传）
+        shell: bash
+        env:
+          # 与 tool/build_apk.sh 的 EXPECTED_FP 同源；换证书时两处一起改。
+          EXPECTED_FP: fbbe1b6cf879ab941a65cdd7a7a8dd6f5a6bb640412de38c43cb894f08886992
+        run: |
+          set -e
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          APKSIGNER="$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)"
+          [[ -n "$APKSIGNER" ]] || { echo "::error::找不到 apksigner"; exit 1; }
+          dn="$("$APKSIGNER" verify --print-certs "$APK" | sed -n 's/.*certificate DN: //p' | head -1)"
+          fp="$("$APKSIGNER" verify --print-certs "$APK" | sed -n 's/.*SHA-256 digest: //p' | head -1 | tr -d ':')"
+          if [[ "$fp" != "$EXPECTED_FP" ]]; then
+            echo "::error::签名不符：$dn（$fp）≠ CN=TongYiLite/$EXPECTED_FP —— 禁止上传"
+            exit 1
+          fi
+          SIZE=$(stat -c %s "$APK")
+          SHA=$(sha256sum "$APK" | awk '{print $1}')
+          # asset 带版本号：Releases 里一眼分得清哪包是哪版，也免得下载方手改文件名
+          cp "$APK" "app-release-${GITHUB_REF_NAME}.apk"
+          {
+            echo "### 发版产物 ${GITHUB_REF_NAME}"
+            echo
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| asset | \`app-release-${GITHUB_REF_NAME}.apk\` |"
+            echo "| 大小 | $SIZE bytes（≈$(awk -v b="$SIZE" 'BEGIN{printf "%.2f", b/1048576}') MiB） |"
+            echo "| sha256 | \`$SHA\` |"
+            echo "| 签名 | $dn |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "验收通过：$dn / $SHA"
 
       - name: 上传 APK 到 GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          files: build/app/outputs/flutter-apk/app-release.apk
+          files: app-release-${{ github.ref_name }}.apk

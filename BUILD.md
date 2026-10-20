@@ -31,6 +31,21 @@
 
 `tool/build_apk.sh` 结尾会自动打印这块（含上面的脏树告警与抽查命令），**直接原样贴出**，不要手抄、不要把路径缩写成相对路径。贴这段之前，先把 APK 本身作为成果发出。
 
+**发版（打 tag 那类）还多两件**，没做完不算交付完成：
+
+1. **上传 GitHub Releases**：`git tag v<版本> && git push origin v<版本>` 触发 CI 的
+   `build-apk` job 构建并上传（asset 名 `app-release-v<版本>.apk`，job 会校验签名指纹，
+   与 `CN=TongYiLite` 不符直接失败）。证书不入库，需先在仓库 Settings → Secrets 配
+   `ANDROID_KEYSTORE_BASE64` 与 `ANDROID_KEY_PROPERTIES_BASE64`（`base64 -w0 android/key.jks`
+   与 `base64 -w0 android/key.properties` 的输出）；**没配就发不出去，这是有意的**——
+   宁可失败也不要发一个静默回退 debug 签名的包，那种包不能覆盖安装线上正式版。
+   历史教训：Releases 里 v0.2.0 那个 173 MB 的 asset 就是缺证书时的 debug 产物；
+   而且 `on: push` 只写了 `branches` 没写 `tags`，导致 tag push 根本不触发 workflow，
+   v0.2.1/v0.2.2 因此从未有过 asset。
+2. **同步 README 的下载信息**：`README.md` 与 `README.html` 顶部「安装包」里的
+   最新正式版说明（版本号、大小、sha256、asset 名）必须与新 Release 一致。
+   `tool/build_apk.sh` 结尾的「交付信息」块会把这两件事直接列出来提醒。
+
 装机方抽查"这个包到底含不含我这轮的改动"（中文串在 Dart 快照里按 **UTF-16** 存，直接 `grep` UTF-8 会误报缺失）：
 
 ```bash
