@@ -20,13 +20,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: subosito/flutter-action@v2
+      # 两条 leg 分开装 SDK：`flutter-version: ''` 空串仍会被 action 当版本号
+      # 校验并报错（这就是 stable 那条一直在 setup 里挂的原因），所以干脆
+      # 不传这个键——要固定版本才传 flutter-version，追最新只给 channel。
+      - name: 安装 Flutter（固定版本 leg）
+        if: matrix.flutter != 'stable'
+        uses: subosito/flutter-action@v2
         with:
-          # 矩阵里的 'stable' 是**通道名**不是版本号：塞进 flutter-version 会让
-          # action 去按版本号解析发布物，上游元数据一变就挂在 setup 阶段——
-          # 本仓库 CI 连续两周全红、日志里连一行 analyze 输出都没有，就是这个坑。
           channel: stable
-          flutter-version: ${{ matrix.flutter == 'stable' && '' || matrix.flutter }}
+          flutter-version: ${{ matrix.flutter }}
+          cache: true
+
+      - name: 安装 Flutter（最新稳定 leg）
+        if: matrix.flutter == 'stable'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
           cache: true
 
       - name: pub get
