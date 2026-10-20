@@ -103,6 +103,41 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 
 ---
 
+## CI 门禁红两周的三条根因（2026-10-20 修复）
+
+- **现象**：CI 矩阵两条 leg 连续两周每次 push 全红，没人看得见原因（匿名取
+  Actions 日志是 **403**，`gh` 也没装）。门禁形同虚设比没有门禁更坏。
+- **根因 1｜setup 阶段就挂**：矩阵把通道名 `'stable'` 当版本号传进
+  `subosito/flutter-action@v2` 的 `flutter-version`，上游元数据一变就取不到发布物。
+  传空串 `flutter-version: ''` **也不行**（仍按版本号校验）。最终拆成两个 job：
+  基线 job 传 `flutter-version: '3.27.0'`，预警 job 只给 `channel: stable`。
+- **根因 2｜info 级也能致命**：`flutter analyze` 默认 `--fatal-infos`（实测一个
+  info 就 exit 1）。Flutter 升级后 `Radio.groupValue/onChanged` 变 deprecation info，
+  代码没动 CI 就红。门禁改为 `--no-fatal-infos` 只卡 error/warning，info 另起一步
+  贴进 Job 摘要（不拦合并，也不静默丢弃）。
+- **根因 3｜vendored fork 拖死主门禁**：根 `flutter analyze` 会分析 `third_party/**`，
+  上游 deprecation 直接把仓库拖红。`analysis_options.yaml` 排除 `third_party/**`，
+  但**必须在 test 之前**对两个 fork 各跑一道 `dart analyze`（只卡 error/warning）——
+  否则 fork 的**编译错误**只表现为"某几个 test 文件 loading [E]"，根因看不见。
+  现在失败仍是 error 级，只是不再被上游的 deprecation 噪声淹没。
+- **稳定版 leg 目前仍红（未修完）**：`tunnel_policy_test` / `download_manager_test` /
+  `artifact_viewer_screen_test` 三个文件加载失败——恰好是**仅有的三个**（传递）引入
+  `tunnel_service.dart → dartssh2` 的测试，指向 fork 或其上游依赖（pointycastle /
+  asn1lib / pinenacl）在新 SDK 下的编译问题。本仓库不提交 `pubspec.lock`，CI 每次
+  重新解析，上游发新版就会编出本地从未见过的错误。已在门禁摘要里输出
+  `flutter pub deps --style=compact`，取到原因后二选一：提交 `pubspec.lock`
+  （应用项目本就该提交）或给肇事依赖加上界。**在此之前稳定版 leg 设为
+  `continue-on-error: true`，只预警不拦合并。**
+- **落地形式**：门禁逻辑收敛进 `tool/ci_gate.sh`（JS 桥 → fork → analyze → info 汇总
+  → test → 依赖清单），CI 与本地提交前跑**同一份**；失败原因写成 `::error::` 注解，
+  不登录也能用 `GET /repos/{o}/{r}/check-runs/{id}/annotations` 读到。
+  本地自查：`bash tool/ci_gate.sh`（`--skip-test` 快速版）。
+- **GitHub API 匿名配额只有 60/小时**：轮询 CI 每次至少 2 个请求，十几次就
+  `403 rate limit exceeded`。轮询要稀疏（30s+ 且只查一次 check-runs），
+  或先查 `/rate_limit` 再决定。
+
+---
+
 ## Linux(aarch64) 打包机：本机编 APK（2026-10-19）
 
 > 本机的 Linux 侧构建记录（Ubuntu 24.04 / aarch64，`Linux 7.0.0-1019-nvidia`）。结论：**能本机出 release APK**，
