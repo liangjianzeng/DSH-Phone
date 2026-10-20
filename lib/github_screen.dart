@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import 'config.dart';
@@ -16,6 +17,14 @@ import 'config.dart';
 ///   头建立会话，彻底绕开 WebView 内的 OAuth 跳转。
 ///
 /// 访问地址默认 https://github.com，可在设置里覆盖（如 GitHub Enterprise）。
+
+/// 给界面/日志用的地址：**必须剥掉 `x-access-token:<PAT>@`  userinfo**，
+/// 否则 PAT 会被显示在错误卡片上、被用户复制走、甚至进截图与日志。
+String githubDisplayTarget(String url) {
+  final m = RegExp(r'^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@').firstMatch(url);
+  if (m == null) return url;
+  return '${m.group(1)}…@${url.substring(m.end)}';
+}
 class GitHubScreen extends StatefulWidget {
   const GitHubScreen({super.key, this.timeoutSeconds = 60});
 
@@ -89,12 +98,36 @@ class _GitHubScreenState extends State<GitHubScreen> {
     _loadedTarget = _target;
   }
 
-  /// 刷新缓存：清缓存后重新加载（与 Unsloth 页面一致）。
-  Future<void> _refreshCache() async {
+  /// **强制走网络**重载当前页面。
+  ///
+  /// 两个坑，都是"页面看着像有缓存、但缓存以外的一直没刷出来"的成因：
+  ///  1. 裸 `reload()` 照样命中 HTTP 缓存（旧配置还是 LOAD_CACHE_ELSE_NETWORK，
+  ///     命中就根本不上网，连一次失败的导航都被反复复用）→ 这里把 cacheMode
+  ///     临时压成 LOAD_NO_CACHE，刷完恢复 LOAD_DEFAULT；不能长期关缓存，
+  ///     GitHub 静态资源带内容哈希，缓存是有益的。
+  ///  2. 旧实现调 `clearAllCache()` 清的是**整个 App 的 WebView 缓存**，
+  ///     顺手把 DSH 隧道页面的加速缓存也清了（那是特性）→ 不再使用。
+  Future<void> _reloadIgnoringCache() async {
     final c = _controller;
-    if (c == null) return;
-    await InAppWebViewController.clearAllCache();
-    await c.reload();
+    if (c == null) {
+      await _loadInitial();
+      return;
+    }
+    _onPageLoadStart();
+    try {
+      await c.setSettings(
+          settings: InAppWebViewSettings(cacheMode: CacheMode.LOAD_NO_CACHE));
+      await c.reload();
+    } catch (_) {
+      // 控制器已失效（极少见）：交回初始加载路径重建。
+      _loadedTarget = '';
+      await _loadInitial();
+    } finally {
+      try {
+        await c.setSettings(
+            settings: InAppWebViewSettings(cacheMode: CacheMode.LOAD_DEFAULT));
+      } catch (_) {}
+    }
   }
 
   /// 打开 PAT 令牌输入对话框（在 GitHub 页面内即可配置令牌，免翻设置页）。
@@ -176,7 +209,8 @@ class _GitHubScreenState extends State<GitHubScreen> {
       setState(() {
         _pageLoading = false;
         _pageError = '加载超时（${_loadTimeout.inSeconds} 秒未完成）。\n'
-            '请检查网络连接后重试。';
+            'github.com 直连常不通，请先确认 VPN / 代理已开启，再点「强制刷新」；'
+            '仍不通可在设置里把访问地址改为镜像或企业版地址。';
       });
     });
   }
@@ -198,18 +232,11 @@ class _GitHubScreenState extends State<GitHubScreen> {
     });
   }
 
-  /// 重试加载：强制重新导航到目标地址；控制器未就绪则重新走初始加载。
+  /// 重试：**绕过缓存**重新导航（见 [_reloadIgnoringCache]）。
   Future<void> _retry() async {
-    final c = _controller;
-    if (c == null) {
-      await _loadInitial();
-      return;
-    }
-    _onPageLoadStart();
-    await c.loadUrl(urlRequest: URLRequest(url: WebUri(_target)));
-    _loadedTarget = _target;
     if (!mounted) return;
     setState(() => _pageError = null);
+    await _reloadIgnoringCache();
   }
 
   // ================= UI =================
@@ -258,9 +285,9 @@ class _GitHubScreenState extends State<GitHubScreen> {
               onPressed: _editToken,
             ),
             IconButton(
-              tooltip: '刷新缓存',
+              tooltip: '强制刷新（忽略缓存）',
               icon: const Icon(Icons.refresh),
-              onPressed: _refreshCache,
+              onPressed: _reloadIgnoringCache,
             ),
             const SizedBox(width: 4),
           ],
@@ -270,39 +297,7 @@ class _GitHubScreenState extends State<GitHubScreen> {
   }
 
   Widget _buildBody(BuildContext context) {
-    // 页面错误（初始加载失败 / 超时 / 网络错误）
-    if (_pageError != null) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.cloud_off, size: 48, color: Colors.red),
-              const SizedBox(height: 16),
-              Text('无法加载 GitHub',
-                  style: Theme.of(context).textTheme.titleMedium),
-              const SizedBox(height: 12),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 320),
-                child: Text(
-                  '$_pageError',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.grey, fontSize: 13),
-                ),
-              ),
-              const SizedBox(height: 20),
-              FilledButton.icon(
-                onPressed: _retry,
-                icon: const Icon(Icons.refresh),
-                label: const Text('重试'),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-    return InAppWebView(
+    final webview = InAppWebView(
       initialUrlRequest: URLRequest(url: WebUri(_target)),
       initialSettings: InAppWebViewSettings(
         // 本地缓存加速：优先用缓存，缺时才走网络（与 Unsloth 一致）。
@@ -333,6 +328,75 @@ class _GitHubScreenState extends State<GitHubScreen> {
         }
         _onPageError('服务器返回错误（$code），请检查网络后重试。');
       },
+    );
+
+    final err = _pageError;
+    if (err == null) return webview;
+    // 错误态**不销毁** WebView，而是盖一层卡片。旧实现在这里直接 return 卡片，
+    // InAppWebView 被卸载、控制器随之失效，"重试"于是对着一个已销毁的控制器
+    // loadUrl——页面永远刷不出来，症状和"缓存卡住"一模一样。
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        webview,
+        ColoredBox(
+          color: Theme.of(context).colorScheme.surface,
+          child: _buildErrorCard(context, err),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildErrorCard(BuildContext context, String message) {
+    final shown = githubDisplayTarget(_target);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.cloud_off, size: 48, color: Colors.red),
+            const SizedBox(height: 16),
+            Text('无法加载 GitHub',
+                style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 12),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 320),
+              child: Text(
+                message,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.grey, fontSize: 13),
+              ),
+            ),
+            const SizedBox(height: 10),
+            // 显示真正去访问的地址（令牌已剥离），便于判断是不是镜像/代理的问题。
+            SelectionArea(
+              child: Text(
+                shown,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 12, color: Colors.blueGrey),
+              ),
+            ),
+            const SizedBox(height: 20),
+            FilledButton.icon(
+              onPressed: _retry,
+              icon: const Icon(Icons.refresh),
+              label: const Text('强制刷新'),
+            ),
+            TextButton.icon(
+              onPressed: () async {
+                await Clipboard.setData(ClipboardData(text: shown));
+                if (!context.mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('已复制访问地址')),
+                );
+              },
+              icon: const Icon(Icons.copy, size: 16),
+              label: const Text('复制地址'),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

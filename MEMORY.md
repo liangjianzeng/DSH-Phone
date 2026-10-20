@@ -105,6 +105,29 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 
 ---
 
+## GitHub 页「访问不通、怎么刷都不出新」的两条根因（2026-10-20）
+
+- **缓存策略抄错了对象**：`github_screen.dart` 用的是 `CacheMode.LOAD_CACHE_ELSE_NETWORK`
+  （从 Unsloth 页抄来的，那页是本地静态资源，缓存优先合理）。github.com 用这个的后果就是
+  用户描述的"感觉有缓存，但缓存以外的一直没刷出过"：**命中就根本不上网**，一次失败的导航
+  也被反复复用。改 `CacheMode.LOAD_DEFAULT`，让 GitHub 自己的 `Cache-Control` 说话
+  （静态资源带内容哈希，HTML 会回源校验）。**别长期关缓存**（`LOAD_NO_CACHE`），那会把
+  GitHub 的哈希资源全部重下。强制刷新 = 临时 `setSettings(cacheMode: LOAD_NO_CACHE)` →
+  `reload()` → 恢复 `LOAD_DEFAULT`；`setSettings` 传只含 cacheMode 的 settings 是安全的
+  （`toMap()` 带上 null，原生侧按 key 存在且非 null 才应用）。
+- **错误态把 WebView 卸了**：`_buildBody` 里 `if (_pageError != null) return 卡片;`，
+  `InAppWebView` 随之销毁、控制器失效，之后"重试"是对**已销毁的控制器** `loadUrl` ——
+  页面永远出不来，症状和"缓存卡住"一模一样，极易误判成网络/缓存问题。改成
+  `Stack`：WebView 常驻，错误卡片盖在上面（不透明 ColoredBox 遮住旧内容）。
+  **教训：任何"出错就换成别的 widget"的 WebView 页面都要检查控制器还活着。**
+- 强制刷新**不要**用 `InAppWebViewController.clearAllCache()`：那清的是整个 App 的
+  WebView 缓存，会顺手把 DSH 隧道页的加速缓存清掉（那是特性）。
+- 错误卡片要显示**真正去访问的地址**才能判断是不是代理/镜像问题，但令牌登录时
+  `_target` 带着 `x-access-token:<PAT>@` —— 必须经 `githubDisplayTarget()` 剥掉 userinfo
+  再显示/复制/进日志（有测试守着，见 `test/github_screen_test.dart`）。
+- `unsloth_screen.dart:350` 同款 `LOAD_CACHE_ELSE_NETWORK` **未动**（本地资源页，语义成立），
+  要不要一起改由用户定。
+
 ## CI 门禁红两周的三条根因（2026-10-20 修复）
 
 - **现象**：CI 矩阵两条 leg 连续两周每次 push 全红，没人看得见原因（匿名取
