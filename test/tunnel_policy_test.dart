@@ -275,6 +275,29 @@ void main() {
     });
   });
 
+  group('临时端口保留段 3090-3099（用户定的规矩）', () {
+    test('边界判定：段内拒绝，段外放行', () {
+      expect(isReservedFallbackPort(3089), isFalse);
+      expect(isReservedFallbackPort(3090), isTrue);
+      expect(isReservedFallbackPort(3095), isTrue);
+      expect(isReservedFallbackPort(3099), isTrue);
+      expect(isReservedFallbackPort(3100), isFalse);
+      expect(isReservedFallbackPort(0), isFalse);
+    });
+
+    test('候选就是这十个，不重不漏；不给随机数时按升序', () {
+      final ordered = fallbackPortCandidates();
+      expect(ordered,
+          List<int>.generate(10, (i) => tunnelFallbackPortMin + i));
+      // 固定序列的伪随机：验证"打乱后仍是同一集合"，而不是每次都能翻出别的端口
+      var k = 0;
+      final shuffled =
+          fallbackPortCandidates(random: () => ((k++ * 37) % 100) / 100.0);
+      expect(shuffled.toSet().length, 10);
+      expect(shuffled.toSet(), ordered.toSet());
+    });
+  });
+
   group('诊断事件环形缓冲', () {
     test('超出容量丢最旧，导出文本含标签与时间', () {
       var now = DateTime(2026, 10, 8, 9, 0, 0);

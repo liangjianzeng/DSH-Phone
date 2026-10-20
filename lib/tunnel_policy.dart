@@ -10,6 +10,40 @@
 /// - 错误文案按故障类别给结论，而不是把异常原文 + 一大段 VPN 建议糊上去。
 library;
 
+/// 隧道**临时端口**保留段：3090–3099。
+///
+/// 配置端口被占时不再向系统要随机端口（`bind(0)` 会给到 4 万多的 ephemeral 段，
+/// 用户在状态栏看到 127.0.0.1:43117 既看不懂也记不住，排查时更没法比对），
+/// 而是固定在这 10 个里挑一个——一眼认得出"这是隧道自己临时换的"。
+/// 代价是这个段被征用：**用户在设置里不允许填 3090–3099**，否则配置端口与
+/// 临时端口会互相撞，见 [isReservedFallbackPort]。
+const int tunnelFallbackPortMin = 3090;
+const int tunnelFallbackPortMax = 3099;
+
+/// 是否落在临时端口保留段（设置页据此拒绝保存，隧道据此挑临时端口）。
+bool isReservedFallbackPort(int port) =>
+    port >= tunnelFallbackPortMin && port <= tunnelFallbackPortMax;
+
+/// 临时端口的尝试顺序：保留段打乱后返回。
+///
+/// 打乱是必要的——同机多路实例配置端口全被占时，若都从 3090 开始抢，第一个
+/// 占走 3090 后其余各要多试一次才拿到 3091；随机起点让它们互不干扰。
+List<int> fallbackPortCandidates({double Function()? random}) {
+  final ports = <int>[
+    for (var port = tunnelFallbackPortMin; port <= tunnelFallbackPortMax; port++)
+      port
+  ];
+  final rnd = random;
+  if (rnd == null) return ports;
+  for (var i = ports.length - 1; i > 0; i--) {
+    final j = (rnd() * (i + 1)).floor().clamp(0, i);
+    final tmp = ports[i];
+    ports[i] = ports[j];
+    ports[j] = tmp;
+  }
+  return ports;
+}
+
 /// 本地转发端口彻底起不来：配置端口被占、临时端口也绑不上。
 ///
 /// 带着"谁占着"的探测结论上抛，界面上才能给出可执行的动作——只说
@@ -24,7 +58,9 @@ class TunnelLocalPortOccupiedException implements Exception {
   final String holder;
 
   @override
-  String toString() => '本地端口 $port 被占用（$holder），临时端口也无法绑定';
+  String toString() =>
+      '本地端口 $port 被占用（$holder），临时端口段 $tunnelFallbackPortMin-'
+      '$tunnelFallbackPortMax 也全部不可用';
 }
 
 /// 隧道故障类别：决定给用户看什么话、要不要立刻打扰用户。
@@ -86,7 +122,8 @@ String tunnelFailureSummary(TunnelFailureKind kind) {
     case TunnelFailureKind.remoteDown:
       return 'SSH 已连通，但云端服务没有应答：请确认远端服务已启动';
     case TunnelFailureKind.localPort:
-      return '本地端口被别的程序占住，临时端口也没能绑上：请在设置里换一个本地端口后点「立即重试」';
+      return '本地端口被别的程序占住，临时端口段（3090-3099）也已用满：'
+          '请在设置里换一个本地端口（勿填 3090-3099）后点「立即重试」';
     case TunnelFailureKind.none:
       return '连接正常';
     case TunnelFailureKind.unknown:

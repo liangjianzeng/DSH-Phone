@@ -2673,7 +2673,7 @@ class _WebViewScreenState extends State<WebViewScreen>
       // 临时端口要如实说出来：用户以为自己在用 3081、实际是 4xxxx，
       // 不说清下次他对着 3081 抓包会一头雾水。
       parts.add(TunnelService.instance.usingFallbackLocalPort
-          ? '127.0.0.1:$port（配置端口被占，本次临时）'
+          ? '127.0.0.1:$port（配置端口被占，临时借用保留段）'
           : '127.0.0.1:$port');
     }
     final since = _tunnel.connectedSince;

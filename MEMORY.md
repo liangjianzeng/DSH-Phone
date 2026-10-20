@@ -147,10 +147,22 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
   两条都不成立：① 手机上查不到是谁占用（Android 无 root 拿不到进程表），
   用户照着提示什么也关不了；② `localPort` 虽被 `isConfigurationFailure` 判成
   配置类，但那条路仍排了个"兜底重试"定时器，于是永远在重试。
-- **修法（`_bindLocalListener` 三步，顺序不能换）**：① 先怀疑自己人——上一轮
+- **绝大多数是"自己人"占的**（用户判断，按此设计）：`_server` 被置空但
+  `close()` 没 await 完 / 抛异常没管，端口挂在无人认领的 `ServerSocket` 上，
+  此后每次重试都在跟自己的残骸抢端口——这时提示用户"关闭其它程序"是误导。
+  于是加了 `_ownedListeners` 登记表 + `_closeListener()`（主隧道三个主动关闭点
+  统一走它），绑定失败先 `_releaseOurStaleListenersOn(port)` 再重试一次。
+  注意 `ServerSocket` **没有 `done` 也没有 `destroy()`**（那是 `Socket` 的）。
+- **修法（`_bindLocalListener` 四步，顺序不能换）**：① 先怀疑自己人——上一轮
   teardown 没走完或并发 connect 时 `_server` 还占着同一个端口，先 close；
-  ② 真被外部占住就 `bind(0)` 用系统临时端口把隧道先跑起来，记
-  `_localPortFallback` 并让界面显示「本次临时」；③ 连临时端口都绑不上才抛
+  ② 清完自己人的残骸再试一次；③ 仍不通就在**保留段 3090–3099** 里随机借一个
+  （`tunnel_policy.dart` 的 `tunnelFallbackPortMin/Max` +
+  `fallbackPortCandidates(random:)`）。**不要退回 `bind(0)`**（用户明确要求）：
+  系统给的 4 万多端口在状态栏看不懂也没法比对，固定段一眼认得出是隧道借的；
+  代价是这个段被征用，**设置页禁止填它**——`_validateLocalPort` 只做红字提示，
+  **`_safeLocalPort()` 必须在保存路径上再挡一次**（本页是自动保存，没有
+  "提交失败"这一步，只在 validator 里挡会把非法值原样写进配置再去绑）；
+  记 `_localPortFallback`，界面显示「临时借用保留段」；④ 连保留段都用满才抛
   `TunnelLocalPortOccupiedException`（带占用探测结论），上层据此**停止自动重试**
   （`isFutileRetryFailure`），把「修改设置 / 立即重试」交给用户。
 - **临时端口的硬前提**：一切访问 `127.0.0.1:<port>` 的地方必须取

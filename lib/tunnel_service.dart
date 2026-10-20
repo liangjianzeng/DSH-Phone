@@ -803,7 +803,7 @@ class TunnelService {
       // 绑定后再确认一次：期间被断开则释放端口，防止端口被本类残留占住，
       // 也避免给一条没人要的会话挂上监听。
       if (_client != client || aborted()) {
-        await server.close();
+        await _closeListener(server);
         throw const TunnelAbortedException();
       }
       _server = server;
@@ -834,10 +834,41 @@ class TunnelService {
     return m.contains('already in use') || m.contains('already bound');
   }
 
+  /// 本进程创建过、**尚未确认关闭**的本地监听。
+  ///
+  /// 存在的唯一理由：端口占用绝大多数是"自己占自己"——`_server` 被置空了，
+  /// 但 `close()` 没 await 完 / 抛异常没管，端口就挂在一个没人认领的
+  /// ServerSocket 对象上；此后每次重试都是与自己的残骸抢端口，于是
+  /// 「请关闭其它占用该端口的程序」永远无解。有了这张表，绑不上时就能
+  /// 先把自己人清掉，而不是甩锅给用户。
+  static final Set<ServerSocket> _ownedListeners = <ServerSocket>{};
+
+  /// 登记"这个监听是我们自己开的"。ServerSocket 既没有 `done` 也没有
+  /// `destroy()`（那是 Socket 的），所以摘除只在我们主动 close 的地方做；
+  /// 万一被别人关掉，表里多留一个条目也无害——再关一次是空操作。
+  void _trackListener(ServerSocket server) => _ownedListeners.add(server);
+
+  /// 关闭本进程持有的监听并从登记表摘除（**同步摘除**，await 期间不让位）。
+  Future<void> _closeListener(ServerSocket server) async {
+    _ownedListeners.remove(server);
+    try {
+      await server.close();
+    } catch (_) {}
+  }
+
+  /// 销毁仍占着 [port] 的**本进程残留**监听。返回是否动过手。
+  Future<bool> _releaseOurStaleListenersOn(int port) async {
+    var touched = false;
+    for (final s in _ownedListeners.toList(growable: false)) {
+      if (s.port != port) continue;
+      touched = true;
+      await _closeListener(s);
+    }
+    return touched;
+  }
+
   /// 谁占着这个端口？Android 无 root 拿不到进程表，只能做**可连通性探测**：
-  /// 能连上 = 有程序正在监听（上一个没释放干净的隧道，或第三方 App）；
-  /// 连不上 = 内核侧残留/半关。给不出进程名，但"有没有人在听"已经足够用户
-  /// 判断该去关 App 还是直接换端口。
+  /// 能连上 = 有程序正在监听（残留隧道或第三方 App）；连不上 = 内核侧残留/半关。
   Future<String> _describeLocalPortHolder(int port) async {
     try {
       final probe = await Socket.connect(InternetAddress.loopbackIPv4, port,
@@ -852,48 +883,78 @@ class TunnelService {
     }
   }
 
-  /// 绑定本地监听端口，**占用时不是一路 rethrow 让用户自己想办法**。
+  /// 绑定本地监听端口：先归位自己人，再让路给现实。
   ///
-  /// 三步，顺序不能换：
-  ///  1. 先怀疑自己人：上一轮 teardown 没走完、或并发 connect 时，`_server`
-  ///     可能还占着同一个端口——这时提示"请关闭其它占用该端口的程序"是句废话，
-  ///     用户在自己的手机上根本找不到那个"程序"。
-  ///  2. 真被外部占住：改用系统分配的临时端口，隧道先通起来。本地端口不是
-  ///     协议约定，值得为了"能用"让步；但一定要记下来并让界面可见。
-  ///  3. 连临时端口都绑不上（极罕见）：抛带占用结论的异常，上层据此停止
-  ///     无意义的自动重试。
+  /// 四步，顺序不能换：
+  ///  1. 活动中的 `_server` 还占着同一个端口 → 先 close（上一轮 teardown
+  ///     未走完 / 并发 connect 就是这种场合）。
+  ///  2. 真被占住 → 先把**本进程遗留**的监听（`_ownedListeners` 里没人认领的
+  ///     残骸）清掉再试一次。端口占用绝大多数是这一步解决的，此时提示用户
+  ///     "关闭其它程序"是在误导。
+  ///  3. 还是不通 → 在**保留段 3090-3099** 里随机挑一个把隧道跑起来。
+  ///     不用 `bind(0)`：系统给的 4 万多端口用户在状态栏看不懂，也不方便比对；
+  ///     固定段一眼认得出是隧道临时换的，代价是设置页不许填这个段。
+  ///  4. 连保留段都用满（同机十条隧道同时全被占，实际极罕见）→ 抛带占用结论
+  ///     的异常，上层据此停止无意义的自动重试。
   Future<ServerSocket> _bindLocalListener(SSHConfig config) async {
+    final port = config.localPort;
+
     final stale = _server;
     if (stale != null) {
       _server = null;
       try {
         await stale.close();
       } catch (_) {}
-      _log('bind', '释放本进程残留的本地监听 :${config.localPort}',
+      _log('bind', '释放本进程在用的本地监听 :$port',
           level: TunnelEventLevel.warn);
     }
+
     try {
-      final server = await ServerSocket.bind(
-          InternetAddress.loopbackIPv4, config.localPort);
+      final server =
+          await ServerSocket.bind(InternetAddress.loopbackIPv4, port);
       _localPortFallback = null;
+      _trackListener(server);
       return server;
     } on SocketException catch (e) {
       if (!_isAddressInUse(e)) rethrow;
-      final holder = await _describeLocalPortHolder(config.localPort);
+    }
+
+    // 2) 自己人的残骸先清掉再试一次
+    if (await _releaseOurStaleListenersOn(port)) {
+      _log('bind', '发现并回收了本进程残留在 :$port 上的监听，重试绑定',
+          level: TunnelEventLevel.warn);
       try {
         final server =
-            await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
-        _localPortFallback = server.port;
-        _log('bind',
-            '本地端口 ${config.localPort} 被占用（$holder），本次改用临时端口 '
-            '127.0.0.1:${server.port}（功能不受影响，建议在设置里永久换个端口）',
-            level: TunnelEventLevel.warn);
+            await ServerSocket.bind(InternetAddress.loopbackIPv4, port);
+        _localPortFallback = null;
+        _trackListener(server);
         return server;
-      } on SocketException catch (e2) {
-        if (!_isAddressInUse(e2)) rethrow;
-        throw TunnelLocalPortOccupiedException(config.localPort, holder);
+      } on SocketException catch (e) {
+        if (!_isAddressInUse(e)) rethrow;
       }
     }
+
+    // 3) 让路：保留段内随机挑一个
+    final holder = await _describeLocalPortHolder(port);
+    for (final candidate in fallbackPortCandidates(random: _rng.nextDouble)) {
+      try {
+        final server =
+            await ServerSocket.bind(InternetAddress.loopbackIPv4, candidate);
+        _localPortFallback = server.port;
+        _trackListener(server);
+        _log('bind',
+            '本地端口 $port 被占用（$holder），本次改用临时端口 '
+            '127.0.0.1:${server.port}（保留段 $tunnelFallbackPortMin-'
+            '$tunnelFallbackPortMax，功能不受影响；建议在设置里永久换个端口）',
+            level: TunnelEventLevel.warn);
+        return server;
+      } on SocketException catch (e) {
+        if (!_isAddressInUse(e)) rethrow;
+      }
+    }
+
+    // 4) 真没辙
+    throw TunnelLocalPortOccupiedException(port, holder);
   }
 
   static bool _neverAborted() => false;
@@ -971,7 +1032,7 @@ class TunnelService {
     final server = _server;
     _server = null;
     _localPortFallback = null;
-    server?.close();
+    if (server != null) unawaited(_closeListener(server));
     _client = null;
     _activeProfileIndex = null;
     _activeConfig = null;
@@ -1201,9 +1262,7 @@ class TunnelService {
     // 恒真把"重试"也挡在守卫外）。必须在任何 await 之前做，别给事件循环让路。
     abortLiveSftpSessions(reason: 'teardown');
     if (server != null) {
-      try {
-        await server.close();
-      } catch (_) {}
+      await _closeListener(server);
     }
     if (client != null) {
       try {

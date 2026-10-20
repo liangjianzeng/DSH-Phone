@@ -7,6 +7,7 @@ import 'asr/default_hotwords.dart';
 import 'config.dart';
 import 'moon_location.dart';
 import 'tunnel_diagnostics_screen.dart';
+import 'tunnel_policy.dart';
 import 'tunnel_service.dart';
 import 'weather_service.dart';
 
@@ -602,6 +603,34 @@ class _SetupScreenState extends State<SetupScreen> {
     return null;
   }
 
+  /// 本地隧道端口专用校验：3090-3099 是隧道在配置端口被占时**自己借用**的
+  /// 临时端口保留段。让用户填这个段会出两种坑：配置端口与临时端口互相抢占，
+  /// 或者用户占掉之后隧道连可借的端口都没了。所以直接拒绝并说明原因。
+  String? _validateLocalPort(String? v) {
+    final basic = _validatePort(v);
+    if (basic != null) return basic;
+    final p = int.tryParse(v ?? '');
+    if (p != null && isReservedFallbackPort(p)) {
+      return '$tunnelFallbackPortMin-$tunnelFallbackPortMax 是隧道临时端口保留段，'
+          '不能设为本地端口（换一个，例如 ${tunnelFallbackPortMin - 9}）';
+    }
+    return null;
+  }
+
+  /// 保存到配置的本地端口。**自动保存没有"提交失败"这一步**，所以非法值必须
+  /// 在这里挡住：否则 3095 会被原样写进配置并真的去绑，然后永远提示"被占用"，
+  /// 用户完全不知道是自己刚填的锅。回落到该实例上一次的有效值。
+  int _safeLocalPort() {
+    final p = int.tryParse(_localPort.text.trim());
+    if (p == null || p < 1 || p > 65535 || isReservedFallbackPort(p)) {
+      final prev = _profileIndex >= 0 && _profileIndex < widget.profiles.length
+          ? widget.profiles[_profileIndex].localPort
+          : 3081;
+      return isReservedFallbackPort(prev) ? 3081 : prev;
+    }
+    return p;
+  }
+
   /// 即时保存实例级监控开关：只写开关字段，不触碰表单其它未保存内容；
   /// 开启时互斥关闭其他实例，并通知父级刷新监控隧道。
   Future<void> _applyInstanceMonitorImmediately(bool on) async {
@@ -640,7 +669,7 @@ class _SetupScreenState extends State<SetupScreen> {
       alias: _alias.text.trim(),
       sshPort: int.tryParse(_sshPort.text.trim()) ?? 22,
       username: _username.text.trim(),
-      localPort: int.tryParse(_localPort.text.trim()) ?? 3081,
+      localPort: _safeLocalPort(),
       mode: _mode,
       remotePort: int.tryParse(_remotePort.text.trim()) ??
           SSHConfig.defaultRemotePort,
@@ -836,10 +865,11 @@ class _SetupScreenState extends State<SetupScreen> {
             keyboardType: TextInputType.number,
             decoration: const InputDecoration(
               labelText: '本地隧道端口',
-              helperText: '默认 3081，DSH 界面将通过 http://127.0.0.1:<端口> 访问',
+              helperText: '默认 3081，DSH 界面将通过 http://127.0.0.1:<端口> 访问；'
+                  '$tunnelFallbackPortMin-$tunnelFallbackPortMax 为隧道临时端口保留段，不可填写',
               border: OutlineInputBorder(),
             ),
-            validator: _validatePort,
+            validator: _validateLocalPort,
             onChanged: (_) => _scheduleAutoSave(),
           ),
           const SizedBox(height: 12),
