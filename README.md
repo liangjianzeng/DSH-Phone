@@ -7,7 +7,7 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - **开源地址**：https://github.com/liangjianzeng/DSH-Phone
 - **当前版本**：v0.2.3（build 19）
 - **安装包**：
-  - **当前版本 v0.2.3 直接下载**：<https://github.com/liangjianzeng/DSH-Phone/releases/download/v0.2.3/app-release-v0.2.3.apk> —— 23,631,486 bytes（≈22.54 MiB），release 签名 `CN=TongYiLite`，sha256 `f624e227e73be6fbf92bb74771617e2dedefe40d1ae837eab67f5bd36dc71dbb`；覆盖安装即可，数据保留
+  - **当前版本 v0.2.3 直接下载**：<https://github.com/liangjianzeng/DSH-Phone/releases/download/v0.2.3/app-release-v0.2.3.apk> —— 23,631,615 bytes（≈22.54 MiB），release 签名 `CN=TongYiLite`，sha256 `5132995ce5bf69f275d38ae76aed009f76bce7bf3912e78bef9e9c9cc99a0cde`；覆盖安装即可，数据保留
   - **备用直链**（Releases 拉不动时用仓库内副本）：<https://github.com/liangjianzeng/DSH-Phone/raw/v0.2.3/apk/app-release-v0.2.3.apk>
   - **APK 目录**：<https://github.com/liangjianzeng/DSH-Phone/tree/main/apk>　｜　**Releases**：<https://github.com/liangjianzeng/DSH-Phone/releases>
   - 自己编译：`./tool/build_apk.sh`，产物 `build/app/outputs/flutter-apk/app-release.apk`，结尾自动打印绝对地址 / 大小 / sha256 / 签名

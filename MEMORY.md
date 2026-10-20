@@ -105,6 +105,16 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 
 ---
 
+## 自动事件不许弹 SnackBar（2026-10-20 用户定的界面规矩）
+
+- 自动重连成功原来弹白底「连接已恢复」，用户嫌显眼并要求屏蔽。理由要记牢：
+  **顶栏连接状态本来就是实时的**，恢复瞬间页面还会自己补载，弹条只是抢焦点。
+- 更隐蔽的一条：`_snack()` 里带 `clearSnackBars()`，所以**自动事件弹一条会把用户
+  正在看的别的提示一起抹掉**（鉴权重试、语音就绪…）。自动事件不该有这个权力。
+- 判据：**用户主动做的动作**才给即时 SnackBar（点顶栏探活 → 「链路正常，已刷新」、
+  切模式 → 「已切换到 X 模式」）；**系统自己发生的事**只更新状态条/横幅，不弹条。
+
+
 ## GitHub 页「访问不通、怎么刷都不出新」的两条根因（2026-10-20）
 
 - **缓存策略抄错了对象**：`github_screen.dart` 用的是 `CacheMode.LOAD_CACHE_ELSE_NETWORK`
@@ -232,7 +242,7 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
   比对指纹（与 `tool/build_apk.sh` 的 `EXPECTED_FP` 同源，换证书两处一起改），不符禁止上传；
   asset 改名 `app-release-v<tag>.apk`，摘要里给大小与 sha256。
 - **v0.2.3 已正式发布（2026-10-20 19:5x）**：Release v0.2.3 = latest，asset
-  `app-release-v0.2.3.apk`（23,631,486 bytes，直链回读 HTTP 200 且字节数一致），
+  `app-release-v0.2.3.apk`（23,631,615 bytes，sha256 `5132995ce5bf69f275d38ae76aed009f76bce7bf3912e78bef9e9c9cc99a0cde`，直链回读 HTTP 200 且字节数一致；同版本重传过一次：首版 23,631,486 / `f624e227…` 少了「去掉连接已恢复 SnackBar」那条改动），
   **v0.2.0 那个 173 MB 的 release 已删除**（git tag 保留）。仓库内 `apk/` 副本保留作
   **备用直链**（`/raw/v<版本>/apk/...`，国内拉 Release asset 偶尔不稳）。
   上传 asset 的两个坑（`tool/publish_release.sh` 已修，别再踩）：
