@@ -890,7 +890,11 @@ class _WebViewScreenState extends State<WebViewScreen>
       }
     });
     if (s.healthy && !wasHealthy) {
-      _snackThrottled('连接已恢复');
+      // 这里**不放 SnackBar**（原来自动重连成功会弹白底「连接已恢复」，用户反馈
+      // 太抢眼）：顶栏的连接状态本来就是活的，恢复瞬间页面还会自己补载，弹条只是
+      // 抢焦点；而且 `_snack` 里带 clearSnackBars()，自动事件弹出的那一瞬间会把
+      // 用户正在看的别的提示一起抹掉。**主动**探活（点顶栏状态）仍回「链路正常，
+      // 已刷新」——那是用户自己按的，需要即时回应。
       // 每次链路恢复都重新发放页面重试预算。不在 `_retryLoad()` 里清零：那样
       // `_schedulePageRetry` 刚加完就会归零，3 次上限直接失效；而不清零的后果是
       // 本会话早先烧完 3 次之后，断线重连的补载一旦失败就再无自动重试。
