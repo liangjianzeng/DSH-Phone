@@ -33,6 +33,13 @@
 
 **发版（打 tag 那类）还多两件**，没做完不算交付完成：
 
+-1. **Release asset 上传 + 仓库内副本双份**（2026-10-20 定）：主分发用 GitHub Release
+   （`GITHUB_TOKEN=<token> ./tool/publish_release.sh v<版本> --notes-file <说明> --delete <旧版本>`，
+   它会在上传前验签名指纹、上传后回读直链确认 HTTP 200 且字节数一致）；同时在仓库留一份
+   `apk/app-release-v<版本>.apk` 作备用直链（国内拉 Release asset 有时不稳）。两条直链都要写进 README。
+   踩过的两个坑：asset 上传必须 `--http1.1`（HTTP/2 传 23 MB 会被边缘节点 PROTOCOL_ERROR 掐断）、
+   上传端点是 `https://uploads.github.com/repos/<repo>/releases/<id>/assets`（不是 `api.github.com/.../uploads/…`，那是 404）。
+
 0. **APK 本体提交进仓库**：`apk/app-release-v<版本>.apk`（`.gitignore` 只放行这个命名），
    并把 README（md + html）「安装包」那行的**直链、大小、sha256** 改成新版本 ——
    下载走 `https://github.com/liangjianzeng/DSH-Phone/raw/v<版本>/apk/app-release-v<版本>.apk`，

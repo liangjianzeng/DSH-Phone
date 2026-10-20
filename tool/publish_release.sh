@@ -121,10 +121,15 @@ for a in json.load(open("/tmp/rel_assets.json")):
 PY
 
 echo "③ 上传 $ASSET（$SIZE bytes）…"
-curl -sS --fail-with-body -o /tmp/asset_pub.json \
+# **必须 --http1.1**：23 MB 的二进制走 HTTP/2 上传时 GitHub 边缘节点会
+# "HTTP/2 stream was not closed cleanly: PROTOCOL_ERROR"（curl 92）掐断；
+# 换 HTTP/1.1 后稳定，再配 3 次重试兜网络抖动。
+curl -sS --fail-with-body --http1.1 --retry 3 --retry-all-errors \
+  -o /tmp/asset_pub.json \
   -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
   -H "Content-Type: $CT" \
-  -X POST "$API/uploads/releases/$id/assets?name=$ASSET" --data-binary "@$APK" >/dev/null
+  -X POST "https://uploads.github.com/repos/$REPO/releases/$id/assets?name=$ASSET" \
+    --data-binary "@$APK" >/dev/null
 url="$(python3 -c 'import json;print(json.load(open("/tmp/asset_pub.json"))["browser_download_url"])')"
 
 echo "④ 验证公网直链…"
