@@ -8,7 +8,7 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - **当前版本**：v0.2.3（build 19）
 - **安装包**：
   - **当前版本 v0.2.3 直接下载**：<https://github.com/liangjianzeng/DSH-Phone/releases/download/v0.2.3/app-release-v0.2.3.apk> —— 23,631,615 bytes（≈22.54 MiB），release 签名 `CN=TongYiLite`，sha256 `5132995ce5bf69f275d38ae76aed009f76bce7bf3912e78bef9e9c9cc99a0cde`；覆盖安装即可，数据保留
-  - **备用直链**（Releases 拉不动时用仓库内副本）：<https://github.com/liangjianzeng/DSH-Phone/raw/v0.2.3/apk/app-release-v0.2.3.apk>
+  - **仓库内镜像**（同版本同 sha256，走 raw CDN 时可能有几分钟缓存时差，故不作主链宣传）：`apk/app-release-v0.2.3.apk`，见 <https://github.com/liangjianzeng/DSH-Phone/tree/main/apk>
   - **APK 目录**：<https://github.com/liangjianzeng/DSH-Phone/tree/main/apk>　｜　**Releases**：<https://github.com/liangjianzeng/DSH-Phone/releases>
   - 自己编译：`./tool/build_apk.sh`，产物 `build/app/outputs/flutter-apk/app-release.apk`，结尾自动打印绝对地址 / 大小 / sha256 / 签名
   - 发新版：`GITHUB_TOKEN=<token> ./tool/publish_release.sh v<版本> --notes-file <说明> --delete <旧版本>` 上传 Release，再把 APK 提交到 `apk/app-release-v<版本>.apk` 并更新上面两条直链（`tool/build_apk.sh` 结尾会提醒）
