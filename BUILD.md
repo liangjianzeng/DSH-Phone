@@ -12,6 +12,30 @@
 - `dartssh2` 为本地 fork（`third_party/dartssh2`），经 `pubspec.yaml` 的 `dependency_overrides` 引入
 - 产物：`build/app/outputs/flutter-apk/app-release.apk`；发版时上传 **GitHub Releases**（不再提交进 Git 仓库，`apk/` 已被 `.gitignore` 忽略）
 
+## 打完包必须交付（规范，2026-10-20 定）
+
+**每次打完包，回复里必须给出下面这一整块**——这是固定要求，不用等对方来要：
+
+| 项 | 要求 |
+| --- | --- |
+| **绝对地址** | 必须是绝对路径（`/home/.../build/app/outputs/flutter-apk/app-release.apk`）。写 `build/...` 这种相对路径对装机方没有意义，他在另一台机器上按这个路径找不到文件 |
+| **字节数** | `ls -l` 的真实值，顺手换算 MiB（用来一眼判断"22MB 是不是被截断"，见 MEMORY 的体积拆解） |
+| **sha256** | `sha256sum` 全量哈希，装机方比对用；别只给前几位 |
+| **签名 + 构建时间** | `CN=TongYiLite…`（`tool/build_apk.sh` 的签名验收行）与产物时间 |
+| **对应提交** | `git rev-parse --short HEAD`，并注明代码树是否干净——**包必须等于已提交树**，否则"装了不对"根本无从复现 |
+
+`tool/build_apk.sh` 结尾会自动打印这块（含上面的脏树告警与抽查命令），**直接原样贴出**，不要手抄、不要把路径缩写成相对路径。
+
+装机方抽查"这个包到底含不含我这轮的改动"（中文串在 Dart 快照里按 **UTF-16** 存，直接 `grep` UTF-8 会误报缺失）：
+
+```bash
+unzip -oq <apk 绝对地址> lib/arm64-v8a/libapp.so -d /tmp/x
+python3 -c "d=open('/tmp/x/lib/arm64-v8a/libapp.so','rb').read(); print('某条新文案' in d.decode('utf-16-le','ignore'))"
+```
+
+构建前请先确认工作区干净：`git status --porcelain lib tool .github test pubspec.yaml third_party` 为空。
+同一条规范也记在 [`MEMORY.md`](MEMORY.md) 的「APK 打包与完整性核验」，两处若不一致以本文为准。
+
 ## 版本记录
 
 - **v0.2.1（build 17）**：DSH ⇄ Zcode 双服务模式 + 语音/相机/天气体验与稳定性。

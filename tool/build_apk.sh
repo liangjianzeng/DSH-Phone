@@ -325,6 +325,38 @@ if [[ -n "$APKSIGNER" ]]; then
   fi
 fi
 
+# ─────────────────────────────────────────────────────────────
+# 交付规范（2026-10-20 用户定的固定要求）：每次打完包，回复里必须给出这个块。
+# 由脚本自己打印，靠人记必然漏项——尤其"绝对地址"这一条：写成 build/... 这种
+# 相对路径对需求方没有意义，他在另一台机器上按这个路径找不到文件。
+echo
+echo "━━━ 交付信息（请原样贴给需求方）━━━"
+APK_ABS="$PROJ_ROOT/$APK"
+APK_BYTES="$(stat -c %s "$APK" 2>/dev/null || wc -c <"$APK" | tr -d ' ')"
+APK_MIB="$(awk -v b="$APK_BYTES" 'BEGIN{printf "%.2f", b/1048576}')"
+echo "绝对地址：$APK_ABS"
+echo "大　　小：$APK_BYTES bytes（≈${APK_MIB} MiB）"
+if command -v sha256sum >/dev/null 2>&1; then
+  echo "sha256　：$(sha256sum "$APK" | awk '{print $1}')"
+fi
+echo "构建时间：$(stat -c %y "$APK" 2>/dev/null | cut -d. -f1)"
+[[ -n "${dn:-}" ]] && echo "签　　名：$dn"
+if git -C "$PROJ_ROOT" rev-parse --short HEAD >/dev/null 2>&1; then
+  HEAD_SHORT="$(git -C "$PROJ_ROOT" rev-parse --short HEAD)"
+  DIRTY="$(git -C "$PROJ_ROOT" status --porcelain lib tool .github test pubspec.yaml third_party 2>/dev/null)"
+  if [[ -z "$DIRTY" ]]; then
+    echo "对应提交：$HEAD_SHORT（代码树干净，包=已提交树）"
+  else
+    echo "对应提交：$HEAD_SHORT ⚠ 有未提交的代码改动，包与提交不一致："
+    echo "$DIRTY" | sed 's/^/           /'
+  fi
+fi
+echo "提示　　：装机方比对 sha256；抽查新增文案用"
+echo "           unzip -oq \"$APK_ABS\" lib/arm64-v8a/libapp.so -d /tmp/x"
+echo "           然后 python3 判 '\"文案\"' in open('/tmp/x/lib/arm64-v8a/libapp.so','rb').read().decode('utf-16-le','ignore')"
+echo "           （中文串在 Dart 快照里按 UTF-16 存，grep UTF-8 会误报缺失）"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
 if [[ "$RUN_INSTALL" == 1 ]]; then
   if command -v adb >/dev/null 2>&1 && adb get-state >/dev/null 2>&1; then
     adb install -r "$APK"

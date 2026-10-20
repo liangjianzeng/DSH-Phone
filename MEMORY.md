@@ -92,7 +92,8 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
   - 拆包算大小：`Expand-Archive` 只认 `.zip` 后缀，需先 `Copy-Item .apk .zip` 再拆；`Get-ChildItem -Recurse` 算 `lib/` 总大小，与 APK 压缩后大小对得上即完整。
   - **受限语言模式挡 `[System.IO.Compression.ZipArchive]` 等 .NET 静态调用**，用 cmdlet/CLI（`Expand-Archive` / `jar`）而非 .NET 类型。
 - 改完代码先 `flutter analyze` 确认无报错再构建（dart 分析器走 `C:\src\flutter\bin\cache\dart-sdk\bin\dart.exe`）。
-- **打完包，回复里必须交付这四项（2026-10-20 用户定的固定要求，默认执行、不再等提醒）**：
+- **打完包，回复里必须交付这四项（2026-10-20 用户定的固定要求，默认执行、不再等提醒）**
+  （正式规范见 [`BUILD.md`](BUILD.md) 的「打完包必须交付」；`tool/build_apk.sh` 结尾已自动打印这块，直接原样贴出，别手抄、别把路径缩写成相对路径）：
   1. **绝对路径**（不写 `build/...` 这种相对缩写）：`/home/jianzengliang/MyWork/DSH-Phone/build/app/outputs/flutter-apk/app-release.apk`
   2. **字节数**（`ls -l` 真实值，顺手换算 MiB）；
   3. **`sha256sum` 全量哈希**（装机方比对用，别只给前几位）；
