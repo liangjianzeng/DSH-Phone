@@ -293,5 +293,13 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 - **SVG 不能进"图片"分支**：`Image.memory` 不认 SVG，只会得到"图片解码失败"；
   `.svg` 走文本读取 + HTML 渲染。`isImageSuffix` 因此刻意不含 `.svg`。
 - **PDF 保持下载**：Android WebView 不内嵌渲染 PDF，硬塞只得到空白页。
-- **测试基线**：`flutter test` 现为 102 例（新增 artifact_render_html 13 例、
-  识别/下载 11 例）；`flutter analyze` 允许且仅有 third_party 的 10 条 info。
+- **测试基线**：`flutter test` 现为 **112 例**（本轮新增 artifact_render_html 13 例、
+  查看器布局回归 9 例、识别/下载 11 例）；`flutter analyze` 允许且仅有 third_party 的 10 条 info。
+- **JS 桥是 analyze/test 的盲区**：注入脚本写在 Dart 字符串里，少个括号、分支不 `send`
+  只在真机点击时暴露成"点了没反应"。`tool/check_bridges_js.mjs`（已入 CI）用假 DOM 跑
+  点击分发，断言 `?token=` 后缀、file 分支带 dirs、fetch 失败带原因、含空格路径、
+  `.so.N` 归资源、composer 区放行。**改桥脚本必须先过它**。
+- **顶栏宽度是分配问题不是字号问题**：leading + 6 个图标把 360dp 吃光，标题只剩几像素
+  （真机截图就是"文…"）。栏上只留 3 个高频动作 + ⋯ 菜单，标题显示文件名并支持
+  长按复制「文件名 + 路径 + 链接」。查看器要报错就得知道自己在读哪条路——
+  `ArtifactViewerScreen.path` 就是为此而加（此前它根本不知道自己读的是哪条路径）。
