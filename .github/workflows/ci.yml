@@ -48,7 +48,10 @@ jobs:
         shell: bash
         run: |
           set +e
-          flutter analyze --no-pub | tee /tmp/analyze.log
+          # `flutter analyze` 默认把 **info 也当致命**（实测 exit=1）。Flutter 一升级
+          # 就冒出 deprecation info（如新版 Radio→RadioGroup），代码没动 CI 也全红。
+          # 门禁只卡 error/warning；info 由下一步汇总展示，不静默丢弃。
+          flutter analyze --no-pub --no-fatal-infos | tee /tmp/analyze.log
           code=${PIPESTATUS[0]}
           set -e
           if [ "$code" -ne 0 ]; then
@@ -58,13 +61,34 @@ jobs:
             grep -E " • " /tmp/analyze.log | sed 's/%/%25/g' | head -40 \
               | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
             {
-              echo '### `flutter analyze` 失败'
+              echo '### `flutter analyze` 失败（error / warning）'
               echo '```'
               cat /tmp/analyze.log
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
           exit "$code"
+
+      - name: 弃用与提示扫描（不卡门禁，只汇总）
+        if: always()
+        shell: bash
+        run: |
+          # info 级（新版 Flutter 的 deprecation、第三方提示）不拦合并，但必须
+          # 看得见：贴进 Job 摘要，等真正升级到该 API 可用时再统一处理。
+          set +e
+          flutter analyze --no-pub --no-fatal-infos > /tmp/infos.log 2>&1
+          set -e
+          if grep -q "info •" /tmp/infos.log; then
+            {
+              echo '### 提示级问题（不卡门禁）'
+              echo '```'
+              grep "info •" /tmp/infos.log | head -60
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '### 提示级问题：无' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
 
       - name: 单元测试
         shell: bash
