@@ -98,8 +98,10 @@ jobs:
           code=${PIPESTATUS[0]}
           set -e
           if [ "$code" -ne 0 ]; then
-            grep -E "\[E\]|Expected:|Actual:|Which:" /tmp/test.log \
-              | sed 's/%/%25/g' | head -40 \
+            # "loading xxx_test.dart [E]" 只说明这个文件没编译过，真正的原因在
+            # 紧跟其后的 Error 行里——只注解 [E] 等于注解了个现象。
+            grep -E "\[E\]|Expected:|Actual:|Which:|Error|error:|Couldn't|Failed to|compilation failed" \
+              /tmp/test.log | sed 's/%/%25/g' | head -40 \
               | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
             {
               echo '### `flutter test` 失败（末 120 行）'
