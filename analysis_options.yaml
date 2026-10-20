@@ -16,6 +16,11 @@ analyzer:
     - windows/**
     - macos/**
     - linux/**
+    # vendored fork 的上游代码不参与主门禁：它们在 Flutter 升级后带来的
+    # deprecation 曾把本仓库 CI 拖成连续两周全红（门禁形同虚设）。
+    # 底线仍在：ci.yml 里对 third_party/dartssh2 与 flutter_foreground_task
+    # 各跑一道 `dart analyze`，只卡 error/warning。
+    - third_party/**
 include: package:flutter_lints/flutter.yaml
 
 linter:

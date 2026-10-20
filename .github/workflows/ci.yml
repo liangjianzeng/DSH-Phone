@@ -22,8 +22,11 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
+          # 矩阵里的 'stable' 是**通道名**不是版本号：塞进 flutter-version 会让
+          # action 去按版本号解析发布物，上游元数据一变就挂在 setup 阶段——
+          # 本仓库 CI 连续两周全红、日志里连一行 analyze 输出都没有，就是这个坑。
           channel: stable
-          flutter-version: ${{ matrix.flutter }}
+          flutter-version: ${{ matrix.flutter == 'stable' && '' || matrix.flutter }}
           cache: true
 
       - name: pub get
@@ -33,10 +36,57 @@ jobs:
         run: node tool/check_bridges_js.mjs
 
       - name: 静态分析
-        run: flutter analyze --no-pub
+        shell: bash
+        run: |
+          set +e
+          flutter analyze --no-pub | tee /tmp/analyze.log
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ "$code" -ne 0 ]; then
+            # 匿名取不到 Actions 日志（/actions/jobs/{id}/logs 返回 403）：
+            # 红了自己却看不到原因，等于没有门禁。把每条问题写成 ::error::
+            # 注解，不登录也能用 /check-runs/{id}/annotations 读到。
+            grep -E " • " /tmp/analyze.log | sed 's/%/%25/g' | head -40 \
+              | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+            {
+              echo '### `flutter analyze` 失败'
+              echo '```'
+              cat /tmp/analyze.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$code"
 
       - name: 单元测试
-        run: flutter test --no-pub
+        shell: bash
+        run: |
+          set +e
+          flutter test --no-pub --reporter expanded | tee /tmp/test.log
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ "$code" -ne 0 ]; then
+            grep -E "\[E\]|Expected:|Actual:|Which:" /tmp/test.log \
+              | sed 's/%/%25/g' | head -40 \
+              | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+            {
+              echo '### `flutter test` 失败（末 120 行）'
+              echo '```'
+              tail -120 /tmp/test.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$code"
+
+      - name: 第三方 fork 门禁（只卡 error/warning，info 交给人工）
+        shell: bash
+        run: |
+          # 根 analyze 已排除 third_party/**：vendored 上游代码的 deprecation
+          # 不该拖死主门禁（本仓库曾因此长期全红）。这里单独立一道只卡
+          # error/warning 的底线，info 级由 code review 与上游同步时处理。
+          set -e
+          for p in third_party/dartssh2 third_party/flutter_foreground_task; do
+            dart analyze "$p"
+          done
 
   build-apk:
     name: 构建 release APK（发版）
@@ -50,7 +100,6 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: 'stable'
           cache: true
 
       - name: pub get
