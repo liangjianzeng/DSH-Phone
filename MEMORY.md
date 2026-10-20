@@ -231,6 +231,16 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
   secret（`ANDROID_KEYSTORE_BASE64`、`ANDROID_KEY_PROPERTIES_BASE64`）；上传前用 apksigner
   比对指纹（与 `tool/build_apk.sh` 的 `EXPECTED_FP` 同源，换证书两处一起改），不符禁止上传；
   asset 改名 `app-release-v<tag>.apk`，摘要里给大小与 sha256。
+- **v0.2.3 已正式发布（2026-10-20 19:5x）**：Release v0.2.3 = latest，asset
+  `app-release-v0.2.3.apk`（23,631,486 bytes，直链回读 HTTP 200 且字节数一致），
+  **v0.2.0 那个 173 MB 的 release 已删除**（git tag 保留）。仓库内 `apk/` 副本保留作
+  **备用直链**（`/raw/v<版本>/apk/...`，国内拉 Release asset 偶尔不稳）。
+  上传 asset 的两个坑（`tool/publish_release.sh` 已修，别再踩）：
+  ① **必须 `--http1.1`** —— HTTP/2 传 23 MB 会被 GitHub 边缘节点以
+  `PROTOCOL_ERROR (curl 92)` 掐断；② 上传端点是
+  `https://uploads.github.com/repos/<repo>/releases/<id>/assets?name=…`，
+  拼成 `api.github.com/repos/<repo>/uploads/…` 会 404。
+  令牌放在 `~/.config/dsh-gh/pat`（0600，fine-grained Contents:write），**不要**贴进仓库或日志。
 - **正式包分发现在走仓库 raw（2026-10-20 用户拍板）**：APK 提交进 `apk/app-release-v<版本>.apk`
   （`.gitignore` 用 `apk/*` + `!apk/app-release-v*.apk`，只放行这个命名），下载直链绑 tag：
   `https://github.com/liangjianzeng/DSH-Phone/raw/v<版本>/apk/app-release-v<版本>.apk`。
