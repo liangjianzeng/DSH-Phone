@@ -33,6 +33,12 @@
 
 **发版（打 tag 那类）还多两件**，没做完不算交付完成：
 
+0. **APK 本体提交进仓库**：`apk/app-release-v<版本>.apk`（`.gitignore` 只放行这个命名），
+   并把 README（md + html）「安装包」那行的**直链、大小、sha256** 改成新版本 ——
+   下载走 `https://github.com/liangjianzeng/DSH-Phone/raw/v<版本>/apk/app-release-v<版本>.apk`，
+   绑定 tag，永不变动。**这是当前主分发路径**（本机到 github.com 网页主机不通、
+   设备码令牌又没有 `Contents:write`，Release asset 传不上去）。
+
 1. **上传 GitHub Releases**：`git tag v<版本> && git push origin v<版本>` 触发 CI 的
    `build-apk` job 构建并上传（asset 名 `app-release-v<版本>.apk`，job 会校验签名指纹，
    与 `CN=TongYiLite` 不符直接失败）。证书不入库，需先在仓库 Settings → Secrets 配

@@ -231,6 +231,15 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
   secret（`ANDROID_KEYSTORE_BASE64`、`ANDROID_KEY_PROPERTIES_BASE64`）；上传前用 apksigner
   比对指纹（与 `tool/build_apk.sh` 的 `EXPECTED_FP` 同源，换证书两处一起改），不符禁止上传；
   asset 改名 `app-release-v<tag>.apk`，摘要里给大小与 sha256。
+- **正式包分发现在走仓库 raw（2026-10-20 用户拍板）**：APK 提交进 `apk/app-release-v<版本>.apk`
+  （`.gitignore` 用 `apk/*` + `!apk/app-release-v*.apk`，只放行这个命名），下载直链绑 tag：
+  `https://github.com/liangjianzeng/DSH-Phone/raw/v<版本>/apk/app-release-v<版本>.apk`。
+  为什么不走 GitHub Release：① 本机到 **github.com（网页主机）不通**（curl 超时），只有
+  api.github.com / uploads.github.com 通，设备码授权因此很脆；② 设备码拿到的是 **GitHub App
+  令牌**，建 release 直接 `Resource not accessible by integration`（没有 `Contents:write`），
+  要它就得用户手发 fine-grained PAT；③ SSH 私钥只能 git push，**Releases 是纯 API 功能，
+  SSH 里没有这个动作**，别指望"有仓库密钥就能发 release"。CI 那条路（证书 Secrets +
+  `GITHUB_TOKEN`）仍在，配好后可用 `tool/publish_release.sh` 手动补 Release。
 - **发版闭环（写进 BUILD.md 交付规范，`tool/build_apk.sh` 会主动提醒）**：打完 release 包
   必须 ① 推 tag 让 CI 上传 Releases，② 回 README.md/README.html 同步「安装包」的最新
   正式版说明（版本号、大小、sha256、asset 名）。只发本地 APK 不改 README 视为发版未完成。

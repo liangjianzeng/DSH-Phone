@@ -52,7 +52,11 @@ crash_startup.txt
 test_artifacts/
 
 # 构建产物 APK（历史版本请上传 GitHub Releases，不提交进 Git）
-apk/
+# 发版 APK **提交进仓库**（apk/app-release-v<版本>.apk），用 raw 直链分发；
+# 本地临时包与旧的 app-release.apk 仍不入库。
+apk/*
+!apk/app-release-v*.apk
+
 
 # 签名密钥（含密码，绝不提交）
 /android/key.properties

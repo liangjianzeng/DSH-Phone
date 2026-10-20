@@ -7,10 +7,10 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - **开源地址**：https://github.com/liangjianzeng/DSH-Phone
 - **当前版本**：v0.2.3（build 19）
 - **安装包**：
-  - **当前版本 v0.2.3 直接下载**：<https://github.com/liangjianzeng/DSH-Phone/releases/download/v0.2.3/app-release-v0.2.3.apk> —— 23,631,486 bytes（≈22.54 MiB），release 签名 `CN=TongYiLite`，sha256 `f624e227e73be6fbf92bb74771617e2dedefe40d1ae837eab67f5bd36dc71dbb`
-  - **所有历史版本**：<https://github.com/liangjianzeng/DSH-Phone/releases>（仓库不提交 APK 二进制）
+  - **当前版本 v0.2.3 直接下载**：<https://github.com/liangjianzeng/DSH-Phone/raw/v0.2.3/apk/app-release-v0.2.3.apk> —— 23,631,486 bytes（≈22.54 MiB），release 签名 `CN=TongYiLite`，sha256 `f624e227e73be6fbf92bb74771617e2dedefe40d1ae837eab67f5bd36dc71dbb`；覆盖安装即可，数据保留
+  - **APK 目录**：<https://github.com/liangjianzeng/DSH-Phone/tree/main/apk>　｜　**Releases**：<https://github.com/liangjianzeng/DSH-Phone/releases>
   - 自己编译：`./tool/build_apk.sh`，产物 `build/app/outputs/flutter-apk/app-release.apk`，结尾自动打印绝对地址 / 大小 / sha256 / 签名
-  - 挂新版：`GITHUB_TOKEN=<token> ./tool/publish_release.sh v<版本>`（验签后上传并自检直链可达）
+  - 发新版：APK 提交到 `apk/app-release-v<版本>.apk` → 打 tag → 更新本行直链（`tool/build_apk.sh` 结尾会提醒）；GitHub Release 那条路需要 `Contents:write` 的 token，用 `GITHUB_TOKEN=<token> ./tool/publish_release.sh v<版本>` 传
 
 <!-- 发版检查清单：1) pubspec.yaml 的 version（唯一版本来源，构建 versionName/versionCode）；2) 同步下方「当前版本」；3) lib/config.dart 的 fallbackAppVersion 仅作读取失败兜底，正常 release 自动读取构建版本无需改；4) 打 tag（v*）触发 CI 的 build-apk job 构建并上传 Releases；5) 上传成功后必须回到本文件核对「安装包」的最新正式版说明（版本号、大小、sha256、asset 名），未同步视为发版未完成——规范见 BUILD.md「打完包必须交付」。 -->
 
