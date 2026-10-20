@@ -192,12 +192,18 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
   - 落地：`gen_snapshot` 位置换成薄包装（真身改名 `gen_snapshot.bin`），有 FEX 走 FEX、没有则退回 binfmt。只动这一个文件，**不改系统 binfmt**（amd64 容器仍依赖 qemu）。
   - aapt2 / NDK clang 用 qemu 就够，不需要 FEX。
 - **验证过的成功路径**：`git worktree` 干净检出 HEAD 后 `tool/build_apk.sh --fix-artifacts` → `✓ Built build/app/outputs/flutter-apk/app-release.apk (23.4MB)`，约 6 分钟；抽出的 `libapp.so` 是真 arm64 AOT（`file` 报 ARM aarch64，`_kDartIsolateSnapshotInstructions` 在位）。
-- **GitHub Releases 现状与三个坑（2026-10-20 查）**：仓库只有 **v0.2.0** 一个 release，
-  asset 是 **181,786,477 bytes（173 MB）的 debug 签名包**——不是发版包，别拿它升级线上版。
-  三个独立故障：① `on: push` 只写了 `branches: [main]`，**tag push 根本不触发 workflow**，
-  所以"有 tag 才跑"的 build-apk 从未执行，v0.2.1/v0.2.2 没有 asset；② 证书被 `.gitignore`
-  排除（`android/key.jks`、`key.properties` 只在本机），CI 里没有证书 → Gradle **静默回退
-  debug 签名**；③ asset 名固定 `app-release.apk` 不带版本号，多版本混在一起分不清。
+- **GitHub Releases 现状（2026-10-20 实测，别再用体积推断签名）**：仓库只有 **v0.2.0**
+  一个 release，`apksigner` 实测 **签名正确**：`CN=TongYiLite, OU=Dev, O=DGXSpark…`、
+  SHA-256 指纹 `fbbe1b6c…` 与本机一致；**173 MB（181,786,477 bytes）的原因是瘦身前打满
+  四架构**（`aapt2` 报 native-code 含 armeabi-v7a/x86/x86_64），v0.2.2 起只打 arm64-v8a
+  才降到 23 MB。我曾把体积当成"debug 签名产物"写进 README，**是错的，已纠正**——
+  判签名只要 10 秒：`apksigner verify --print-certs <apk>`。
+- **正式包历史上是手工上传的**：证书**从未入库**（`android/key.jks`、`key.properties`
+  自 v0.1.5 即被 .gitignore 排除，`git log --` 查不到任何提交记录）。真正的三个缺口：
+  ① `on: push` 只写了 `branches: [main]`，**tag push 根本不触发 workflow**，"有 tag 才跑"
+  的 build-apk 因此从未执行；② CI 里本来就没有证书，若真去构建会**静默回退 debug 签名**
+  （这个风险是 Gradle 行为，历史上没发生只因为没人用 CI 发版）；③ asset 名固定
+  `app-release.apk` 不带版本号。
   现在：workflow 加 `tags: ['v*']`；缺 Secrets 时 job **直接失败**并在摘要里写出该配哪两个
   secret（`ANDROID_KEYSTORE_BASE64`、`ANDROID_KEY_PROPERTIES_BASE64`）；上传前用 apksigner
   比对指纹（与 `tool/build_apk.sh` 的 `EXPECTED_FP` 同源，换证书两处一起改），不符禁止上传；

@@ -39,9 +39,13 @@
    `ANDROID_KEYSTORE_BASE64` 与 `ANDROID_KEY_PROPERTIES_BASE64`（`base64 -w0 android/key.jks`
    与 `base64 -w0 android/key.properties` 的输出）；**没配就发不出去，这是有意的**——
    宁可失败也不要发一个静默回退 debug 签名的包，那种包不能覆盖安装线上正式版。
-   历史教训：Releases 里 v0.2.0 那个 173 MB 的 asset 就是缺证书时的 debug 产物；
-   而且 `on: push` 只写了 `branches` 没写 `tags`，导致 tag push 根本不触发 workflow，
-   v0.2.1/v0.2.2 因此从未有过 asset。
+   现状（2026-10-20 实测，别再凭体积猜）：Releases 里唯一的包 `v0.2.0` **签名是正确的**
+   （`apksigner` 读出 `CN=TongYiLite`、指纹与本机一致），173 MB 是**瘦身前打满四架构**
+   （arm64-v7a/x86/x86_64）造成的，与签名方式无关；它是**手工上传**的——证书从未入库，
+   而 `on: push` 当时只写了 `branches` 没写 `tags`，tag push 根本不触发 workflow，
+   所以 v0.2.1/v0.2.2/v0.2.3 从未有过 CI 产出的 asset。两条发版路线并存：**手工发版**
+   （打包机签好名 → 网页或 `gh release upload` 上传，历史沿用）与 **CI 发版**
+   （配 Secrets 后重跑 job）。
 2. **同步 README 的下载信息**：`README.md` 与 `README.html` 顶部「安装包」里的
    最新正式版说明（版本号、大小、sha256、asset 名）必须与新 Release 一致。
    `tool/build_apk.sh` 结尾的「交付信息」块会把这两件事直接列出来提醒。

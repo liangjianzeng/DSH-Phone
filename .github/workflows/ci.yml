@@ -71,7 +71,7 @@ jobs:
       # 证书不入库（.gitignore 排除 android/key.properties 与 key.jks），只能走
       # Secrets。缺证书时 Gradle 会**静默回退 debug 签名**：能装能跑，但不能覆盖
       # 安装线上正式版——所以这里宁可失败，也不要把一个伪装成 release 的 debug 包
-      # 发进 Releases（Releases 里那个 173MB 的 v0.2.0 就是这么来的）。
+          #（现存 Releases 的 v0.2.0 是打包机手工签名的正确包，不是 CI 产物，见 MEMORY）
       - name: 还原 release 签名证书
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
