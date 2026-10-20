@@ -77,7 +77,21 @@ if [[ "$code" == "201" ]]; then
   id="$(python3 -c 'import json;print(json.load(open("/tmp/rel_pub.json"))["id"])')"
   echo "   已创建 release id=$id"
 else
-  echo "   创建返回 $code（多半是已存在）→ 查询 + PATCH 更新说明"
+  msg="$(python3 -c 'import json;d=json.load(open("/tmp/rel_pub.json"));print(d.get("message") or "")' 2>/dev/null || true)"
+  # 422 = tag 已有 release（走更新）；其余（401/403）都是权限问题，直接把 API
+  # 原文吐出来——"Resource not accessible by integration" 就是 token 没有
+  # Contents:write，硬撑着往下跑只会变成 KeyError: 'id'。
+  if [[ "$code" != "422" ]]; then
+    echo "✗ 创建 release 失败：HTTP $code ${msg:+（$msg）}"
+    case "$msg" in
+      *"not accessible by integration"*|*"Not Found"*)
+        echo "  → token 权限不足。需要 fine-grained PAT：Repository permissions →"
+        echo "    **Contents: Read and write**（设备码授权拿到的是 GitHub App 令牌，"
+        echo "    没有 Contents:write，建不了 release）。" ;;
+    esac
+    exit 1
+  fi
+  echo "   release 已存在 → 查询 + PATCH 更新说明"
   curl -sS -o /tmp/rel_pub.json -H "Authorization: Bearer $GITHUB_TOKEN" \
     -H "Accept: application/vnd.github+json" "$API/releases/tags/$TAG"
   id="$(python3 -c 'import json;print(json.load(open("/tmp/rel_pub.json"))["id"])')"
