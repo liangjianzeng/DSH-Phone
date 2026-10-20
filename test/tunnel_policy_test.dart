@@ -246,6 +246,35 @@ void main() {
     });
   });
 
+  group('本地端口被占（真机：重试一万次也没用）', () {
+    test('端口占用异常分类为 localPort，结论给的是可执行动作', () {
+      const e = TunnelLocalPortOccupiedException(3081, '有程序正在监听，且能接受连接');
+      expect(classifyTunnelFailure(e), TunnelFailureKind.localPort);
+      final summary = tunnelFailureSummary(TunnelFailureKind.localPort);
+      // 不能只说"请关闭其它占用的程序"——手机上根本看不到是谁，得给出能做的动作
+      expect(summary, contains('换一个本地端口'));
+      expect(summary, contains('立即重试'));
+      expect('$e', contains('3081'));
+      expect('$e', contains('有程序正在监听'));
+    });
+
+    test('端口占用属于"重试也不会好"，其它故障仍要永不放弃', () {
+      expect(isFutileRetryFailure(TunnelFailureKind.localPort), isTrue);
+      // 网络类必须继续退避重试：它们真的会因为重试而变好
+      expect(isFutileRetryFailure(TunnelFailureKind.timeout), isFalse);
+      expect(isFutileRetryFailure(TunnelFailureKind.unreachable), isFalse);
+      expect(isFutileRetryFailure(TunnelFailureKind.dns), isFalse);
+      expect(isFutileRetryFailure(TunnelFailureKind.unknown), isFalse);
+    });
+
+    test('普通 bind 冲突文案仍被认成 localPort（回归保护）', () {
+      expect(
+          classifyTunnelFailure(_err('Failed to bind (OS Error: Address already '
+              'in use, errno = 98, address = 127.0.0.1, port = 3081)')),
+          TunnelFailureKind.localPort);
+    });
+  });
+
   group('诊断事件环形缓冲', () {
     test('超出容量丢最旧，导出文本含标签与时间', () {
       var now = DateTime(2026, 10, 8, 9, 0, 0);

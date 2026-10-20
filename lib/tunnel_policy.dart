@@ -10,6 +10,23 @@
 /// - 错误文案按故障类别给结论，而不是把异常原文 + 一大段 VPN 建议糊上去。
 library;
 
+/// 本地转发端口彻底起不来：配置端口被占、临时端口也绑不上。
+///
+/// 带着"谁占着"的探测结论上抛，界面上才能给出可执行的动作——只说
+/// 「请关闭其它占用该端口的程序」用户无从下手（手机上根本看不到是谁）。
+class TunnelLocalPortOccupiedException implements Exception {
+  const TunnelLocalPortOccupiedException(this.port, this.holder);
+
+  /// 配置里要求的本地端口。
+  final int port;
+
+  /// 占用情况的一句话结论（见 TunnelService 的端口探测）。
+  final String holder;
+
+  @override
+  String toString() => '本地端口 $port 被占用（$holder），临时端口也无法绑定';
+}
+
 /// 隧道故障类别：决定给用户看什么话、要不要立刻打扰用户。
 enum TunnelFailureKind {
   /// 无故障。
@@ -69,7 +86,7 @@ String tunnelFailureSummary(TunnelFailureKind kind) {
     case TunnelFailureKind.remoteDown:
       return 'SSH 已连通，但云端服务没有应答：请确认远端服务已启动';
     case TunnelFailureKind.localPort:
-      return '本地端口被占用：请关闭其它占用该端口的程序，或改用其它端口';
+      return '本地端口被别的程序占住，临时端口也没能绑上：请在设置里换一个本地端口后点「立即重试」';
     case TunnelFailureKind.none:
       return '连接正常';
     case TunnelFailureKind.unknown:
@@ -96,6 +113,15 @@ bool isConfigurationFailure(TunnelFailureKind kind) {
       return false;
   }
 }
+
+/// 这类故障重试一万次也不会变好：得由用户改配置或释放资源才能解。
+///
+/// 端口占用是最典型的一个——过去它排在"永不放弃"的退避重试里，界面上
+/// 「第 4 次尝试 · 约 5 秒后自动重试」转个没完，而端口并不会因为多试几次
+/// 就空出来（真机实测）。现在：能自己救的（改临时端口）当场救，救不了的
+/// 就停下来把入口交给用户，不再空转。
+bool isFutileRetryFailure(TunnelFailureKind kind) =>
+    kind == TunnelFailureKind.localPort;
 
 /// 从异常推断故障类别。
 ///
@@ -142,6 +168,9 @@ TunnelFailureKind classifyTunnelFailure(Object error, {bool probeFailed = false}
         'nodename nor servname', 'temporary failure in name resolution',
         'no address associated with hostname'])) {
     return TunnelFailureKind.dns;
+  }
+  if (error is TunnelLocalPortOccupiedException) {
+    return TunnelFailureKind.localPort;
   }
   if (containsAny(const ['already bound', 'address already in use', 'bind'])) {
     return TunnelFailureKind.localPort;

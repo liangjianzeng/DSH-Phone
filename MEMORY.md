@@ -138,6 +138,30 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 
 ---
 
+## 本地端口被占：从"死循环重试"改成"自己破局"（2026-10-20）
+
+- **真机现象**：状态页「本地端口被占用：请关闭其它占用该端口的程序，或改用
+  其它端口」+「第 4 次尝试 · 约 5 秒后自动重试 · 127.0.0.1:3081」无限空转。
+  两条都不成立：① 手机上查不到是谁占用（Android 无 root 拿不到进程表），
+  用户照着提示什么也关不了；② `localPort` 虽被 `isConfigurationFailure` 判成
+  配置类，但那条路仍排了个"兜底重试"定时器，于是永远在重试。
+- **修法（`_bindLocalListener` 三步，顺序不能换）**：① 先怀疑自己人——上一轮
+  teardown 没走完或并发 connect 时 `_server` 还占着同一个端口，先 close；
+  ② 真被外部占住就 `bind(0)` 用系统临时端口把隧道先跑起来，记
+  `_localPortFallback` 并让界面显示「本次临时」；③ 连临时端口都绑不上才抛
+  `TunnelLocalPortOccupiedException`（带占用探测结论），上层据此**停止自动重试**
+  （`isFutileRetryFailure`），把「修改设置 / 立即重试」交给用户。
+- **临时端口的硬前提**：一切访问 `127.0.0.1:<port>` 的地方必须取
+  `TunnelService.activeLocalPort`（WebView 入口 URL、端到端探活都改了）。
+  按配置端口发的话，请求会打到**占着那个端口的别人的程序**上——比连不上更难查。
+- **占用探测只能做到"有没有人在听"**：`Socket.connect` 400ms 能连上 = 有程序在
+  监听（残留隧道或第三方 App）；连不上 = 内核残留/半关。给不出进程名，但足够
+  用户判断该去关 App 还是直接换端口。
+- 网络类故障（DNS/不可达/超时/unknown）**必须**继续"永不放弃"退避，别把这条
+  一起关掉——`test/tunnel_policy_test.dart` 里钉了这组断言。
+
+---
+
 ## Linux(aarch64) 打包机：本机编 APK（2026-10-19）
 
 > 本机的 Linux 侧构建记录（Ubuntu 24.04 / aarch64，`Linux 7.0.0-1019-nvidia`）。结论：**能本机出 release APK**，

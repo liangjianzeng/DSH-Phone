@@ -1325,7 +1325,11 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 在首次访问完成鉴权并下发 30 天签名 cookie；未配置则裸地址直连。
   /// Zcode：zcode-phone-server 对每个请求校验 Token，必须携带。
   String get _targetUrl {
-    final base = 'http://127.0.0.1:${_config.localPort}';
+    // 取**实际生效**的端口：本地端口被别的项目占用时隧道会临时改用系统分配的
+    // 端口（见 TunnelService._bindLocalListener）。还按配置里的端口发的话，
+    // 请求会打到那个占着端口的第三方服务上——比连不上更难排查。
+    final port = TunnelService.instance.activeLocalPort ?? _config.localPort;
+    final base = 'http://127.0.0.1:$port';
     final token = _config.activeModeToken.trim();
     if (token.isEmpty) return base;
     return '$base/?token=${Uri.encodeQueryComponent(token)}';
@@ -2664,8 +2668,14 @@ class _WebViewScreenState extends State<WebViewScreen>
       final secs = next.difference(DateTime.now()).inSeconds;
       parts.add(secs > 0 ? '约 $secs 秒后自动重试' : '正在重试…');
     }
-    final port = _config.localPort;
-    if (port > 0) parts.add('127.0.0.1:$port');
+    final port = TunnelService.instance.activeLocalPort ?? _config.localPort;
+    if (port > 0) {
+      // 临时端口要如实说出来：用户以为自己在用 3081、实际是 4xxxx，
+      // 不说清下次他对着 3081 抓包会一头雾水。
+      parts.add(TunnelService.instance.usingFallbackLocalPort
+          ? '127.0.0.1:$port（配置端口被占，本次临时）'
+          : '127.0.0.1:$port');
+    }
     final since = _tunnel.connectedSince;
     if (_tunnel.healthy && since != null) {
       parts.add('已连接 ${_humanDuration(DateTime.now().difference(since))}');

@@ -378,6 +378,28 @@ class TunnelService {
   SSHClient? _client;
   ServerSocket? _server;
 
+  /// 配置端口被外部程序占住时**临时**改用的端口（null = 用的就是配置里那个）。
+  /// 本地端口只是 WebView / 预览 / 探活的入口，不是与远端约定好的协议端口，
+  /// 所以可以让系统随机分配一个先把隧道跑起来——前提是所有人都取"实际生效"
+  /// 的那个，见 [activeLocalPort]。
+  int? _localPortFallback;
+
+  /// **实际生效**的本地端口：正在监听的 socket → 临时端口 → 配置端口。
+  ///
+  /// 任何要访问 `127.0.0.1:<port>` 的地方都必须走它：临时端口模式下，配置里
+  /// 那个端口正被别人的服务占着，按配置端口发请求会把请求打到**别人的程序**
+  /// 上（表现为"打开了一个莫名其妙的页面"，比连不上更难查）。
+  int? get activeLocalPort {
+    final s = _server;
+    if (s != null) return s.port;
+    final f = _localPortFallback;
+    if (f != null) return f;
+    return _activeConfig?.localPort ?? _desiredConfig?.localPort;
+  }
+
+  /// 本次隧道是否在用临时端口（界面要如实告诉用户"端口换了"）。
+  bool get usingFallbackLocalPort => _localPortFallback != null;
+
   /// 当前激活（已连接/正在连接）的实例索引，null 表示无。
   int? _activeProfileIndex;
   int? get activeProfileIndex => _activeProfileIndex;
@@ -667,18 +689,31 @@ class TunnelService {
       final delay = _backoff.delayFor(_attempt, random: _rng.nextDouble);
       final next = DateTime.now().add(delay);
       final hard = isConfigurationFailure(kind);
+      // 「重试一万次也没用」的那一类：端口占用不会因为多试几次就空出来
+      // （真机实测：界面「第 4 次尝试 · 约 5 秒后自动重试」空转到天荒地老）。
+      // 能自己救的在绑定时已经救过（临时端口），走到这里说明真没辙——
+      // 停下来把「修改设置 / 立即重试」交给用户，别用空转假装在干活。
+      final futile = isFutileRetryFailure(kind);
       _setState(_state.copyWith(
         status: hard ? TunnelStatus.failed : TunnelStatus.disconnected,
         kind: kind,
         attempt: _attempt,
         lastError: '$e',
-        nextRetryAt: next,
+        nextRetryAt: futile ? null : next,
         probeOk: false,
         clearConnectedSince: true,
       ));
       _log('connect',
           '第 $_attempt 次尝试失败（$kind）：$e',
           level: hard ? TunnelEventLevel.error : TunnelEventLevel.warn);
+      if (futile) {
+        _retryTimer?.cancel();
+        _retryTimer = null;
+        _log('connect', '本地端口问题：自动重试不会让它空出来，已停止重试；'
+            '请在「修改设置」里换一个本地端口后点「立即重试」',
+            level: TunnelEventLevel.error);
+        return _state;
+      }
       _log('connect',
           hard
               ? '配置类故障：暂停快速重试，每 ${delay.inSeconds}s 兜底再试一次'
@@ -763,9 +798,8 @@ class TunnelService {
         throw const TunnelAbortedException();
       }
 
-      // 4) 本地监听端口
-      final server = await ServerSocket.bind(
-          InternetAddress.loopbackIPv4, config.localPort);
+      // 4) 本地监听端口（占用时自己救自己，见 _bindLocalListener）
+      final server = await _bindLocalListener(config);
       // 绑定后再确认一次：期间被断开则释放端口，防止端口被本类残留占住，
       // 也避免给一条没人要的会话挂上监听。
       if (_client != client || aborted()) {
@@ -788,6 +822,77 @@ class TunnelService {
       // TOFU 拒绝要带类型上抛，供上层判成"配置类"而不是泛泛的链路故障。
       if (hostKeyMismatch) throw const TunnelHostKeyMismatchException();
       rethrow;
+    }
+  }
+
+  /// 是否"地址已被占用"。Android/Linux 上 EADDRINUSE = 98。
+  static bool _isAddressInUse(Object e) {
+    if (e is! SocketException) return false;
+    final code = e.osError?.errorCode;
+    if (code == 98 || code == 48 /* macOS EADDRINUSE */) return true;
+    final m = e.message.toLowerCase();
+    return m.contains('already in use') || m.contains('already bound');
+  }
+
+  /// 谁占着这个端口？Android 无 root 拿不到进程表，只能做**可连通性探测**：
+  /// 能连上 = 有程序正在监听（上一个没释放干净的隧道，或第三方 App）；
+  /// 连不上 = 内核侧残留/半关。给不出进程名，但"有没有人在听"已经足够用户
+  /// 判断该去关 App 还是直接换端口。
+  Future<String> _describeLocalPortHolder(int port) async {
+    try {
+      final probe = await Socket.connect(InternetAddress.loopbackIPv4, port,
+          timeout: const Duration(milliseconds: 400));
+      await probe.close().catchError((_) {});
+      try {
+        probe.destroy();
+      } catch (_) {}
+      return '有程序正在监听，且能接受连接';
+    } catch (_) {
+      return '无进程应答（端口处于内核残留或半关状态）';
+    }
+  }
+
+  /// 绑定本地监听端口，**占用时不是一路 rethrow 让用户自己想办法**。
+  ///
+  /// 三步，顺序不能换：
+  ///  1. 先怀疑自己人：上一轮 teardown 没走完、或并发 connect 时，`_server`
+  ///     可能还占着同一个端口——这时提示"请关闭其它占用该端口的程序"是句废话，
+  ///     用户在自己的手机上根本找不到那个"程序"。
+  ///  2. 真被外部占住：改用系统分配的临时端口，隧道先通起来。本地端口不是
+  ///     协议约定，值得为了"能用"让步；但一定要记下来并让界面可见。
+  ///  3. 连临时端口都绑不上（极罕见）：抛带占用结论的异常，上层据此停止
+  ///     无意义的自动重试。
+  Future<ServerSocket> _bindLocalListener(SSHConfig config) async {
+    final stale = _server;
+    if (stale != null) {
+      _server = null;
+      try {
+        await stale.close();
+      } catch (_) {}
+      _log('bind', '释放本进程残留的本地监听 :${config.localPort}',
+          level: TunnelEventLevel.warn);
+    }
+    try {
+      final server = await ServerSocket.bind(
+          InternetAddress.loopbackIPv4, config.localPort);
+      _localPortFallback = null;
+      return server;
+    } on SocketException catch (e) {
+      if (!_isAddressInUse(e)) rethrow;
+      final holder = await _describeLocalPortHolder(config.localPort);
+      try {
+        final server =
+            await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+        _localPortFallback = server.port;
+        _log('bind',
+            '本地端口 ${config.localPort} 被占用（$holder），本次改用临时端口 '
+            '127.0.0.1:${server.port}（功能不受影响，建议在设置里永久换个端口）',
+            level: TunnelEventLevel.warn);
+        return server;
+      } on SocketException catch (e2) {
+        if (!_isAddressInUse(e2)) rethrow;
+        throw TunnelLocalPortOccupiedException(config.localPort, holder);
+      }
     }
   }
 
@@ -865,6 +970,7 @@ class TunnelService {
 
     final server = _server;
     _server = null;
+    _localPortFallback = null;
     server?.close();
     _client = null;
     _activeProfileIndex = null;
@@ -921,7 +1027,9 @@ class TunnelService {
     if (_client == null) return false;
     // 已有建链在途：那条路自己会给出结论，此时探测必然不准，直接跳过。
     if (_inflight != null || _rebuilding) return false;
-    final port = _activeConfig?.localPort ?? _desiredConfig?.localPort;
+    // 必须是**实际生效**的端口：临时端口模式下按配置端口探活，探的是别人家
+    // 的服务，要么误报"云端无应答"，要么更糟——探通了个不相干的程序。
+    final port = activeLocalPort;
     if (port == null) return false;
 
     final last = _lastForwardActivity;
@@ -1080,6 +1188,7 @@ class TunnelService {
     final client = _client;
     _server = null;
     _client = null;
+    _localPortFallback = null; // 下次连接重新按配置端口试，别把临时端口带过去
     _activeProfileIndex = null;
     _activeConfig = null;
     // 上一会话的流量时间不能带进新会话：否则新隧道的第一次周期探活会吃到旧的
