@@ -44,6 +44,31 @@ jobs:
       - name: JS 桥校验（注入脚本在 Dart 字符串里，analyze/test 看不见）
         run: node tool/check_bridges_js.mjs
 
+      - name: 第三方 fork 门禁（只卡 error/warning，info 交给人工）
+        # 必须排在 test 之前：根 analyze 排除了 third_party/**，而 fork 里的
+        # 编译错误会在 `flutter test` 编译期才炸出来（只表现为"某几个 test
+        # 文件 loading [E]"，看不出根因）。先跑它，错误才落在注解里。
+        shell: bash
+        run: |
+          set +e
+          : > /tmp/fork.log
+          for p in third_party/dartssh2 third_party/flutter_foreground_task; do
+            dart analyze "$p" 2>&1 | tee -a /tmp/fork.log
+          done
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ "$code" -ne 0 ]; then
+            grep -E "error -|warning -" /tmp/fork.log | sed 's/%/%25/g' | head -40 \
+              | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+            {
+              echo '### 第三方 fork 分析失败（error / warning）'
+              echo '```'
+              cat /tmp/fork.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$code"
+
       - name: 静态分析
         shell: bash
         run: |
@@ -111,17 +136,6 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
           exit "$code"
-
-      - name: 第三方 fork 门禁（只卡 error/warning，info 交给人工）
-        shell: bash
-        run: |
-          # 根 analyze 已排除 third_party/**：vendored 上游代码的 deprecation
-          # 不该拖死主门禁（本仓库曾因此长期全红）。这里单独立一道只卡
-          # error/warning 的底线，info 级由 code review 与上游同步时处理。
-          set -e
-          for p in third_party/dartssh2 third_party/flutter_foreground_task; do
-            dart analyze "$p"
-          done
 
   build-apk:
     name: 构建 release APK（发版）
