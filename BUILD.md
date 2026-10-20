@@ -58,6 +58,8 @@ python3 -c "d=open('/tmp/x/lib/arm64-v8a/libapp.so','rb').read(); print('某条�
 
 ## 版本记录
 
+- **v0.2.3（build 19）**：成果预览与下载重做（WebView 主渲染 + 图片预览 + 失败可自查）；下载字节数校验与 SSH 通道泄漏根因修复；本地端口占用自愈（自纠残骸 + 3090-3099 保留段）；CI 门禁复活（tool/ci_gate.sh 统一、117 例测试）；发版链路修复与交付规范。
+- **v0.2.2（build 18）**：GitHub 仓库快捷访问（PAT 免登录）；ASR 全离主线程 + 热词真正生效；回前台自愈；APK 瘦身 92.8MB → 22.3MB。
 - **v0.2.1（build 17）**：DSH ⇄ Zcode 双服务模式 + 语音/相机/天气体验与稳定性。
 - **v0.2.0（build 16）**：语音输入重构为端侧流式 ASR（sherpa-onnx 流式 Zipformer）。
 - **v0.1.8（build 14）**：Unsloth Studio 远程加载 + DSH Token 鉴权适配。

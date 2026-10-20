@@ -27,7 +27,7 @@ class SSHConfig {
   /// 读取构建产物的 versionName/versionCode（如 `v0.1.9 (build 15)`），
   /// 不再手工维护常量，避免发版时多处版本号漏改。
   /// 读取失败时回退 [fallbackAppVersion]（发版时与该兜底值同步一次即可）。
-  static const String fallbackAppVersion = 'v0.1.9';
+  static const String fallbackAppVersion = 'v0.2.3';
 
   /// 异步读取当前构建的显示版本号（含 build 号）；失败回退常量。
   static Future<String> appVersion() async {

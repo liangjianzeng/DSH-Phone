@@ -138,3 +138,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: app-release-${{ github.ref_name }}.apk
+          # 有自动生成说明 + 标题带版本：README 的"最新正式版"点进来能看懂装的是哪个版
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
