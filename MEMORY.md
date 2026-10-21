@@ -175,6 +175,11 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 
 ## 本地端口被占：从"死循环重试"改成"自己破局"（2026-10-20）
 
+> ⚠️ **本节已被 2026-10-21 的复查修正，先看下一节**：① 那套"四步阶梯"在真机上
+> **从来没跑起来过**——占用判定只认 `EADDRINUSE`，而"自家占用" Dart 报的是另一种
+> 错误，于是第一次绑定就 rethrow，临时端口一个都没试；② "只在 3090-3099 里借"
+> 太窄，已扩到 3090-3149。**"不许退回 `bind(0)`"这条仍然有效。**
+
 - **真机现象**：状态页「本地端口被占用：请关闭其它占用该端口的程序，或改用
   其它端口」+「第 4 次尝试 · 约 5 秒后自动重试 · 127.0.0.1:3081」无限空转。
   两条都不成立：① 手机上查不到是谁占用（Android 无 root 拿不到进程表），
@@ -206,6 +211,65 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
   用户判断该去关 App 还是直接换端口。
 - 网络类故障（DNS/不可达/超时/unknown）**必须**继续"永不放弃"退避，别把这条
   一起关掉——`test/tunnel_policy_test.dart` 里钉了这组断言。
+
+---
+
+## 端口自愈为什么整段失效：Dart 的 shared-flag 占用形态（2026-10-21，真机复盘）
+
+用户报："退后台再拉起就报『本地端口被别的程序占住，临时端口段（3090-3099）也已
+用满』，任何重试都没用，只能杀进程再拉起"，并怀疑**根本没做随机端口重试**。
+**用户是对的**——上一版的阶梯一次都没走到临时端口那一步。
+
+- **根因①（致命）：占用判定只认 `EADDRINUSE`。** dart:io 实测（dart 3.7，
+  `ServerSocket.bind` 同一 (address, port) 撞车）分两种形态：
+
+  | 占用者 | `osError.errorCode` | `osError.message` |
+  |---|---|---|
+  | 另一个**进程**（真第三方 App） | `98` EADDRINUSE（macOS 48） | `Address already in use` |
+  | **本进程**：自家没 close 的残骸 / 别的 isolate / **已死 isolate 的僵尸 FD** | **`-1`** | `The shared flag to bind() needs to be `true` if binding multiple times on the same (address, port) combination.` |
+
+  旧 `_isAddressInUse()` 只看 `code == 98 || 48` 且只翻 `e.message`（内容恒为
+  `Failed to create server socket`，**不含** `already in use`）→ 自家占用被判成
+  "不是端口占用" → `if (!_isAddressInUse(e)) rethrow;` **第一次绑定就整体抛出**。
+  裸 SocketException 再被 `classifyTunnelFailure` 按 `'bind'` 关键词归成
+  `localPort` → 界面套用同一句"临时端口段也已用满"——**那句是假的**。截图里的
+  "第 1 次尝试、且没有『约 N 秒后自动重试』"就是铁证（旧 futile 分支置 null）。
+  → 判定占用**必须同时认 shared-flag**：`LocalPortBinder.isPortUnavailableToUs()`；
+  而且它还是比 pid 自比对更硬的**归属证据**（Dart 只在本进程已绑过该端口时才报这条）：
+  shared-flag + 不在自家登记表 = 上一世代 isolate 的僵尸监听 → 界面给「重启应用」；
+  EADDRINUSE = 别人家进程 → 让用户"改设置换端口"。
+- **根因②：回收只按配置端口。** `_releaseOurStaleListenersOn(port)` 里
+  `if (s.port != port) continue`，临时段里的孤儿**永远没人回收** → 每轮重建烧一个
+  可借端口。→ 新增 `_sweepOrphanListeners()`：主隧道同一时刻只该有一个活监听，
+  所以登记表里除 `_server` 外**每一条都是垃圾**，绑定前全量清扫；候选端口 bind 前
+  也要先定向回收。`_closeListener()` 里 `close()` 抛异常时要把 socket **放回登记表**
+  （否则端口对本 isolate 变成"以为关了其实没关"的永久占用）。
+- **根因③：isolate 死了不会释放端口。** `ServerSocket` 不 `close()` 就丢引用，
+  端口一直占到**整个进程退出**；连"绑了端口的 isolate 被 `Isolate.kill` 掉"也一样
+  （实测：同进程 spawn 一个 isolate 绑 3099 后 kill，父 isolate 再绑仍失败）。
+  Android 侧的放大器：MIUI/HyperOS 后台回收常常**只销毁 Activity**，进程被
+  `flutter_foreground_task` 的 sticky 前台服务 + wakelock 拽着不死 → 回前台时
+  Flutter 在**同进程里换新 isolate** → 老 isolate 的监听成为谁也关不掉的僵尸。
+  对策：`AppLifecycleState.detached` 里调 `TunnelService.releaseLocalResources()`
+  主动关监听（尽力而为，少产生僵尸）；产生了的唯一出路是进程重开 → 错误卡/横幅给
+  **「重启应用」**（`restartProcessToReleasePorts()`：teardown + 清扫 + `exit(0)`），
+  等价于把用户现在手动杀进程的动作一键化，**不自动重启**（用户定的）。
+- **保留池 3090-3099 → 3090-3149**（`tunnelFallbackPoolMin/Max`；首选段仍是
+  3090-3099 且整体排在候选最前，状态栏观感不变）。10 个不够的算术：每次同进程重
+  拉起烧 1 个，十轮就永久死锁。**"不许 `bind(0)`"这条用户规矩保留**：固定段一眼
+  认得出是隧道借的，4 万多的随机端口在状态栏没法看也没法比对。设置页
+  `_validateLocalPort` + `_safeLocalPort()` 必须整池拒绝，否则用户填了隧道就没得借。
+- **不再永久停止重试**：`localPort` 仍属 `isFutileRetryFailure`（**语义是"别快速
+  空转"**），但改为按 `tunnelLocalPortSalvageInterval`（60s）兜底慢试，界面保持
+  `hard` 级红色指引 + 「重启应用 / 改设置 / 立即重试」。以前直接 `return` 把端口
+  占用钉成永久失败，用户只剩杀进程一条路。
+- **决策已抽成可测单元 `lib/local_port_binder.dart`**（纯 dart:io + tunnel_policy）：
+  阶梯的两次翻车都是"代码看着合理、纯策略测试全绿、只有真机炸"，现在
+  `test/local_port_binder_test.dart` 用**真 ServerSocket** + **注入的两种错误形态**
+  把每条分支钉住（含回归保护：关掉候选回收 → 必须报耗尽）。改这块**必须先过这个
+  测试**；新增占用形态请同时改 `isPortUnavailableToUs` 与测试里的形态对照。
+- 诊断可核对：`bind` 标签的日志会写"共试过 N 个（列表）；本进程内占用 …、外部进程
+  占用 …；同进程重拉起=…"，下次再报端口问题，先看有没有 shared-flag 就能定性。
 
 ---
 
