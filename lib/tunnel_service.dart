@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'config.dart';
 import 'foreground_service.dart';
+import 'local_port_binder.dart';
 import 'tunnel_diagnostics.dart';
 import 'tunnel_policy.dart';
 
@@ -588,6 +589,52 @@ class TunnelService {
     unawaited(_probeEndpoint(reason: 'page:$reason', forceRebuildOnFail: false));
   }
 
+  /// 进程/引擎要没了（`AppLifecycleState.detached`）：**主动**关掉本地监听。
+  ///
+  /// 为什么必须抢在这一步：Android 后台回收常常只销毁 Activity，进程被 sticky
+  /// 前台服务 + wakelock 拽着不死，用户从最近任务回来时 Flutter 换的是**同进程里
+  /// 的新 isolate**。而 isolate 死亡**不会**释放它没 `close()` 的 `ServerSocket`
+  /// （dart:io 实测：同进程 spawn 一个 isolate 绑端口后 `Isolate.kill(immediate)`，
+  /// 端口一直占到整个进程退出）。错过这个回调，这一世代的端口就永久烧掉一个——
+  /// 烧满保留池就是用户报的"退后台再拉起必然报错、只能杀进程"。
+  ///
+  /// 尽力而为：系统强杀时不会给这个回调，所以它只是"少产生僵尸"，不是"能回收"。
+  /// 不动 `_wantConnected`：真回来了 [notifyShouldReconnectNow] 会整条重建。
+  Future<void> releaseLocalResources(String reason) async {
+    _log('supervisor', '本地资源释放（$reason）：主动关闭监听，避免端口随 isolate 残留在进程里',
+        level: TunnelEventLevel.warn);
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _watchdogTimer?.cancel();
+    _watchdogTimer = null;
+    _networkTimer?.cancel();
+    _networkTimer = null;
+    await _teardown();
+    final n = await _sweepOrphanListeners();
+    if (n > 0) _log('bind', '释放时额外清扫 $n 个遗留监听', level: TunnelEventLevel.warn);
+  }
+
+  /// 「重启应用」按钮：让**整个进程**重来一次。
+  ///
+  /// 这是唯一能收回"上一世代 isolate 留下的僵尸监听"的办法——那些 FD 不属于当前
+  /// isolate，Dart 侧任何 close/回收都碰不到它们，只有进程退出才会被内核收走。
+  /// 用户今天本来就在手动干这件事（杀进程再拉起），这里只是把它变成一键。
+  Future<void> restartProcessToReleasePorts() async {
+    _log('supervisor',
+        '用户按下「重启应用」：先尽力关闭监听，再退出进程（僵尸 FD 只有进程重开才收回）',
+        level: TunnelEventLevel.warn);
+    _wantConnected = false;
+    _bumpGeneration('重启进程释放端口');
+    try {
+      await _teardown();
+      await _sweepOrphanListeners();
+    } catch (_) {}
+    ForegroundTunnelService.instance.stop();
+    // 给内核一点时间把已发起的 close() 排完；剩下的 FD 由 exit 一并带走。
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    exit(0);
+  }
+
   // ---------------- 监督器内核 ----------------
 
   Future<TunnelState> _runAttempt([String? key]) async {
@@ -686,20 +733,24 @@ class TunnelService {
               ? TunnelFailureKind.hostKey
               : classifyTunnelFailure(e);
       _attempt += 1;
-      final delay = _backoff.delayFor(_attempt, random: _rng.nextDouble);
-      final next = DateTime.now().add(delay);
       final hard = isConfigurationFailure(kind);
       // 「重试一万次也没用」的那一类：端口占用不会因为多试几次就空出来
       // （真机实测：界面「第 4 次尝试 · 约 5 秒后自动重试」空转到天荒地老）。
-      // 能自己救的在绑定时已经救过（临时端口），走到这里说明真没辙——
-      // 停下来把「修改设置 / 立即重试」交给用户，别用空转假装在干活。
+      // 但"不空转"不等于"从此不再尝试"：早期版本直接 return 把端口占用钉成永久
+      // 失败，用户除了杀进程没有第二条路，而占用常常是暂时的（第三方 App 退出、
+      // 自家残骸被下一轮清扫回收）。改为**慢速兜底**：界面仍是 hard 级红色指引 +
+      // 「重启应用 / 改设置」，背后每 60s 真试一次。
       final futile = isFutileRetryFailure(kind);
+      final delay = futile
+          ? tunnelLocalPortSalvageInterval
+          : _backoff.delayFor(_attempt, random: _rng.nextDouble);
+      final next = DateTime.now().add(delay);
       _setState(_state.copyWith(
         status: hard ? TunnelStatus.failed : TunnelStatus.disconnected,
         kind: kind,
         attempt: _attempt,
         lastError: '$e',
-        nextRetryAt: futile ? null : next,
+        nextRetryAt: next,
         probeOk: false,
         clearConnectedSince: true,
       ));
@@ -707,11 +758,13 @@ class TunnelService {
           '第 $_attempt 次尝试失败（$kind）：$e',
           level: hard ? TunnelEventLevel.error : TunnelEventLevel.warn);
       if (futile) {
-        _retryTimer?.cancel();
-        _retryTimer = null;
-        _log('connect', '本地端口问题：自动重试不会让它空出来，已停止重试；'
-            '请在「修改设置」里换一个本地端口后点「立即重试」',
+        _log('connect',
+            '本地端口问题：已停止快速重试（多试几次不会让它空出来），'
+            '每 ${tunnelLocalPortSalvageInterval.inSeconds}s 兜底再试一次；'
+            '点「重启应用」可直接收回本进程残留的监听，或在「修改设置」里换个本地端口',
             level: TunnelEventLevel.error);
+        _scheduleRetry(delay);
+        _startNetworkWatcher();
         return _state;
       }
       _log('connect',
@@ -825,22 +878,20 @@ class TunnelService {
     }
   }
 
-  /// 是否"地址已被占用"。Android/Linux 上 EADDRINUSE = 98。
-  static bool _isAddressInUse(Object e) {
-    if (e is! SocketException) return false;
-    final code = e.osError?.errorCode;
-    if (code == 98 || code == 48 /* macOS EADDRINUSE */) return true;
-    final m = e.message.toLowerCase();
-    return m.contains('already in use') || m.contains('already bound');
-  }
-
-  /// 本进程创建过、**尚未确认关闭**的本地监听。
+  /// 本 isolate 创建过、**尚未确认关闭**的本地监听。
   ///
   /// 存在的唯一理由：端口占用绝大多数是"自己占自己"——`_server` 被置空了，
   /// 但 `close()` 没 await 完 / 抛异常没管，端口就挂在一个没人认领的
   /// ServerSocket 对象上；此后每次重试都是与自己的残骸抢端口，于是
   /// 「请关闭其它占用该端口的程序」永远无解。有了这张表，绑不上时就能
   /// 先把自己人清掉，而不是甩锅给用户。
+  ///
+  /// 边界要说清楚：这张表**只覆盖当前 isolate**。Android 上回前台常常是
+  /// "进程还在、isolate 换了一个"（Activity 被回收、sticky 前台服务把进程拽住），
+  /// 老 isolate 没 `close()` 的监听不在表里、也永远关不掉（实测：isolate 被 kill
+  /// 之后端口仍被占，直到整个进程退出）。那部分只能靠"少产生"
+  /// （[releaseLocalResources] 在 detached 时主动关）与"认出来"
+  /// （[_detectSameProcessRespawn] + 界面「重启应用」）两招对付。
   static final Set<ServerSocket> _ownedListeners = <ServerSocket>{};
 
   /// 登记"这个监听是我们自己开的"。ServerSocket 既没有 `done` 也没有
@@ -853,7 +904,12 @@ class TunnelService {
     _ownedListeners.remove(server);
     try {
       await server.close();
-    } catch (_) {}
+    } catch (_) {
+      // close() 抛异常 = 端口很可能还挂着。把它**放回登记表**：下一轮绑定至少
+      // 还能再关一次。若就此遗忘，这个端口对本 isolate 就成了"以为关了、其实
+      // 没关"的永久占用——正是"重试也没用、只能杀进程"的另一个来源。
+      _ownedListeners.add(server);
+    }
   }
 
   /// 销毁仍占着 [port] 的**本进程残留**监听。返回是否动过手。
@@ -867,94 +923,137 @@ class TunnelService {
     return touched;
   }
 
-  /// 谁占着这个端口？Android 无 root 拿不到进程表，只能做**可连通性探测**：
-  /// 能连上 = 有程序正在监听（残留隧道或第三方 App）；连不上 = 内核侧残留/半关。
-  Future<String> _describeLocalPortHolder(int port) async {
+  /// 关掉登记表里**不属于当前活动监听**的每一个条目，返回清掉的个数。
+  ///
+  /// 这是端口自愈的主闸。主隧道同一时刻最多只有一个合法监听（就是 `_server`），
+  /// 所以表里除它以外的每一条都必然是被丢弃的残骸——并发尝试交错、`_teardown`
+  /// 与 `_onTransportClosed` 抢时序、`_bindLocalListener` 第一步 close 后没摘除，
+  /// 都会留下这种孤儿。
+  ///
+  /// 以前只在"配置端口绑不上"时**按配置端口号**回收（[_releaseOurStaleListenersOn]），
+  /// 落在临时段里的孤儿于是**永远没人管**：每漏一个就永久少一个可借端口，烧满
+  /// 保留池就变成"重试一万次也没用、只能杀进程"。改成绑定前全量清扫，任何路径
+  /// 漏掉的监听都会在下一轮绑定前被收回来。
+  Future<int> _sweepOrphanListeners() async {
+    final live = _server;
+    var n = 0;
+    for (final s in _ownedListeners.toList(growable: false)) {
+      if (identical(s, live)) continue;
+      await _closeListener(s);
+      n++;
+    }
+    return n;
+  }
+
+  // ---- "同进程重拉起"识别：区分自家僵尸 FD 与第三方 App 占用 ----
+
+  /// 本进程 pid（`dart:io` 顶层 `pid`）。与落盘的上一次 pid 比对即可判断
+  /// "这个进程是不是已经跑过一个拉起过隧道的 isolate"。
+  static final int _processPid = pid;
+
+  static const String _ownerPidPrefKey = 'tunnel.ownerPid';
+  static const String _ownerPortsPrefKey = 'tunnel.ownerBoundPorts';
+
+  /// pid 比对结论是否已做过（每个 isolate 只做一次，别在每次绑定时狂写 prefs）。
+  static bool _respawnChecked = false;
+
+  /// 本进程此前已跑过一个拉起过隧道的 isolate → 绑不上的端口大概率是自家僵尸 FD。
+  static bool _sameProcessRespawn = false;
+
+  /// 上一世代 isolate 在本进程绑过的端口（仅用于诊断日志）。
+  static String _previousGenerationPorts = '';
+
+  /// 用 pid 自比对判断"是不是同进程里被重新拉起的第二个 isolate"。
+  ///
+  /// 为什么不用别的信号：从 Dart 侧看不到 FD 的归属，也没有进程启动时间可查。
+  /// pid 是唯一能跨 isolate 存活、又能在进程重启后自然失效的标识——进程真死了
+  /// 重来时 pid 必然变（Android 不会把刚死掉的 pid 立刻复用给同一个 App）。
+  Future<void> _detectSameProcessRespawn() async {
+    if (_respawnChecked) return;
+    _respawnChecked = true;
     try {
-      final probe = await Socket.connect(InternetAddress.loopbackIPv4, port,
-          timeout: const Duration(milliseconds: 400));
-      await probe.close().catchError((_) {});
-      try {
-        probe.destroy();
-      } catch (_) {}
-      return '有程序正在监听，且能接受连接';
-    } catch (_) {
-      return '无进程应答（端口处于内核残留或半关状态）';
+      final prefs = await SharedPreferences.getInstance();
+      final prev = prefs.getInt(_ownerPidPrefKey);
+      if (prev != null && prev == _processPid) {
+        _sameProcessRespawn = true;
+        _previousGenerationPorts = prefs.getString(_ownerPortsPrefKey) ?? '';
+        _log('bind',
+            '检测到同进程重拉起（pid=$_processPid，上一世代绑过 '
+            '${_previousGenerationPorts.isEmpty ? '?' : _previousGenerationPorts}）：'
+            '上一世代未 close 的监听会一直占到进程退出，Dart 侧无法回收',
+            level: TunnelEventLevel.warn);
+      }
+      await prefs.setInt(_ownerPidPrefKey, _processPid);
+    } catch (e) {
+      debugPrint('[DSH] respawn detect failed: $e');
     }
   }
 
+  /// 记下本世代实际绑过的端口，供下一次（同进程）重拉起时写进诊断日志。
+  void _rememberBoundPorts(int configPort, int? fallbackPort) {
+    final text = '$configPort${fallbackPort == null ? '' : '/$fallbackPort'}';
+    unawaited(SharedPreferences.getInstance()
+        .then((p) => p.setString(_ownerPortsPrefKey, text))
+        .catchError((Object _) => false));
+  }
+
+  /// 最近一次"端口彻底起不来"的结论，界面上据此决定要不要把「重启应用」提为主按钮。
+  TunnelLocalPortOccupiedException? _lastPortFailure;
+
+  /// 端口占用是否疑似"自家上一世代 isolate 的僵尸监听"（只有杀进程能解）。
+  bool get localPortSelfZombieSuspected =>
+      _lastPortFailure?.selfZombieSuspected ?? false;
+
+  /// 绑定阶梯的依赖注入：状态（登记表、实际生效端口、是否同进程重拉起）留在这边，
+  /// 决策本身在 [LocalPortBinder]。抽出去只为一个目的——"端口被占"这条唯一真正
+  /// 干活的路径必须能在 `flutter test` 里用真 ServerSocket 复现，而不是只能上真机
+  /// 验证：上一版自愈就死在"只按配置端口回收残骸"这种代码看着没毛病、真机才露馅
+  /// 的地方。回归网在 test/local_port_binder_test.dart。
+  late final LocalPortBinder _portBinder = LocalPortBinder(
+    log: (message, {required warn}) => _log('bind', message,
+        level: warn ? TunnelEventLevel.warn : TunnelEventLevel.info),
+    onBound: (server, configPort) {
+      _trackListener(server);
+      // 实际生效端口必须当场记下：WebView 入口、端到端探活、诊断全取
+      // activeLocalPort。借了临时端口还按配置端口发请求，请求会打到**占着那个
+      // 端口的别人家程序**上——比连不上更难查。
+      _localPortFallback = server.port == configPort ? null : server.port;
+      _lastPortFailure = null;
+      _rememberBoundPorts(
+          configPort, server.port == configPort ? null : server.port);
+    },
+    sweepOrphans: _sweepOrphanListeners,
+    releaseOwnedOn: _releaseOurStaleListenersOn,
+    ownedHolds: (port) => _ownedListeners.any((s) => s.port == port),
+    ensureRespawnChecked: _detectSameProcessRespawn,
+    sameProcessRespawn: () => _sameProcessRespawn,
+    candidates: () => fallbackPortCandidates(random: _rng.nextDouble),
+  );
+
   /// 绑定本地监听端口：先归位自己人，再让路给现实。
   ///
-  /// 四步，顺序不能换：
-  ///  1. 活动中的 `_server` 还占着同一个端口 → 先 close（上一轮 teardown
-  ///     未走完 / 并发 connect 就是这种场合）。
-  ///  2. 真被占住 → 先把**本进程遗留**的监听（`_ownedListeners` 里没人认领的
-  ///     残骸）清掉再试一次。端口占用绝大多数是这一步解决的，此时提示用户
-  ///     "关闭其它程序"是在误导。
-  ///  3. 还是不通 → 在**保留段 3090-3099** 里随机挑一个把隧道跑起来。
-  ///     不用 `bind(0)`：系统给的 4 万多端口用户在状态栏看不懂，也不方便比对；
-  ///     固定段一眼认得出是隧道临时换的，代价是设置页不许填这个段。
-  ///  4. 连保留段都用满（同机十条隧道同时全被占，实际极罕见）→ 抛带占用结论
-  ///     的异常，上层据此停止无意义的自动重试。
+  /// 阶梯（全量清扫自家残骸 → 绑配置端口 → 定向回收后重试 → 扫遍保留池
+  /// 3090-3149、每个候选先回收再绑 → 抛带结论的异常）在
+  /// [LocalPortBinder.bindListener]；每一步对应的真实翻车现场与"为什么顺序不能换"
+  /// 注释在那里，并由 test/local_port_binder_test.dart 用真 socket 钉死。
+  /// 这里只保留监督器独占的两件事：
+  ///  1. 上一轮 teardown 没走完 / 并发 connect 时 `_server` 可能还占着同一个端口，
+  ///     必须先 close——它是"活动监听"，不在残骸之列，清扫不会碰它；
+  ///  2. 最终结论记进 [_lastPortFailure]，界面据此决定「重启应用」是不是主按钮。
   Future<ServerSocket> _bindLocalListener(SSHConfig config) async {
-    final port = config.localPort;
-
     final stale = _server;
     if (stale != null) {
       _server = null;
-      try {
-        await stale.close();
-      } catch (_) {}
-      _log('bind', '释放本进程在用的本地监听 :$port',
+      await _closeListener(stale);
+      _log('bind', '释放本进程在用的本地监听 :${stale.port}',
           level: TunnelEventLevel.warn);
     }
-
     try {
-      final server =
-          await ServerSocket.bind(InternetAddress.loopbackIPv4, port);
-      _localPortFallback = null;
-      _trackListener(server);
-      return server;
-    } on SocketException catch (e) {
-      if (!_isAddressInUse(e)) rethrow;
+      return await _portBinder.bindListener(config.localPort);
+    } on TunnelLocalPortOccupiedException catch (e) {
+      _lastPortFailure = e;
+      rethrow;
     }
-
-    // 2) 自己人的残骸先清掉再试一次
-    if (await _releaseOurStaleListenersOn(port)) {
-      _log('bind', '发现并回收了本进程残留在 :$port 上的监听，重试绑定',
-          level: TunnelEventLevel.warn);
-      try {
-        final server =
-            await ServerSocket.bind(InternetAddress.loopbackIPv4, port);
-        _localPortFallback = null;
-        _trackListener(server);
-        return server;
-      } on SocketException catch (e) {
-        if (!_isAddressInUse(e)) rethrow;
-      }
-    }
-
-    // 3) 让路：保留段内随机挑一个
-    final holder = await _describeLocalPortHolder(port);
-    for (final candidate in fallbackPortCandidates(random: _rng.nextDouble)) {
-      try {
-        final server =
-            await ServerSocket.bind(InternetAddress.loopbackIPv4, candidate);
-        _localPortFallback = server.port;
-        _trackListener(server);
-        _log('bind',
-            '本地端口 $port 被占用（$holder），本次改用临时端口 '
-            '127.0.0.1:${server.port}（保留段 $tunnelFallbackPortMin-'
-            '$tunnelFallbackPortMax，功能不受影响；建议在设置里永久换个端口）',
-            level: TunnelEventLevel.warn);
-        return server;
-      } on SocketException catch (e) {
-        if (!_isAddressInUse(e)) rethrow;
-      }
-    }
-
-    // 4) 真没辙
-    throw TunnelLocalPortOccupiedException(port, holder);
   }
 
   static bool _neverAborted() => false;

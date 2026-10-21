@@ -10,46 +10,76 @@
 /// - 错误文案按故障类别给结论，而不是把异常原文 + 一大段 VPN 建议糊上去。
 library;
 
-/// 隧道**临时端口**保留段：3090–3099。
+/// 隧道**临时端口**首选段：3090–3099。
 ///
 /// 配置端口被占时不再向系统要随机端口（`bind(0)` 会给到 4 万多的 ephemeral 段，
 /// 用户在状态栏看到 127.0.0.1:43117 既看不懂也记不住，排查时更没法比对），
-/// 而是固定在这 10 个里挑一个——一眼认得出"这是隧道自己临时换的"。
-/// 代价是这个段被征用：**用户在设置里不允许填 3090–3099**，否则配置端口与
-/// 临时端口会互相撞，见 [isReservedFallbackPort]。
+/// 而是先在这 10 个里挑——一眼认得出"这是隧道自己临时换的"。
+/// 首选段用满后继续往 [tunnelFallbackPoolMax] 方向借，见 [tunnelFallbackPoolMin]。
+/// 代价是这个池子被征用：**用户在设置里不允许填它**，否则配置端口与临时端口
+/// 会互相撞，见 [isReservedFallbackPort]。
 const int tunnelFallbackPortMin = 3090;
 const int tunnelFallbackPortMax = 3099;
 
-/// 是否落在临时端口保留段（设置页据此拒绝保存，隧道据此挑临时端口）。
-bool isReservedFallbackPort(int port) =>
-    port >= tunnelFallbackPortMin && port <= tunnelFallbackPortMax;
+/// 临时端口**完整保留池**：3090–3149（首选段 3090-3099 + 扩展段 3100-3149）。
+///
+/// 为什么光有 10 个会把用户逼死（2026-10-21 真机复盘）：端口占用绝大多数是
+/// **自家僵尸 FD**。Android 后台回收常常只销毁 Activity，进程被 sticky 前台服务
+/// 加 wakelock 拽着不死；从最近任务回来时 Flutter 在**同一个进程里换了个
+/// isolate**。而 isolate 死掉**不会**释放它没 `close()` 的 `ServerSocket`——
+/// 实测（dart 3.7：同进程 spawn 一个 isolate 绑端口后 `Isolate.kill(immediate)`）
+/// 端口一直占到**整个进程退出**为止。于是每"退后台 → 回前台"一轮就烧掉一个可借
+/// 端口，10 个烧满之后就是「绑定全失败 → 停止重试 → 只能手动杀进程」。
+/// 扩池只是把死锁推迟到几十轮；真正止血在 `TunnelService` 的残骸清扫
+/// （`_sweepOrphanListeners`）与「重启应用」一键自救。
+/// 仍然全是固定段、一眼认得出是隧道借的，**没有退回 `bind(0)`**。
+const int tunnelFallbackPoolMin = tunnelFallbackPortMin;
+const int tunnelFallbackPoolMax = 3149;
 
-/// 临时端口的尝试顺序：保留段打乱后返回。
+/// 是否落在临时端口保留池（设置页据此拒绝保存，隧道据此挑临时端口）。
+bool isReservedFallbackPort(int port) =>
+    port >= tunnelFallbackPoolMin && port <= tunnelFallbackPoolMax;
+
+/// 临时端口的尝试顺序：**首选段先试**（段内打乱），再用扩展段（段内也打乱）。
 ///
 /// 打乱是必要的——同机多路实例配置端口全被占时，若都从 3090 开始抢，第一个
 /// 占走 3090 后其余各要多试一次才拿到 3091；随机起点让它们互不干扰。
+/// 首选段整体排在前面，是为了让"状态栏里看到的临时端口"绝大多数时候还是
+/// 3090-3099 这个用户最眼熟的窗口。
 List<int> fallbackPortCandidates({double Function()? random}) {
-  final ports = <int>[
-    for (var port = tunnelFallbackPortMin; port <= tunnelFallbackPortMax; port++)
-      port
-  ];
-  final rnd = random;
-  if (rnd == null) return ports;
-  for (var i = ports.length - 1; i > 0; i--) {
-    final j = (rnd() * (i + 1)).floor().clamp(0, i);
-    final tmp = ports[i];
-    ports[i] = ports[j];
-    ports[j] = tmp;
+  List<int> build(int from, int to) {
+    final ports = <int>[for (var port = from; port <= to; port++) port];
+    final rnd = random;
+    if (rnd == null) return ports;
+    for (var i = ports.length - 1; i > 0; i--) {
+      final j = (rnd() * (i + 1)).floor().clamp(0, i);
+      final tmp = ports[i];
+      ports[i] = ports[j];
+      ports[j] = tmp;
+    }
+    return ports;
   }
-  return ports;
+
+  return [
+    ...build(tunnelFallbackPortMin, tunnelFallbackPortMax),
+    if (tunnelFallbackPoolMax > tunnelFallbackPortMax)
+      ...build(tunnelFallbackPortMax + 1, tunnelFallbackPoolMax),
+  ];
 }
 
-/// 本地转发端口彻底起不来：配置端口被占、临时端口也绑不上。
+/// 本地转发端口彻底起不来：配置端口被占、整个临时端口池也绑不上。
 ///
 /// 带着"谁占着"的探测结论上抛，界面上才能给出可执行的动作——只说
 /// 「请关闭其它占用该端口的程序」用户无从下手（手机上根本看不到是谁）。
 class TunnelLocalPortOccupiedException implements Exception {
-  const TunnelLocalPortOccupiedException(this.port, this.holder);
+  const TunnelLocalPortOccupiedException(
+    this.port,
+    this.holder, {
+    this.tried = const [],
+    this.selfZombieSuspected = false,
+    this.occupiedBySelf = const [],
+    this.occupiedByOthers = const [],
+  });
 
   /// 配置里要求的本地端口。
   final int port;
@@ -57,10 +87,40 @@ class TunnelLocalPortOccupiedException implements Exception {
   /// 占用情况的一句话结论（见 TunnelService 的端口探测）。
   final String holder;
 
+  /// **实际尝试过并绑定失败**的端口（含配置端口与整个保留池）。
+  ///
+  /// 必须有：用户第一反应是"你根本没随机试"，而这条列表就是"确实逐个试过了"
+  /// 的证据；空列表则说明确实是没走到那一步，两者排查方向完全不同。
+  final List<int> tried;
+
+  /// 占用者在本进程内的端口（Dart 报 `shared flag to bind()`）。
+  ///
+  /// 这一类是本次事故的主因：自家没 `close()` 的残骸，或者**上一个 isolate** 留下
+  /// 的僵尸监听（进程没死、isolate 换了，FD 跟着进程一起活着）。前者能被清扫回收，
+  /// 后者谁也碰不到。
+  final List<int> occupiedBySelf;
+
+  /// 被**别的进程**占着的端口（内核 `EADDRINUSE`）——该让用户去设置里换端口。
+  final List<int> occupiedByOthers;
+
+  /// 是否怀疑占着端口的是**本进程上一世代 isolate 留下的僵尸监听**。
+  ///
+  /// 判据以**错误形态**为准：`ServerSocket.bind` 只有在**本进程**已经绑过这个端口
+  /// 时才报 `shared flag to bind()`（`osError.errorCode = -1`），而自家登记表里又
+  /// 没有这个端口 —— 那就只能是上一个 isolate 留下的僵尸监听。这种占用从 Dart 侧
+  /// 永远关不掉（FD 属于已死的 isolate，只随进程退出而释放），所以界面要把
+  /// 「重启应用」提为主按钮，而不是让用户去找"其它占用该端口的程序"：他什么也
+  /// 关不掉。pid 自比对（`TunnelService._detectSameProcessRespawn`）只作旁证进日志。
+  final bool selfZombieSuspected;
+
   @override
   String toString() =>
-      '本地端口 $port 被占用（$holder），临时端口段 $tunnelFallbackPortMin-'
-      '$tunnelFallbackPortMax 也全部不可用';
+      '本地端口 $port 被占用（$holder），临时端口池 $tunnelFallbackPoolMin-'
+      '$tunnelFallbackPoolMax 也全部不可用'
+      '（共试过 ${tried.isEmpty ? '0' : tried.length} 个：${tried.join(',')}；'
+      '本进程内占用 ${occupiedBySelf.isEmpty ? '无' : occupiedBySelf.join(',')}、'
+      '外部进程占用 ${occupiedByOthers.isEmpty ? '无' : occupiedByOthers.join(',')}）'
+      '${selfZombieSuspected ? ' → 疑似本进程上一世代 isolate 残留，需重启应用' : ''}';
 }
 
 /// 隧道故障类别：决定给用户看什么话、要不要立刻打扰用户。
@@ -122,8 +182,10 @@ String tunnelFailureSummary(TunnelFailureKind kind) {
     case TunnelFailureKind.remoteDown:
       return 'SSH 已连通，但云端服务没有应答：请确认远端服务已启动';
     case TunnelFailureKind.localPort:
-      return '本地端口被别的程序占住，临时端口段（3090-3099）也已用满：'
-          '请在设置里换一个本地端口（勿填 3090-3099）后点「立即重试」';
+      return '本地端口被占住，临时端口池（$tunnelFallbackPoolMin-'
+          '$tunnelFallbackPoolMax）也已用满：请点「重启应用」收回本进程残留的监听，'
+          '或在设置里换一个本地端口（勿填 $tunnelFallbackPoolMin-'
+          '$tunnelFallbackPoolMax）后点「立即重试」';
     case TunnelFailureKind.none:
       return '连接正常';
     case TunnelFailureKind.unknown:
@@ -151,14 +213,19 @@ bool isConfigurationFailure(TunnelFailureKind kind) {
   }
 }
 
-/// 这类故障重试一万次也不会变好：得由用户改配置或释放资源才能解。
+/// 这类故障"多试几次也不会变好"：不该拿快速退避去空转，得由用户改配置或释放资源。
 ///
-/// 端口占用是最典型的一个——过去它排在"永不放弃"的退避重试里，界面上
-/// 「第 4 次尝试 · 约 5 秒后自动重试」转个没完，而端口并不会因为多试几次
-/// 就空出来（真机实测）。现在：能自己救的（改临时端口）当场救，救不了的
-/// 就停下来把入口交给用户，不再空转。
+/// **语义是"别空转"，不是"从此不再尝试"**：监督器改按
+/// [tunnelLocalPortSalvageInterval] 兜底慢试（见 tunnel_service 的 futile 分支）。
+/// 早先是直接停止一切重试，于是端口占用被钉成永久失败，用户除了杀进程没有第二条
+/// 路；而端口占用常常是暂时的（第三方 App 退出、自家残骸被回收），60s 一次的代价
+/// 几乎为零，却把"必须手动干预"变成"多数情况自己活过来"。界面仍是 `hard` 级红色
+/// 指引，不会退回"第 4 次尝试 · 约 5 秒后自动重试"那种假装在干活的空转。
 bool isFutileRetryFailure(TunnelFailureKind kind) =>
     kind == TunnelFailureKind.localPort;
+
+/// 端口类故障的兜底重试节奏：**不再永久停止**，但也不再快速空转。
+const Duration tunnelLocalPortSalvageInterval = Duration(seconds: 60);
 
 /// 从异常推断故障类别。
 ///

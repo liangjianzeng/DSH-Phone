@@ -251,15 +251,38 @@ void main() {
       const e = TunnelLocalPortOccupiedException(3081, '有程序正在监听，且能接受连接');
       expect(classifyTunnelFailure(e), TunnelFailureKind.localPort);
       final summary = tunnelFailureSummary(TunnelFailureKind.localPort);
-      // 不能只说"请关闭其它占用的程序"——手机上根本看不到是谁，得给出能做的动作
+      // 不能只说"请关闭其它占用的程序"——手机上根本看不到是谁，得给出能做的动作。
+      // 而"重启应用"是必须有的那一个：占着端口的常是本进程上一世代 isolate 的
+      // 僵尸监听，用户既看不见也关不掉，只有进程重开才收得回来。
+      expect(summary, contains('重启应用'));
       expect(summary, contains('换一个本地端口'));
       expect(summary, contains('立即重试'));
       expect('$e', contains('3081'));
       expect('$e', contains('有程序正在监听'));
     });
 
-    test('端口占用属于"重试也不会好"，其它故障仍要永不放弃', () {
+    test('异常要带上"到底试过了哪些端口"与僵尸判定（回应用户"你没随机重试"）',
+        () {
+      const e = TunnelLocalPortOccupiedException(
+        3081,
+        '无进程应答（端口处于内核残留或半关状态）',
+        tried: [3081, 3093, 3090],
+        selfZombieSuspected: true,
+      );
+      expect('$e', allOf(contains('3081'), contains('3093'), contains('3090')));
+      expect('$e', contains('疑似'));
+      expect('$e', contains('需重启应用'));
+      // 没试过任何端口时不能假装试过（空列表 = 根本没走到候选那一步，排查方向不同）
+      const bare = TunnelLocalPortOccupiedException(3081, 'x');
+      expect(bare.tried, isEmpty);
+      expect('$bare', isNot(contains('疑似')));
+    });
+
+    test('端口占用不再快速空转，但也**不是永久停止重试**', () {
       expect(isFutileRetryFailure(TunnelFailureKind.localPort), isTrue);
+      // 「不空转」的落地节奏：60s 兜底一次。曾经这里是直接 return，端口占用被
+      // 钉成永久失败，用户只剩"杀进程"一条路——真机就是这么报的。
+      expect(tunnelLocalPortSalvageInterval, const Duration(seconds: 60));
       // 网络类必须继续退避重试：它们真的会因为重试而变好
       expect(isFutileRetryFailure(TunnelFailureKind.timeout), isFalse);
       expect(isFutileRetryFailure(TunnelFailureKind.unreachable), isFalse);
@@ -275,26 +298,42 @@ void main() {
     });
   });
 
-  group('临时端口保留段 3090-3099（用户定的规矩）', () {
-    test('边界判定：段内拒绝，段外放行', () {
+  group('临时端口保留池 3090-3149（首选段 3090-3099）', () {
+    test('边界判定：池内拒绝，池外放行', () {
       expect(isReservedFallbackPort(3089), isFalse);
       expect(isReservedFallbackPort(3090), isTrue);
-      expect(isReservedFallbackPort(3095), isTrue);
       expect(isReservedFallbackPort(3099), isTrue);
-      expect(isReservedFallbackPort(3100), isFalse);
+      // 3100 起是扩展段：同样不许用户填，否则隧道连可借的端口都会被抢光
+      expect(isReservedFallbackPort(3100), isTrue);
+      expect(isReservedFallbackPort(tunnelFallbackPoolMax), isTrue);
+      expect(isReservedFallbackPort(tunnelFallbackPoolMax + 1), isFalse);
       expect(isReservedFallbackPort(0), isFalse);
+      // 配置端口 3081 绝不能被误伤，否则用户连默认值都存不下去
+      expect(isReservedFallbackPort(3081), isFalse);
     });
 
-    test('候选就是这十个，不重不漏；不给随机数时按升序', () {
+    test('候选 = 首选段在前 + 扩展段在后，不重不漏', () {
       final ordered = fallbackPortCandidates();
-      expect(ordered,
-          List<int>.generate(10, (i) => tunnelFallbackPortMin + i));
-      // 固定序列的伪随机：验证"打乱后仍是同一集合"，而不是每次都能翻出别的端口
+      expect(
+          ordered,
+          List<int>.generate(
+              tunnelFallbackPoolMax - tunnelFallbackPoolMin + 1,
+              (i) => tunnelFallbackPoolMin + i));
+      expect(ordered.length, greaterThan(10),
+          reason: '只有 10 个会把用户逼死：每退一次后台烧掉一个，烧满就只能杀进程');
+      // 首选段整体排在扩展段之前：状态栏里的临时端口绝大多数仍是眼熟的 3090-3099
+      expect(ordered.take(10).toSet(),
+          {for (var p = tunnelFallbackPortMin; p <= tunnelFallbackPortMax; p++) p});
+
+      // 固定序列的伪随机：验证"打乱后仍是同一集合"，且两段各自打乱、顺序不乱
       var k = 0;
       final shuffled =
           fallbackPortCandidates(random: () => ((k++ * 37) % 100) / 100.0);
-      expect(shuffled.toSet().length, 10);
+      expect(shuffled.toSet().length, ordered.length);
       expect(shuffled.toSet(), ordered.toSet());
+      expect(shuffled.first, greaterThanOrEqualTo(tunnelFallbackPortMin));
+      expect(shuffled.first, lessThanOrEqualTo(tunnelFallbackPortMax),
+          reason: '首选段必须永远排在最前，随机打乱不能把它挤到后面');
     });
   });
 

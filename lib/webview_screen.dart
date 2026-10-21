@@ -435,7 +435,12 @@ class _WebViewScreenState extends State<WebViewScreen>
         // 一遍鉴权链）。
         TunnelService.instance.notifyShouldReconnectNow('resume');
       case AppLifecycleState.detached:
-        break;
+        // 引擎要没了：趁还来得及**主动**关掉本地监听。isolate 死亡不会释放没
+        // close() 的 ServerSocket（端口一直占到整个进程退出），Android 又常常只
+        // 销毁 Activity、进程被前台服务拽着不死——这一刻不关，这个端口就永久烧掉，
+        // 烧满保留池就是"退后台再拉起必然报错、只能杀进程"。见
+        // `TunnelService.releaseLocalResources`。
+        unawaited(TunnelService.instance.releaseLocalResources('detached'));
     }
   }
 
@@ -2548,9 +2553,18 @@ class _WebViewScreenState extends State<WebViewScreen>
   //  3. 必须提供一个**真的能刷新**的入口（横幅按钮 / 顶栏按钮）；
   //  4. 技术细节收进「连接诊断」页，不进主界面。
 
+  /// 「重启应用」：端口被本进程**上一世代 isolate 的僵尸监听**占死时，这是唯一
+  /// 能收回文件描述符的动作——那些 `ServerSocket` 已不属于当前 isolate，Dart 侧
+  /// 任何回收都碰不到，只有进程退出才会被内核收走。用户今天本来就在手动做这件事
+  /// （杀进程再拉起），这里只是把它变成一键。
+  void _restartAppForPorts() {
+    unawaited(TunnelService.instance.restartProcessToReleasePorts());
+  }
+
   /// 首次连接（从未成功连上）时的整屏引导。
   Widget _buildInitialScreen() {
     final hard = _tunnel.alertLevel == TunnelAlertLevel.hard;
+    final portStuck = _tunnel.kind == TunnelFailureKind.localPort;
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24),
@@ -2573,6 +2587,19 @@ class _WebViewScreenState extends State<WebViewScreen>
               icon: const Icon(Icons.refresh),
               label: const Text('立即重试'),
             ),
+            // 端口彻底起不来：给它一个真正能解的动作。「重启应用」在怀疑是自家
+            // 僵尸监听时提为主按钮——那种占用用户既看不见也关不掉，让他去找
+            // "其它占用该端口的程序"纯属误导。
+            if (portStuck) ...[
+              const SizedBox(height: 8),
+              FilledButton.tonalIcon(
+                onPressed: _restartAppForPorts,
+                icon: const Icon(Icons.power_settings_new),
+                label: Text(TunnelService.instance.localPortSelfZombieSuspected
+                    ? '重启应用（清掉残留端口，推荐）'
+                    : '重启应用'),
+              ),
+            ],
             const SizedBox(height: 8),
             Row(
               mainAxisSize: MainAxisSize.min,
@@ -2644,6 +2671,19 @@ class _WebViewScreenState extends State<WebViewScreen>
                   onPressed: _openSettings,
                   child: Text('改设置', style: TextStyle(color: fg)),
                 ),
+              // 端口占用还有一条改设置解决不了的路：占着端口的是本进程上一世代
+              // isolate 的僵尸监听（用户既看不见也关不掉）。把「重启应用」直接摆
+              // 在横幅上，别逼用户去诊断页里找线索、再手动杀进程。
+              if (hard && _tunnel.kind == TunnelFailureKind.localPort)
+                TextButton(
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    minimumSize: const Size(0, 36),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  onPressed: _restartAppForPorts,
+                  child: Text('重启应用', style: TextStyle(color: fg)),
+                ),
               IconButton(
                 tooltip: '连接诊断',
                 iconSize: 18,
@@ -2677,7 +2717,7 @@ class _WebViewScreenState extends State<WebViewScreen>
       // 临时端口要如实说出来：用户以为自己在用 3081、实际是 4xxxx，
       // 不说清下次他对着 3081 抓包会一头雾水。
       parts.add(TunnelService.instance.usingFallbackLocalPort
-          ? '127.0.0.1:$port（配置端口被占，临时借用保留段）'
+          ? '127.0.0.1:$port（配置端口被占，临时借用保留池）'
           : '127.0.0.1:$port');
     }
     final since = _tunnel.connectedSince;

@@ -603,16 +603,17 @@ class _SetupScreenState extends State<SetupScreen> {
     return null;
   }
 
-  /// 本地隧道端口专用校验：3090-3099 是隧道在配置端口被占时**自己借用**的
-  /// 临时端口保留段。让用户填这个段会出两种坑：配置端口与临时端口互相抢占，
-  /// 或者用户占掉之后隧道连可借的端口都没了。所以直接拒绝并说明原因。
+  /// 本地隧道端口专用校验：3090-3149 是隧道在配置端口被占时**自己借用**的临时
+  /// 端口保留池（首选段 3090-3099，用满继续往后借）。让用户填这个池子会出两种
+  /// 坑：配置端口与临时端口互相抢占，或者用户占掉之后隧道连可借的端口都没了。
+  /// 所以直接拒绝并说明原因。
   String? _validateLocalPort(String? v) {
     final basic = _validatePort(v);
     if (basic != null) return basic;
     final p = int.tryParse(v ?? '');
     if (p != null && isReservedFallbackPort(p)) {
-      return '$tunnelFallbackPortMin-$tunnelFallbackPortMax 是隧道临时端口保留段，'
-          '不能设为本地端口（换一个，例如 ${tunnelFallbackPortMin - 9}）';
+      return '$tunnelFallbackPoolMin-$tunnelFallbackPoolMax 是隧道临时端口保留池，'
+          '不能设为本地端口（换一个，例如 ${tunnelFallbackPoolMin - 9}）';
     }
     return null;
   }
@@ -866,7 +867,7 @@ class _SetupScreenState extends State<SetupScreen> {
             decoration: const InputDecoration(
               labelText: '本地隧道端口',
               helperText: '默认 3081，DSH 界面将通过 http://127.0.0.1:<端口> 访问；'
-                  '$tunnelFallbackPortMin-$tunnelFallbackPortMax 为隧道临时端口保留段，不可填写',
+                  '$tunnelFallbackPoolMin-$tunnelFallbackPoolMax 为隧道临时端口保留池，不可填写',
               border: OutlineInputBorder(),
             ),
             validator: _validateLocalPort,
