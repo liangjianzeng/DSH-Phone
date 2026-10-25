@@ -76,6 +76,11 @@ android {
             // 有 key.properties 用 release 签名；否则回退 debug 签名，
             // 保证各打包机在未配置签名密钥时也能产出可安装 APK。
             def hasKey = rootProject.file('key.properties').exists()
+            if (!hasKey) {
+                // debug 签名的包不能覆盖安装正式版：构建日志里显式留一行警告，
+                // 避免"打包成功"被误当成"可发布"。
+                logger.warn('DSH-Phone: 缺少 android/key.properties，release 回退 DEBUG 签名（仅供自测，不可覆盖安装正式版）')
+            }
             signingConfig = hasKey ? signingConfigs.release : signingConfigs.debug
         }
     }
