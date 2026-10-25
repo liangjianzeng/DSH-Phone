@@ -163,7 +163,7 @@ flutter build apk --release --target-platform=android-arm64
 | `charset` | 文件编码自动检测（UTF-8 / GBK / ASCII） |
 | `file_picker` | 下载 / 另存为：系统文件选择器（SAF）保存位置 |
 | `path_provider` | 下载临时目录 |
-| `flutter_foreground_task`（本地 fork，`third_party/`） | 前台服务后台保活（隧道连接期间保持进程/网络，避免后台断线重连；补 namespace 兼容 AGP 8.x） |
+| `flutter_foreground_task`（官方包 ^9.2.2） | 前台服务后台保活（隧道连接期间保持进程/网络，避免后台断线重连；2026-10 弃本地 fork 回归官方） |
 | `sherpa_onnx` + `record` | 端侧流式语音识别（sherpa-onnx 流式 Zipformer 中文模型 CPU 推理）+ 16kHz PCM 录音流 |
 | `background_downloader` | ASR 中文模型下载（~160MB 断点续传，hf-mirror 主源 + huggingface 兜底） |
 | `geolocator` | 月相观测位置定位获取（GPS，失败自动回退） |
@@ -208,7 +208,6 @@ lib/
 ├── task_notifier.dart        # AI 任务进行中/完成系统通知（锁屏可见）
 └── foreground_service.dart   # 前台服务保活封装（隧道连接期间后台保持进程/网络）
 third_party/dartssh2/                 # 本地 fork 的 dartssh2（吞吐优化 + SFTP 会话释放 + 半开连接/通道泄漏等 5 处本地加固，同步上游时须保留）
-third_party/flutter_foreground_task/  # 本地 fork 的 flutter_foreground_task（AGP 8.x namespace 兼容）
 tool/build_apk.sh                     # 打包机一键脚本（环境自检 / 补齐 aarch64 主机的官方 AOT 产物 / 构建）
 tool/check_bridges_js.mjs             # 注入式 JS 桥校验（假 DOM 跑点击分发；桥脚本写在 Dart 字符串里，analyze/test 看不见其内部）
 test/                                 # 单元测试 112 例（隧道失败分类与退避 / 热词校正 / 成果识别与渲染 / 查看器布局回归 / 日出日落 …）；CI 跑 analyze + test + JS 桥校验

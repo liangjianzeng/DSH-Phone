@@ -19,7 +19,9 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 version: 0.2.3+19
 
 environment:
-  sdk: ^3.6.0
+  # Dart 3.7 = Flutter 3.29（与开发机一致）。CI 基线同步钉 3.29.0，
+  # 避免本地 pub get 反复把 lockfile 的 sdk 约束漂到 3.7 再回滚。
+  sdk: ^3.7.0
 
 # Dependencies specify other packages that your package needs in order to work.
 # To automatically upgrade your package dependencies to the latest versions
@@ -49,7 +51,8 @@ dependencies:
   lunar: ^1.7.1                        # 农历计算：相机按钮按初一到十五再到三十显示月相
   # 前台服务保活：隧道连接期间在后台保持进程与网络，避免后台/关屏后
   # SSH 保活停止导致远端空闲断开、恢复前台必然重连。
-  flutter_foreground_task: ^4.0.0
+  # 2026-10 回归官方包：上游 9.x 已带 AGP 8 所需 namespace，本地 fork 退役。
+  flutter_foreground_task: ^9.2.2
   # 熄屏通知：AI 智能体任务进行中/完成时发系统通知，锁屏可见。
   flutter_local_notifications: ^17.2.2
   # 观测者位置：月相按钮按真实纬度/经度计算盘面朝向（月出月落旋转）。
@@ -83,10 +86,6 @@ dependency_overrides:
   # 显著提升隧道吞吐，避免长上下文历史加载超时。
   dartssh2:
     path: third_party/dartssh2
-  # 本地 fork 的 flutter_foreground_task：为 Android 库模块补 namespace，
-  # 兼容 AGP 8.x（原包缺失 namespace 导致 assembleRelease 失败）。
-  flutter_foreground_task:
-    path: third_party/flutter_foreground_task
 
 dev_dependencies:
   flutter_test:

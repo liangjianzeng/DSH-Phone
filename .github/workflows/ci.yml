@@ -16,17 +16,17 @@ on:
     branches: [main]
 
 jobs:
-  # 真正的门禁：项目声明的最低支持版本（environment.sdk ^3.6.0 ⇒ Flutter 3.27）。
+  # 真正的门禁：项目声明的最低支持版本（environment.sdk ^3.7.0 ⇒ Flutter 3.29）。
   # 这一条红 = 合并被拦。
   analyze-test:
-    name: flutter analyze + test（基线 3.27.0）
+    name: flutter analyze + test（基线 3.29.0）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: '3.27.0'
+          flutter-version: '3.29.0'
           cache: true
       - name: pub get
         run: flutter pub get

@@ -32,21 +32,22 @@ class ForegroundTunnelService {
         enableVibration: false,
         playSound: false,
         showWhen: false,
-        // 被系统意外终止时自动重启服务，尽量保住隧道。
-        isSticky: true,
         visibility: NotificationVisibility.VISIBILITY_PRIVATE,
       ),
       iosNotificationOptions: const IOSNotificationOptions(
         showNotification: false,
         playSound: false,
       ),
-      foregroundTaskOptions: const ForegroundTaskOptions(
-        interval: 5000,
-        isOnceEvent: true,
+      foregroundTaskOptions: ForegroundTaskOptions(
+        // 服务只为保活存在，无周期任务（9.x 用 eventAction 取代旧版
+        // interval/isOnceEvent；nothing = 不触发 onRepeatEvent）。
+        eventAction: ForegroundTaskEventAction.nothing(),
         autoRunOnBoot: false,
         // 持有 PARTIAL_WAKE_LOCK：关屏时 CPU 保持运行以继续发送保活。
         allowWakeLock: true,
         allowWifiLock: false,
+        // 服务被系统杀掉后自动重启，尽量保住隧道（承接旧版 isSticky）。
+        allowAutoRestart: true,
       ),
     );
   }
@@ -92,10 +93,15 @@ class ForegroundTunnelService {
     if (_want == _started) return; // 已符合期望（含"本来就没起、也不需要起"）
     if (_want) {
       try {
-        final ok = await FlutterForegroundTask.startService(
+        final result = await FlutterForegroundTask.startService(
           notificationTitle: 'DSH-Phone',
           notificationText: 'SSH 隧道运行中',
         );
+        // 9.x 起返回 sealed result 而非 bool。服务已在运行也按成功处理：
+        // 进程被杀后服务自动重启的场合，"期望态=运行"本就成立。
+        final ok = result is ServiceRequestSuccess ||
+            (result is ServiceRequestFailure &&
+                result.error is ServiceAlreadyStartedException);
         _started = ok;
         if (ok) {
           debugPrint('[DSH] foreground service started');

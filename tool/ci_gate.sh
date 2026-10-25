@@ -64,8 +64,9 @@ run_gate "JS 桥校验" /tmp/gate_js.log '✗|Error|error|失败' \
   'node tool/check_bridges_js.mjs'
 
 # 2) vendored fork：只卡 error/warning（info 是上游 deprecation，交人工与同步时处理）。
+#    （flutter_foreground_task fork 已退役回归官方包，仅剩 dartssh2。）
 run_gate "第三方 fork 分析" /tmp/gate_fork.log 'error -|warning -' \
-  'dart analyze third_party/dartssh2 && dart analyze third_party/flutter_foreground_task'
+  'dart analyze third_party/dartssh2'
 
 # 3) 主分析：info 不致命。
 run_gate "静态分析" /tmp/gate_analyze.log ' • ' \
@@ -93,8 +94,9 @@ if (( SKIP_TEST == 0 )); then
     'flutter test --no-pub --reporter expanded'
 fi
 
-# 6) 依赖解析清单：本仓库不提交 pubspec.lock，CI 每次重新解析，上游发新版
-#    就可能编出本地从未见过的错误——把实际解析结果贴出来省一轮猜测。
+# 6) 依赖解析清单：lock 实际随仓库提交（与下方历史注释相反——曾有一段
+#    不提交的时期，2026-10 体检时确认早已改为提交），本地 pub get 若改了
+#    lock 必须一并提交，否则 CI 与本地依赖面不一致；贴出解析结果省一轮猜测。
 if [[ -n "$SUMMARY" ]]; then
   {
     echo '### 依赖解析结果（compact）'
