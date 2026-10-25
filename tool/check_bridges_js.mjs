@@ -162,6 +162,21 @@ const check = (name, ok, detail = '') => cases.push({ name, ok, detail });
   check('libfoo.so.1 归 resource（不进文本查看器）',
     p?.type === 'resource', JSON.stringify(p));
 
+  // PDF/office 放行（2026-10）：DSH Web 自带 pdf.js 预览（office 服务端转 PDF），
+  // 真实成果控件交回 Web 处理、App 不截走；代码块裸文件名/外部链接 Web
+  // 没人接管，仍走 App 下载。
+  chips = [];
+  let none = await click(el({ title: '/root/out/报告.pdf', _class: '_fileMention_1', _matches: ['button'] }, 'BUTTON'));
+  check('成果 chips 的 PDF 放行给 Web 预览（不截走）', none.length === 0, JSON.stringify(none));
+  none = await click(el({ href: '/api/files/报表.xlsx?token=abc', _matches: ['a'] }, 'A'));
+  check('成果链接的 office 放行给 Web 预览（不截走）', none.length === 0, JSON.stringify(none));
+  p = (await click(el({ _text: '/root/out/报告.pdf', _matches: ['code'] }, 'CODE')))[0];
+  check('代码块裸 PDF 文件名仍归 resource（Web 不处理代码块）',
+    p?.type === 'resource', JSON.stringify(p));
+  p = (await click(el({ href: '/dl/报告.pdf', _matches: ['a'] }, 'A')))[0];
+  check('外部 PDF 链接仍归 resource（非 DSH 成果控件）',
+    p?.type === 'resource', JSON.stringify(p));
+
   // composer 附件区放行：不能拦截附件删除按钮
   chips = [el({ title: '/tmp/up.png' })];
   const card = el({ _matches: ['[data-composer-card]'] }, 'DIV');

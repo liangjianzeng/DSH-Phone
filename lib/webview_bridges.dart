@@ -179,6 +179,14 @@ const String artifactBridgeJs = r'''
       return anyArtifactRe.test(s) || versionedSoRe.test(s);
     }
     var isFileUrlPrefix = /\/api\/files\/|\/files\/|\/api\/artifact\/|\/artifacts\//i;
+    // PDF/Office 放行：DSH Web 自带 pdf.js 预览侧栏（office 由服务端
+    // office-to-pdf 转换后进同一预览），App 原生查看器渲染不了这两类，
+    // webFallback 的裸文件 URL 在安卓系统 WebView 也显示不了 PDF——
+    // 所以「确属 DSH 成果控件」的这两类点击交回 Web 自己的预览处理，
+    // App 不再截走送下载页。仅放行真实成果控件（fileMention chips、
+    // /api/files/ 成果链接）；代码块裸文件名与外部链接 Web 没人接管，
+    // 仍走 App 下载。
+    var passPreviewRe = /\.(pdf|doc|docx|xls|xlsx|ppt|pptx)(\?|#|$)/i;
 
     // 1) 文件型成果链接：优先判断，即使链接包裹在 pre/code 里。
     var a = closestUp(t, ['a']);
@@ -186,6 +194,8 @@ const String artifactBridgeJs = r'''
       var href = a.getAttribute('href') || '';
       var isFile = isFileUrlPrefix.test(href) || isTextPath(href);
       var isResource = isResourcePath(href);
+      // DSH 成果链接的 PDF/office：放行给 Web 自带 pdf.js 预览
+      if (isFileUrlPrefix.test(href) && passPreviewRe.test(href)) return;
       if (isFile || isResource) {
         ev.preventDefault();
         ev.stopPropagation();
@@ -223,6 +233,10 @@ const String artifactBridgeJs = r'''
       var isMention = cls.indexOf('fileMention') >= 0 ||
           isArtifactPath(filePath);
       if (isMention && filePath) {
+        // 真实成果 chips（fileMention 类名）的 PDF/office：放行给 Web 预览
+        if (cls.indexOf('fileMention') >= 0 && passPreviewRe.test(filePath)) {
+          return;
+        }
         ev.preventDefault();
         ev.stopPropagation();
         // 资源型（apk 等二进制）：走下载保存流程；否则经 SSH 读取查看。
