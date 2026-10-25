@@ -141,6 +141,18 @@ const String artifactBridgeJs = r'''
     return dirs;
   }
 
+  // 成果链接前缀 + PDF/office 放行正则：click 与 contextmenu 两个处理器
+  // 共用，声明在 IIFE 顶层，避免两处各写一份漂移。
+  var isFileUrlPrefix = /\/api\/files\/|\/files\/|\/api\/artifact\/|\/artifacts\//i;
+  // PDF/Office 放行：DSH Web 自带 pdf.js 预览侧栏（office 由服务端
+  // office-to-pdf 转换后进同一预览），App 原生查看器渲染不了这两类，
+  // webFallback 的裸文件 URL 在安卓系统 WebView 也显示不了 PDF——
+  // 所以「确属 DSH 成果控件」的这两类点击交回 Web 自己的预览处理，
+  // App 不再截走送下载页。仅放行真实成果控件（fileMention chips、
+  // /api/files/ 成果链接）；代码块裸文件名与外部链接 Web 没人接管，
+  // 仍走 App 下载。
+  var passPreviewRe = /\.(pdf|doc|docx|xls|xlsx|ppt|pptx)(\?|#|$)/i;
+
   document.addEventListener('click', function(ev) {
     var t = ev.target;
 
@@ -178,15 +190,6 @@ const String artifactBridgeJs = r'''
       var s = String(p || '');
       return anyArtifactRe.test(s) || versionedSoRe.test(s);
     }
-    var isFileUrlPrefix = /\/api\/files\/|\/files\/|\/api\/artifact\/|\/artifacts\//i;
-    // PDF/Office 放行：DSH Web 自带 pdf.js 预览侧栏（office 由服务端
-    // office-to-pdf 转换后进同一预览），App 原生查看器渲染不了这两类，
-    // webFallback 的裸文件 URL 在安卓系统 WebView 也显示不了 PDF——
-    // 所以「确属 DSH 成果控件」的这两类点击交回 Web 自己的预览处理，
-    // App 不再截走送下载页。仅放行真实成果控件（fileMention chips、
-    // /api/files/ 成果链接）；代码块裸文件名与外部链接 Web 没人接管，
-    // 仍走 App 下载。
-    var passPreviewRe = /\.(pdf|doc|docx|xls|xlsx|ppt|pptx)(\?|#|$)/i;
 
     // 1) 文件型成果链接：优先判断，即使链接包裹在 pre/code 里。
     var a = closestUp(t, ['a']);
@@ -325,6 +328,37 @@ const String artifactBridgeJs = r'''
       ev.stopPropagation();
       send({type: 'markdown', url: '', language: '', content: md.innerText || md.textContent || ''});
       return;
+    }
+  }, true);
+
+  // 长按 = App 下载保底：安卓 WebView 长按触发 contextmenu。PDF/office
+  // 的成果控件点击已放行给 DSH Web 的 pdf.js 预览（见 passPreviewRe），
+  // 但 Web 预览里不一定有下载按钮——长按仍走 App 原生下载流，
+  // 预览/下载两条路都不丢。
+  document.addEventListener('contextmenu', function(ev) {
+    var t = ev.target;
+    if (closestUp(t, ['[data-composer-card]'])) return;
+    var a = closestUp(t, ['a']);
+    if (a) {
+      var href = a.getAttribute('href') || '';
+      if (isFileUrlPrefix.test(href) && passPreviewRe.test(href)) {
+        ev.preventDefault();
+        var base = href.split(/[\\/?#]+/).pop() || '';
+        send({type: 'resource', url: a.href, language: '', content: '',
+              path: findMentionPath(base), dirs: collectProducedDirs()});
+        return;
+      }
+    }
+    var mention = closestUp(t, ['button', 'a', 'span', '[data-file-path]', '[data-remote-path]', '[data-path]']);
+    if (mention) {
+      var cls = mention.className || '';
+      var filePath = elementPath(mention) || mention.getAttribute('title') ||
+          mention.getAttribute('aria-label') || '';
+      if (cls.indexOf('fileMention') >= 0 &&
+          filePath && passPreviewRe.test(filePath)) {
+        ev.preventDefault();
+        send({type: 'resource', url: '', language: '', content: '', path: filePath});
+      }
     }
   }, true);
 })();

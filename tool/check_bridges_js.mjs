@@ -70,6 +70,7 @@ function el(attrs, tagName = 'SPAN', parent = null) {
 let sent = [];
 let chips = [];
 let clickHandler = null;
+const handlers = {};
 let fetchImpl = async () => ({
   ok: true,
   status: 200,
@@ -81,6 +82,7 @@ const documentStub = {
   documentElement: {},
   readyState: 'complete',
   addEventListener: (type, fn) => {
+    handlers[type] = fn;
     if (type === 'click') clickHandler = fn;
   },
   querySelectorAll: () => chips,
@@ -109,6 +111,14 @@ async function click(target) {
   sent = [];
   clickHandler({ target, preventDefault() {}, stopPropagation() {} });
   await new Promise((r) => setTimeout(r, 30)); // 等 fetchArtifact 的 Promise 落地
+  return sent;
+}
+
+// 长按：安卓 WebView 的 contextmenu 事件（App 下载保底入口）
+async function longpress(target) {
+  sent = [];
+  handlers.contextmenu?.({ target, preventDefault() {}, stopPropagation() {} });
+  await new Promise((r) => setTimeout(r, 30));
   return sent;
 }
 
@@ -176,6 +186,18 @@ const check = (name, ok, detail = '') => cases.push({ name, ok, detail });
   p = (await click(el({ href: '/dl/报告.pdf', _matches: ['a'] }, 'A')))[0];
   check('外部 PDF 链接仍归 resource（非 DSH 成果控件）',
     p?.type === 'resource', JSON.stringify(p));
+
+  // 长按（contextmenu）= App 下载保底：PDF/office 放行给 Web 预览后，
+  // App 侧下载入口不能丢。
+  chips = [];
+  p = (await longpress(el({ title: '/root/out/报告.pdf', _class: '_fileMention_1', _matches: ['button'] }, 'BUTTON')))[0];
+  check('长按成果 chips 的 PDF 走 App 下载',
+    p?.type === 'resource' && /报告\.pdf$/.test(p?.path || ''), JSON.stringify(p));
+  p = (await longpress(el({ href: '/api/files/报表.xlsx?token=abc', _matches: ['a'] }, 'A')))[0];
+  check('长按成果链接的 office 走 App 下载',
+    p?.type === 'resource' && /报表\.xlsx$/.test((p?.url || '').split(/[?#]/)[0]), JSON.stringify(p));
+  const noneMd = await longpress(el({ title: '/root/out/note.md', _class: '_fileMention_1', _matches: ['button'] }, 'BUTTON'));
+  check('长按文本 chips 不触发下载（非放行类型）', noneMd.length === 0, JSON.stringify(noneMd));
 
   // composer 附件区放行：不能拦截附件删除按钮
   chips = [el({ title: '/tmp/up.png' })];

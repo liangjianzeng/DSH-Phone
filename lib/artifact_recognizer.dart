@@ -155,6 +155,20 @@ class ArtifactRules {
         lower.endsWith('.tiff');
   }
 
+  /// 安卓系统 WebView 渲染不了的文档后缀（无 PDF 插件、无 office 渲染器）。
+  ///
+  /// 与 webview_bridges.dart 里 artifactBridgeJs 的 passPreviewRe **两处必须
+  /// 一致**：这些类型的成果 chips 点击已放行给 DSH Web 自带 pdf.js 预览；
+  /// 失败卡片上的「用网页方式打开」对它们只会白屏，按此隐藏。
+  static const Set<String> _webviewUnrenderableSuffixes = {
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+  };
+
+  static bool isWebviewUnrenderable(String pathOrUrl) {
+    final lower = normalizeForSuffix(pathOrUrl);
+    return _webviewUnrenderableSuffixes.any(lower.endsWith);
+  }
+
   /// 代码块命中：点击落在 pre/code 内（由 JS 侧判定，这里只做类型归类）。
   static bool isCodeTarget(String tagName) =>
       tagName == 'PRE' || tagName == 'CODE';

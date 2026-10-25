@@ -144,6 +144,17 @@ void main() {
       expect(ArtifactRules.isImageSuffix('/a/b.png?token=x'), isTrue);
       expect(ArtifactRules.isImageSuffix('/a/b.md'), isFalse);
     });
+
+    test('isWebviewUnrenderable 覆盖 PDF/office（与桥侧 passPreviewRe 一致）', () {
+      expect(ArtifactRules.isWebviewUnrenderable('/a/报告.pdf'), isTrue);
+      expect(ArtifactRules.isWebviewUnrenderable('/a/报表.XLSX?token=x'), isTrue);
+      expect(ArtifactRules.isWebviewUnrenderable('/a/方案.docx#frag'), isTrue);
+      expect(ArtifactRules.isWebviewUnrenderable('/a/幻灯.pptx'), isTrue);
+      // 非 WebView 渲染死角：文本、图片、其它二进制都有各自的打开路径
+      expect(ArtifactRules.isWebviewUnrenderable('/a/note.md'), isFalse);
+      expect(ArtifactRules.isWebviewUnrenderable('/a/img.png'), isFalse);
+      expect(ArtifactRules.isWebviewUnrenderable('/a/app.apk'), isFalse);
+    });
   });
 
   group('parseArtifactHit 链接型成果', () {

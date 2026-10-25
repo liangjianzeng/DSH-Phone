@@ -568,7 +568,11 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
               icon: const Icon(Icons.download),
               label: const Text('另存为'),
             ),
-            if (widget.url.isNotEmpty) ...[
+            if (widget.url.isNotEmpty &&
+                // PDF/office：安卓 WebView 渲染不了（无 PDF 插件），点了
+                // 只会白屏——这类去对话里点文件卡片，走 DSH Web 自带
+                // pdf.js 预览（长按卡片则进 App 下载）。
+                !ArtifactRules.isWebviewUnrenderable(widget.url)) ...[
               const SizedBox(height: 8),
               OutlinedButton.icon(
                 // SFTP 这条路走不通时，同源链接往往还能打开（登录态在 WebView
