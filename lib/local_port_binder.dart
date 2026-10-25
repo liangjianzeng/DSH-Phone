@@ -221,7 +221,9 @@ class LocalPortBinder {
       await probe.close().catchError((_) {});
       try {
         probe.destroy();
-      } catch (_) {}
+      } catch (_) {
+        // socket 已关/从未真正建立：探测结论不受影响，无需处理。
+      }
       return '有程序正在监听，且能接受连接';
     } catch (_) {
       return '无进程应答（端口处于内核残留或半关状态）';

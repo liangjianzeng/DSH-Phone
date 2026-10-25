@@ -234,7 +234,9 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
     if (parts.isEmpty) return;
     try {
       await Clipboard.setData(ClipboardData(text: parts.join('\n')));
-    } catch (_) {}
+    } catch (_) {
+      // 剪贴板被系统策略限制（如企业策略）：复制失败仍给出提示，内容可手动选。
+    }
     if (!mounted) return;
     _toast('已复制文件名与路径');
   }
@@ -826,7 +828,9 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
             if (href.isEmpty) return;
             try {
               await Clipboard.setData(ClipboardData(text: href));
-            } catch (_) {}
+            } catch (_) {
+              // 剪贴板不可用：仍提示链接内容，用户可手动抄录。
+            }
             if (!mounted) return;
             _toast('链接已复制：$href');
           },
@@ -913,7 +917,9 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
           if (href == null || href.isEmpty) return;
           try {
             await Clipboard.setData(ClipboardData(text: href));
-          } catch (_) {}
+          } catch (_) {
+            // 剪贴板不可用：仍提示链接内容，用户可手动抄录。
+          }
           if (!mounted) return;
           _toast('链接已复制：$href');
         },
@@ -922,9 +928,11 @@ class _ArtifactViewerScreenState extends State<ArtifactViewerScreen> {
           // 于是"报告里所有截图都显示不出来"。
           var target = config.uri;
           if (target.scheme.isEmpty && base != null) {
-            try {
-              target = base.resolveUri(target);
-            } catch (_) {}
+          try {
+            target = base.resolveUri(target);
+          } catch (_) {
+            // 非法相对路径 resolve 不了：保留原样交给 Image.network 自己报错。
+          }
           }
           return ConstrainedBox(
             constraints: const BoxConstraints(maxHeight: 640),

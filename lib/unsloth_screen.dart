@@ -150,7 +150,9 @@ class _UnslothScreenState extends State<UnslothScreen> {
     if (pw && /\/login/.test(window.location.pathname)) {
       try {
         window.flutter_inappwebview.callHandler('onUnslothLoginFailed', {});
-      } catch (e) {}
+      } catch (e) {
+        // 桥未注入（注入脚本早于桥生效）：本次登录态检测作废即可，不强报。
+      }
     }
   }, 6000);
 })();

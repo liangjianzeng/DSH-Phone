@@ -199,7 +199,9 @@ class AsrModelManager {
         final len = resp.contentLength;
         client.close(force: true);
         total += len > 0 ? len : 0;
-      } catch (_) {}
+      } catch (_) {
+        // 单个文件 HEAD 失败就跳过：总大小只用于进度条，走保守估计兜底。
+      }
     }
     return total > 0 ? total : 167000000;
   }

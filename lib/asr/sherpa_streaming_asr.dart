@@ -107,7 +107,9 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
         } finally {
           raf.closeSync();
         }
-      } catch (_) {}
+      } catch (_) {
+        // 预热（读入页缓存）失败无碍：只影响首次读取速度，不影响功能。
+      }
     }
   }
 
@@ -183,7 +185,9 @@ class SherpaStreamingAsr implements StreamingAsrEngine {
     if (_sessionActive) {
       try {
         await _worker?.discardSession();
-      } catch (_) {}
+      } catch (_) {
+        // 异常路径的收尾清理：失败也不能阻断 dispose（录音器仍需释放）。
+      }
       _sessionActive = false;
     }
     await _recorder.dispose();

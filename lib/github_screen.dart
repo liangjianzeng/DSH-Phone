@@ -122,12 +122,14 @@ class _GitHubScreenState extends State<GitHubScreen> {
       // 控制器已失效（极少见）：交回初始加载路径重建。
       _loadedTarget = '';
       await _loadInitial();
-    } finally {
-      try {
-        await c.setSettings(
-            settings: InAppWebViewSettings(cacheMode: CacheMode.LOAD_DEFAULT));
-      } catch (_) {}
-    }
+      } finally {
+        try {
+          await c.setSettings(
+              settings: InAppWebViewSettings(cacheMode: CacheMode.LOAD_DEFAULT));
+        } catch (_) {
+          // 控制器已随页面销毁：缓存模式恢复不了也无妨，下次建 WebView 会重置。
+        }
+      }
   }
 
   /// 打开 PAT 令牌输入对话框（在 GitHub 页面内即可配置令牌，免翻设置页）。
