@@ -2259,9 +2259,11 @@ class TunnelService {
       onMismatch?.call();
       return false;
     } catch (e) {
-      // 存储异常时退回"信任"以保持可用性，但记录日志便于排查
-      debugPrint('[DSH] host key store unavailable, fallback trust: $e');
-      return true;
+      // 存储不可用时拒绝连接（fail-closed）：指纹既读不出也记不下，
+      // 放行等于在这个窗口里跳过全部中间人防护。表现为普通建链失败，
+      // 用户重试或清指纹后可恢复。
+      debugPrint('[DSH] host key store unavailable, reject (fail-closed): $e');
+      return false;
     }
   }
 
