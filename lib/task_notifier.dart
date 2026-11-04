@@ -82,6 +82,25 @@ class TaskNotifier {
     );
   }
 
+  /// 任务失败：与完成区分的失败通知（官方推送五类事件的 task_failed 语义）。
+  /// 复用 _doneId（替换可能残留的完成通知），文案带耗时便于判断失败阶段。
+  Future<void> showFailed() async {
+    if (!_ready) return;
+    await _plugin.cancel(_runningId);
+    final elapsed = _runningSince == null
+        ? null
+        : DateTime.now().difference(_runningSince!);
+    final body = elapsed == null || elapsed.inSeconds < 1
+        ? '智能体任务执行失败'
+        : '执行 ${_durationText(elapsed)} 后失败';
+    await _plugin.show(
+      _doneId,
+      'DSH 任务失败',
+      body,
+      _details(ongoing: false, playSound: true, enableVibration: true),
+    );
+  }
+
   /// 智能体请求人工审批/提问：推送「等待你的确认」（响铃 + 震动，锁屏可见）。
   /// 移动场景下这是任务干等的唯一信号，重要度等同完成通知。
   Future<void> showApproval() async {

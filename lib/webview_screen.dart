@@ -1442,6 +1442,9 @@ class _WebViewScreenState extends State<WebViewScreen>
             await TaskNotifier.instance.showRunning();
           case 'settled':
             await TaskNotifier.instance.showCompleted();
+          case 'failed':
+            // G14：失败回合专属通知（旧版 APK 无此分支 = 静默忽略，不误报已完成）
+            await TaskNotifier.instance.showFailed();
           case 'approval':
             await TaskNotifier.instance.showApproval();
           case 'approval_clear':

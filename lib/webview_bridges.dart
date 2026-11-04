@@ -420,7 +420,14 @@ const String taskBridgeJs = r'''
         break;
       }
     }
-    var next = running ? 'running' : 'settled';
+    // 结算区分失败（G14，对齐官方推送 task_failed 语义）：页面在回合收尾时
+    // 把结果写到 #turnStatus[data-result]（'failed'/'ok'）。轮询推断的收尾
+    // 无 turn.failed 事件时为 'ok'，与页面直推层（onTaskState state='failed'）
+    // 双通道兜底，任一先到都有效。
+    var next = running ? 'running' : (function() {
+      var st = document.getElementById('turnStatus');
+      return (st && st.getAttribute('data-result') === 'failed') ? 'failed' : 'settled';
+    })();
     if (state === null) {
       // 首次对齐：已在运行则上报，否则只记基准（不误报已完成）
       state = next;
