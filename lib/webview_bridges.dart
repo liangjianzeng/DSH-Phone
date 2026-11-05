@@ -159,7 +159,12 @@ const String artifactBridgeJs = r'''
     // 0) 放行 composer 输入/附件区域：附件删除按钮/预览图/发送按钮等
     //    点击归 DSH 处理，避免附件文件名（含 .png 等后缀）被误判为
     //    "资源型成果"而触发查看/下载流程（导致无法删除、误开下载页）。
-    if (closestUp(t, ['[data-composer-card]'])) return;
+    //    data-dsh-no-artifact：页面组件的自我豁免声明。step-4 的
+    //    「span/p/td/li 单行文本像路径」判据会吞掉这类组件的点击：
+    //    顶部任务计划条的 todo 文本常含文件路径，点击被 preventDefault +
+    //    拉起成果查看页，计划条整个被盖住（2026-11-06 真机 CDP 实证，
+    //    用户报告"一点击展开就不见了"）。UI  chrome 组件声明该属性即整体放行。
+    if (closestUp(t, ['[data-composer-card]', '[data-dsh-no-artifact]'])) return;
 
     // 后缀表：**脚本内单一来源**（此前同一份后缀在脚本里写了 4 遍，各自漂移，
     // 结果 `.log/.tsv/.tsx/.rs/.deb/.jar` 等点了没反应，而 Dart 侧那份
@@ -337,7 +342,9 @@ const String artifactBridgeJs = r'''
   // 预览/下载两条路都不丢。
   document.addEventListener('contextmenu', function(ev) {
     var t = ev.target;
-    if (closestUp(t, ['[data-composer-card]'])) return;
+    // 同 click 的 step 0：composer 区与 data-dsh-no-artifact 组件整体放行
+    //（长按计划条 todo 文本也不该弹原生下载/查看）。
+    if (closestUp(t, ['[data-composer-card]', '[data-dsh-no-artifact]'])) return;
     var a = closestUp(t, ['a']);
     if (a) {
       var href = a.getAttribute('href') || '';
