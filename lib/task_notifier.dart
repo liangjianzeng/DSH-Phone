@@ -28,17 +28,26 @@ class TaskNotifier {
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
   /// 初始化通知通道与权限（应在 runApp 前调用一次；非 Android 为空操作）。
+  ///
+  /// 本方法**不得上抛**：main 里调用未 await，异常会变成 unhandled async
+  /// error；且 `_ready` 永为 false 后所有通知静默变 no-op，用户零感知，
+  /// 归因全靠这里留下的失败原因。
   Future<void> init() async {
     if (!_isAndroid) return;
-    await _plugin.initialize(
-      const InitializationSettings(
-        android: AndroidInitializationSettings('@mipmap/ic_launcher'),
-      ),
-      // 点击通知：App 前台即 DSH 界面，无需额外跳转。
-      onDidReceiveNotificationResponse: (response) {
-        debugPrint('[DSH] task notification tapped: ${response.id}');
-      },
-    );
+    try {
+      await _plugin.initialize(
+        const InitializationSettings(
+          android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+        ),
+        // 点击通知：App 前台即 DSH 界面，无需额外跳转。
+        onDidReceiveNotificationResponse: (response) {
+          debugPrint('[DSH] task notification tapped: ${response.id}');
+        },
+      );
+    } catch (e) {
+      debugPrint('[DSH] task notifier init failed（通知禁用）：$e');
+      return;
+    }
     // Android 13+ 通知运行时权限；拒绝也不阻塞，通知静默不显示。
     try {
       final android = _plugin

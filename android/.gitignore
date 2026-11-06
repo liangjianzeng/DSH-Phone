@@ -4,6 +4,9 @@
 /captures/
 /local.properties
 GeneratedPluginRegistrant.java
+# AGP 构建中间产物（评审发现：模板自带此条，此仓库缺失——跑过一次
+# ./gradlew 后 `git add -A` 就会把 app/build 整个带进仓库）。
+/app/build/
 
 # Remember to never publicly share your keystore.
 # See https://flutter.dev/to/reference-keystore

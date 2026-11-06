@@ -80,12 +80,22 @@ class _GitHubScreenState extends State<GitHubScreen> {
       _currentToken = token.trim();
       _tokenCtrl.text = _currentToken;
     });
-    // 路线 B：有令牌时用 x-access-token 前缀自动认证（PAT 为字母数字连字符，无需转义）。
-    final target = _currentToken.isNotEmpty
-        ? 'https://x-access-token:$_currentToken@github.com'
-        : base;
+    final target = _targetWithToken(base, _currentToken);
     setState(() => _target = target);
     _ensureLoaded();
+  }
+
+  /// 路线 B：有令牌时用 x-access-token 前缀自动认证（PAT 为字母数字连字符，
+  /// 无需转义）。userinfo 注入的是**用户配置的 base 主机**——旧实现有令牌时
+  /// 硬编码 github.com，把可自定义的 GHE/镜像地址旁路掉，还会把 PAT 交给
+  /// 错误的站点。base 解析失败才回退 github.com。
+  static String _targetWithToken(String base, String token) {
+    if (token.isEmpty) return base;
+    final uri = Uri.tryParse(base);
+    final scheme = (uri != null && uri.scheme.isNotEmpty) ? uri.scheme : 'https';
+    final host = (uri != null && uri.host.isNotEmpty) ? uri.host : 'github.com';
+    final port = (uri != null && uri.hasPort) ? ':${uri.port}' : '';
+    return '$scheme://x-access-token:$token@$host$port';
   }
 
   /// 确保 WebView 已导航到 [_target]：控制器就绪则导航；已与当前地址一致则跳过。
@@ -122,14 +132,14 @@ class _GitHubScreenState extends State<GitHubScreen> {
       // 控制器已失效（极少见）：交回初始加载路径重建。
       _loadedTarget = '';
       await _loadInitial();
-      } finally {
-        try {
-          await c.setSettings(
-              settings: InAppWebViewSettings(cacheMode: CacheMode.LOAD_DEFAULT));
-        } catch (_) {
-          // 控制器已随页面销毁：缓存模式恢复不了也无妨，下次建 WebView 会重置。
-        }
+    } finally {
+      try {
+        await c.setSettings(
+            settings: InAppWebViewSettings(cacheMode: CacheMode.LOAD_DEFAULT));
+      } catch (_) {
+        // 控制器已随页面销毁：缓存模式恢复不了也无妨，下次建 WebView 会重置。
       }
+    }
   }
 
   /// 打开 PAT 令牌输入对话框（在 GitHub 页面内即可配置令牌，免翻设置页）。
@@ -186,9 +196,7 @@ class _GitHubScreenState extends State<GitHubScreen> {
     await SSHConfig.saveGithubToken(token);
     if (!mounted) return;
     final base = await SSHConfig.loadGithubUrl();
-    final target = token.isNotEmpty
-        ? 'https://x-access-token:$token@github.com'
-        : base;
+    final target = _targetWithToken(base, token);
     setState(() {
       _currentToken = token;
       _target = target;
