@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:background_downloader/background_downloader.dart';
@@ -56,13 +57,93 @@ class AsrModelManager {
     return p.join(docs.path, 'models', 'asr', modelId);
   }
 
-  /// 模型是否已就绪（四个文件全部存在）。
+  /// 模型是否已就绪：文件齐全、非 0 字节、且与下载时记录的 [sizes.json]
+  /// 尺寸一致（见 [filesNeedingDownload]——只查"存在"时，一次截断/0 字节的
+  /// 坏文件会让识别器每次加载失败、重试又永远跳过它，永久卡死）。
   static Future<bool> isReady() async {
     final dir = await modelDir();
+    final need = filesNeedingDownload(
+      files: files,
+      actualSizes: _sizesOf(dir),
+      manifest: await _readManifest(dir),
+    );
+    return need.isEmpty;
+  }
+
+  /// 尺寸清单文件名（与模型文件同目录，download 成功后写入）。
+  static const String _manifestName = 'sizes.json';
+
+  /// 判定哪些文件需要（重新）下载——纯函数，脱离文件系统可测
+  /// （test/asr_model_integrity_test.dart）：
+  ///  · [actualSizes] 值为 null = 文件不存在 → 需要下载；
+  ///  · 0 字节 = 损坏（截断下载的典型形态）→ 需要下载；
+  ///  · manifest 有记录且 >0 而实际尺寸不符 = 损坏 → 需要下载；
+  ///  · manifest 无该文件记录（旧装无清单）且实际 >0 → 放行，兼容既有
+  ///    完整模型，不强制重下 160MB。
+  static List<String> filesNeedingDownload({
+    required List<String> files,
+    required Map<String, int?> actualSizes,
+    required Map<String, int>? manifest,
+  }) {
+    final need = <String>[];
     for (final f in files) {
-      if (!File(p.join(dir, f)).existsSync()) return false;
+      final size = actualSizes[f];
+      if (size == null || size == 0) {
+        need.add(f);
+        continue;
+      }
+      final expected = manifest?[f];
+      if (expected != null && expected > 0 && size != expected) need.add(f);
     }
-    return true;
+    return need;
+  }
+
+  /// 各模型文件的当前大小（null = 不存在；stat 异常按不存在处理重下）。
+  static Map<String, int?> _sizesOf(String dir) {
+    final result = <String, int?>{};
+    for (final f in files) {
+      try {
+        final file = File(p.join(dir, f));
+        result[f] = file.existsSync() ? file.lengthSync() : null;
+      } catch (_) {
+        result[f] = null;
+      }
+    }
+    return result;
+  }
+
+  static Future<Map<String, int>?> _readManifest(String dir) async {
+    try {
+      final f = File(p.join(dir, _manifestName));
+      if (!f.existsSync()) return null;
+      final json = jsonDecode(await f.readAsString());
+      if (json is Map) {
+        return {
+          for (final e in json.entries)
+            if (e.value is num) e.key: (e.value as num).toInt(),
+        };
+      }
+    } catch (_) {
+      // 清单坏了按"无清单"处理：宽松兼容，不因此清库重下 160MB。
+    }
+    return null;
+  }
+
+  /// 全部文件就位后落尺寸清单（下次 [isReady] 的校验基准）。
+  static Future<void> _writeManifest(String dir) async {
+    try {
+      final sizes = <String, int>{};
+      for (final f in files) {
+        final file = File(p.join(dir, f));
+        final len = file.existsSync() ? file.lengthSync() : 0;
+        if (len <= 0) return; // 理论上到不了这里（失败已抛异常）：保险丝
+        sizes[f] = len;
+      }
+      await File(p.join(dir, _manifestName)).writeAsString(jsonEncode(sizes));
+      debugPrint('[DSH][asr] manifest written: $sizes');
+    } catch (e) {
+      debugPrint('[DSH][asr] manifest write failed: $e');
+    }
   }
 
   static String _url(String file, {required bool mirror}) =>
@@ -82,11 +163,22 @@ class AsrModelManager {
     final dir = await modelDir();
     await Directory(dir).create(recursive: true);
 
-    final missing = [
-      for (final f in files)
-        if (!File(p.join(dir, f)).existsSync()) f,
-    ];
+    final missing = filesNeedingDownload(
+      files: files,
+      actualSizes: _sizesOf(dir),
+      manifest: await _readManifest(dir),
+    );
     if (missing.isEmpty) return;
+    // 损坏件（0 字节/与清单不符）先删再下：background_downloader 按 taskId
+    // 认账，坏体留在原地会让后续每轮"已存在跳过"，截断的文件永远卡死。
+    for (final f in missing) {
+      try {
+        final file = File(p.join(dir, f));
+        if (file.existsSync()) file.deleteSync();
+      } catch (e) {
+        debugPrint('[DSH][asr] delete damaged $f failed: $e');
+      }
+    }
 
     // 文件字节数用于整体进度加权（encoder 占绝对大头）
     final totalBytes = await _missingBytes(missing);
@@ -103,6 +195,8 @@ class AsrModelManager {
       doneBytes += await File(p.join(dir, file)).length();
       debugPrint('[DSH][asr] downloaded: $file');
     }
+    // 全部就位：记录尺寸清单，作为下次 isReady() 完整性校验的基准。
+    await _writeManifest(dir);
   }
 
   /// 取消进行中的模型下载（对话框取消按钮）。
