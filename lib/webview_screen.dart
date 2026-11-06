@@ -726,10 +726,13 @@ class _WebViewScreenState extends State<WebViewScreen>
       return;
     }
     if (!ok) {
-      setState(() => _holdSession = null);
+      // start 慢且期间页面销毁时这里是最后一个无守卫 setState（上方
+      // await session.start 可能已跨 dispose），补 mounted 自守卫。
+      if (mounted) setState(() => _holdSession = null);
       _snack('端侧语音识别启动失败，请重试');
       return;
-    }    if (session.cancelRequested || !mounted) {
+    }
+    if (session.cancelRequested || !mounted) {
       // 引擎加载期间已松手：按取消丢弃
       await session.end(cancelled: true);
       if (mounted) setState(() => _holdSession = null);
@@ -1130,6 +1133,19 @@ class _WebViewScreenState extends State<WebViewScreen>
     _loadTimeoutTimer?.cancel();
     _tunnelSub?.cancel();
     _shareSub?.cancel();
+    // 按住说话收尾：录音中/句尾缓冲期页面被销毁（返回、切实例、路由替换）时，
+    // 会话持有的录音器与引擎流只有 HoldToTalkSession.end() 这一条释放路径，
+    // 不显式收尾就是麦克风被占死 + worker 侧流悬挂（end 幂等，可放心补调）。
+    _pendingVoiceEnd?.cancel();
+    _pendingVoiceEnd = null;
+    final lingering = _pendingVoiceSession;
+    final recording = _holdSession;
+    _pendingVoiceSession = null;
+    _holdSession = null;
+    if (lingering != null) unawaited(lingering.end(cancelled: true));
+    if (recording != null && !identical(recording, lingering)) {
+      unawaited(recording.end(cancelled: true));
+    }
     _tokenCtrl.dispose();
     _zoomScaleNotifier.dispose();
     MoonLocation.observer.removeListener(_onMoonLocationChanged);
@@ -1364,6 +1380,37 @@ class _WebViewScreenState extends State<WebViewScreen>
     return '$base/?token=${Uri.encodeQueryComponent(token)}';
   }
 
+  /// 校验 URL 是否属于**隧道 loopback origin**（与 [_targetUrl] 同源同端口）。
+  ///
+  /// JS 桥的 handler 对 WebView 里**任何**页面都可调用（外链跳转/重定向到的
+  /// 第三方页同样能 `callHandler('onArtifactClick', ...)`）：桥回调能把任意
+  /// path 喂给隧道 SFTP 读取、伪造任务系统通知，因此注入与回调入口一律校验
+  /// origin——非隧道 origin 的请求视为伪造，直接丢弃（fail-closed）。
+  bool _isTunnelOrigin(String? url) {
+    if (url == null || url.isEmpty) return false;
+    final u = Uri.tryParse(url);
+    if (u == null) return false;
+    // 与 _targetUrl 同一端口来源：隧道可能临时借用系统分配的端口。
+    final port = TunnelService.instance.activeLocalPort ?? _config.localPort;
+    return u.scheme == 'http' &&
+        (u.host == '127.0.0.1' || u.host == 'localhost') &&
+        u.hasPort &&
+        u.port == port;
+  }
+
+  /// 桥注入/桥回调共用的 origin 门。[url] 传 onLoadStop 回调自带的地址
+  /// （Android 上常为 null，此时回退查 [InAppWebViewController.getUrl]）；
+  /// controller 已失效等异常一律按不放行处理。
+  Future<bool> _bridgeOriginOk(InAppWebViewController c,
+      {String? url}) async {
+    try {
+      if (_isTunnelOrigin(url)) return true;
+      return _isTunnelOrigin((await c.getUrl())?.toString());
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> _loadTargetUrl() async {
     final c = _controller;
     // 隧道未连接或 controller 已失效时跳过，避免 MissingPluginException。
@@ -1404,6 +1451,9 @@ class _WebViewScreenState extends State<WebViewScreen>
               'contentLen=${(raw['content'] as String?)?.length ?? 0}');
         }
         if (args.isEmpty || !mounted) return null;
+        // origin 校验：hit.path 会直接喂给隧道 SFTP 读取，非隧道页的
+        // 调用一律视为伪造（见 _isTunnelOrigin）。
+        if (!await _bridgeOriginOk(controller)) return null;
         final raw = args.first;
         if (raw is! Map) return null;
         final hit = parseArtifactHit(raw);
@@ -1453,6 +1503,9 @@ class _WebViewScreenState extends State<WebViewScreen>
       handlerName: 'onTaskState',
       callback: (List<Object?> args) async {
         if (args.isEmpty) return null;
+        // origin 校验：状态会驱动系统通知，非隧道页的调用一律视为伪造
+        // （外部页面可借此发虚假「任务完成」通知钓鱼，见 _isTunnelOrigin）。
+        if (!await _bridgeOriginOk(controller)) return null;
         final raw = args.first;
         if (raw is! Map) return null;
         final state = raw['state'] as String?;
@@ -1491,6 +1544,8 @@ class _WebViewScreenState extends State<WebViewScreen>
       handlerName: 'onTerminalState',
       callback: (List<Object?> args) async {
         if (args.isEmpty || args.first is! Map) return null;
+        // origin 校验：非隧道页不应能操纵本 App 的终端按键条显隐
+        if (!await _bridgeOriginOk(controller)) return null;
         final visible = (args.first as Map)['visible'] == true;
         debugPrint('[DSH] terminal visible: $visible');
         if (mounted && visible != _terminalVisible) {
@@ -1747,33 +1802,39 @@ class _WebViewScreenState extends State<WebViewScreen>
     // 上传进度：模态进度框（上传中不可关闭）
     final progress = ValueNotifier<double>(0.0);
     final progressText = ValueNotifier<String>('准备上传…');
-    final navigator = Navigator.of(context);
+    // 本进度框自己的路由句柄：收尾时精确 removeRoute 它，而不是"弹栈顶"
+    // （见下方 finally 的注释）。
+    Route<dynamic>? dialogRoute;
     showDialog<void>(
       context: context,
       barrierDismissible: false,
-      builder: (_) => ValueListenableBuilder<double>(
-        valueListenable: progress,
-        builder: (_, value, __) => AlertDialog(
-          title: const Text('上传中…'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              LinearProgressIndicator(value: value),
-              const SizedBox(height: 12),
-              ValueListenableBuilder<String>(
-                valueListenable: progressText,
-                builder: (_, text, __) => Text(
-                  text,
-                  style: const TextStyle(fontSize: 12),
+      builder: (dialogCtx) {
+        dialogRoute ??= ModalRoute.of(dialogCtx);
+        return ValueListenableBuilder<double>(
+          valueListenable: progress,
+          builder: (_, value, __) => AlertDialog(
+            title: const Text('上传中…'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                LinearProgressIndicator(value: value),
+                const SizedBox(height: 12),
+                ValueListenableBuilder<String>(
+                  valueListenable: progressText,
+                  builder: (_, text, __) => Text(
+                    text,
+                    style: const TextStyle(fontSize: 12),
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
 
     String? remotePath;
+    Object? uploadError;
     try {
       remotePath = await TunnelService.instance.uploadRemoteFile(
         bytes,
@@ -1783,11 +1844,26 @@ class _WebViewScreenState extends State<WebViewScreen>
           progressText.value = '$sent / $total 字节';
         },
       );
+    } catch (e) {
+      // 此前异常裸抛穿过 finally：用户得不到任何失败提示（SFTP 拒绝/隧道
+      // 半断时表现为进度框一闪消失、石沉大海），现在统一兜底播报。
+      uploadError = e;
+      debugPrint('[DSH] uploadRemoteFile failed: $e');
     } finally {
-      navigator.pop(); // 关闭进度框
+      // 精确移除**本进度框**路由：期间若又 push 了别的页、或系统返回先关了
+      // 对话框，用提前捕获的 navigator.pop() 会弹掉当时的栈顶（如用户刚打开
+      // 的设置页）。两个进度 Notifier 随本次上传终止一并释放。
+      final r = dialogRoute;
+      if (r != null && r.isActive) r.navigator?.removeRoute(r);
+      progress.dispose();
+      progressText.dispose();
     }
 
     if (!mounted) return;
+    if (uploadError != null) {
+      _snack('上传失败：$uploadError');
+      return;
+    }
     if (remotePath == null || remotePath.isEmpty) {
       _snack('上传失败：隧道可能已断开或服务器拒绝写入');
       return;
@@ -2458,11 +2534,20 @@ class _WebViewScreenState extends State<WebViewScreen>
                 // 权限授予见 onPermissionRequest。
                 mediaPlaybackRequiresUserGesture: false,
               ),
-              // 页面申请麦克风/摄像头（getUserMedia）时直接授予：
-              // 应用层的 RECORD_AUDIO 运行时权限在语音入口先申请。
+              // 页面申请麦克风/摄像头（getUserMedia）时授予——但**只给隧道页**：
+              // 应用层的 RECORD_AUDIO 运行时权限在语音入口先申请，那是用户
+              // 主动动作；这里若对外部 origin 也 GRANT，任意被外链/重定向带进
+              // WebView 的第三方页面都能静默拿到麦克风/摄像头。
               onPermissionRequest: (controller, request) async {
                 debugPrint('[DSH] webview permission: '
-                    '${request.resources}');
+                    '${request.resources} from ${request.origin}');
+                if (!_isTunnelOrigin(request.origin.toString())) {
+                  debugPrint('[DSH] webview permission DENIED（非隧道 origin）');
+                  return PermissionResponse(
+                    resources: request.resources,
+                    action: PermissionResponseAction.DENY,
+                  );
+                }
                 return PermissionResponse(
                   resources: request.resources,
                   action: PermissionResponseAction.GRANT,
@@ -2479,10 +2564,19 @@ class _WebViewScreenState extends State<WebViewScreen>
               onLoadStart: (controller, url) => _onPageLoadStart(),
               onProgressChanged: (controller, progress) =>
                   _onPageProgress(progress),
-              onLoadStop: (controller, url) {
+              onLoadStop: (controller, url) async {
                 _onPageLoadStop();
                 // 页面就绪后应用持久化的缩放比例
                 _applyZoom();
+                // 桥只服务隧道 loopback origin：被外链/重定向带去的第三方页
+                // 不注入监听脚本、不消费分享内容——桥注入本身就是攻击面
+                // （见 _isTunnelOrigin）。回到隧道页的 onLoadStop 会照常注入。
+                if (!await _bridgeOriginOk(controller,
+                    url: url?.toString())) {
+                  debugPrint('[DSH] onLoadStop：非隧道 origin（${url ?? 'null'}'
+                      '），跳过桥注入与分享消费');
+                  return;
+                }
                 // 每次页面导航后重新注入成果监听脚本
                 _injectArtifactBridge();
                 // 每次页面导航后重新注入图片直传桥
