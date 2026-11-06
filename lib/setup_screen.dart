@@ -52,6 +52,8 @@ class SetupScreen extends StatefulWidget {
     this.onResourceDownloadChanged,
     this.githubEnabled = false,
     this.onGithubEnabledChanged,
+    this.topbarRefreshEnabled = false,
+    this.onTopbarRefreshChanged,
 
     /// 实例级"默认主机资源监控"开关即时保存后通知父级刷新监控隧道。
     this.onInstanceMonitorChanged,
@@ -148,6 +150,13 @@ class SetupScreen extends StatefulWidget {
   final bool githubEnabled;
   /// GitHub 开关变更回调。
   final ValueChanged<bool>? onGithubEnabledChanged;
+
+  /// 顶栏「刷新云」按钮（连接状态图标，点击=立即探活/重连）是否显示。
+  /// 全局生效、**默认关闭**：顶栏图标位紧张，隐藏后连接状态仍由实例标签
+  /// 的状态点体现，链路故障时横幅另有「立即重试」入口。
+  final bool topbarRefreshEnabled;
+  /// 顶栏「刷新云」按钮开关变更回调。
+  final ValueChanged<bool>? onTopbarRefreshChanged;
 
   /// 实例级"默认主机资源监控"开关即时保存后通知父级刷新监控隧道。
   final ValueChanged<bool>? onInstanceMonitorChanged;
@@ -251,6 +260,9 @@ class _SetupScreenState extends State<SetupScreen> {
   late bool _resourceViewEnabled;
   late bool _resourceDownloadEnabled;
 
+  /// 顶栏「刷新云」按钮显示开关的本地状态（全局配置，默认关闭）。
+  late bool _topbarRefreshEnabled;
+
   /// GitHub 快捷访问（全局配置，随设置页一次性加载，不随实例标签切换重置）。
   late bool _githubEnabled;
   late TextEditingController _githubTokenCtrl;
@@ -287,6 +299,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _hostMonitorEnabled = widget.hostMonitorEnabled;
     _resourceViewEnabled = widget.resourceViewEnabled;
     _resourceDownloadEnabled = widget.resourceDownloadEnabled;
+    _topbarRefreshEnabled = widget.topbarRefreshEnabled;
     _githubEnabled = widget.githubEnabled;
     _githubTokenCtrl = TextEditingController(text: '');
     _githubUrlCtrl = TextEditingController(text: 'https://github.com');
@@ -1334,6 +1347,21 @@ class _SetupScreenState extends State<SetupScreen> {
           onChanged: (v) {
             setState(() => _hostMonitorEnabled = v);
             widget.onHostMonitorChanged?.call(v);
+          },
+        ),
+        // 顶栏「刷新云」按钮：默认关闭（顶栏图标位紧张，且故障横幅已自带重试入口）
+        SwitchListTile(
+          title: const Text('顶栏连接刷新按钮'),
+          subtitle: const Text(
+            '默认关闭；开启后顶部状态栏显示云朵图标（绿=正常 · 橙=检测中 · '
+            '红=失败），点一下立即端到端探活，探不通当场强制重建隧道并重载页面\n'
+            '关闭时不显示该图标：连接状态仍看实例标签左侧状态点，链路异常时'
+            '页面顶部横幅另有「立即重试」按钮',
+          ),
+          value: _topbarRefreshEnabled,
+          onChanged: (v) {
+            setState(() => _topbarRefreshEnabled = v);
+            widget.onTopbarRefreshChanged?.call(v);
           },
         ),
         // 资源查看 / 下载：默认开启，关闭不触发能力

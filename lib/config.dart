@@ -110,6 +110,12 @@ class SSHConfig {
   static const String keyResourceView = 'resource_view_enabled';
   static const String keyResourceDownload = 'resource_download_enabled';
 
+  /// 顶栏「刷新云」按钮（连接状态图标，点击即探活/重连）显示开关的键名。
+  ///
+  /// 全局生效（不随 SSH 实例变）；默认关闭——顶栏图标位本就紧张，多数时候
+  /// 隧道监督器会自动重连，按钮只在需要手动探活时才有价值。
+  static const String keyTopbarRefresh = 'topbar_refresh_button_enabled';
+
   // GitHub 仓库快捷访问（全局，非实例级；token 是用户级不随实例变）
   static const String keyGithubEnabled = 'github_enabled';
   static const String keyGithubUrl = 'github_url';
@@ -610,6 +616,18 @@ class SSHConfig {
   static Future<void> saveResourceDownloadEnabled(bool enabled) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(keyResourceDownload, enabled);
+  }
+
+  /// 读取顶栏「刷新云」按钮显示开关（**默认关闭**：顶栏图标位紧张，
+  /// 且隧道故障时横幅已自带「立即重试」入口）。
+  static Future<bool> loadTopbarRefreshEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(keyTopbarRefresh) ?? false;
+  }
+
+  static Future<void> saveTopbarRefreshEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(keyTopbarRefresh, enabled);
   }
 
   // ============ GitHub 仓库快捷访问（全局）============

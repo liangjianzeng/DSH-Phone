@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:dsh_phone/config.dart';
 
 void main() {
@@ -47,6 +48,19 @@ void main() {
 
     test('实例数量上限为 3', () {
       expect(SSHConfig.maxProfiles, 3);
+    });
+  });
+
+  group('全局开关持久化', () {
+    test('顶栏「刷新云」按钮开关：无记录时默认关闭，写入后可读回', () async {
+      SharedPreferences.setMockInitialValues({});
+      expect(await SSHConfig.loadTopbarRefreshEnabled(), isFalse);
+
+      await SSHConfig.saveTopbarRefreshEnabled(true);
+      expect(await SSHConfig.loadTopbarRefreshEnabled(), isTrue);
+
+      await SSHConfig.saveTopbarRefreshEnabled(false);
+      expect(await SSHConfig.loadTopbarRefreshEnabled(), isFalse);
     });
   });
 }

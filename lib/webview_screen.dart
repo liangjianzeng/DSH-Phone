@@ -137,6 +137,14 @@ class _WebViewScreenState extends State<WebViewScreen>
   bool _resourceDownloadEnabled = true; // 资源下载（默认开）
   bool _githubEnabled = false; // GitHub 仓库快捷访问（全局开关，默认关）
 
+  /// 顶栏「刷新云」按钮（连接状态图标，点击=立即探活/重连）是否显示。
+  ///
+  /// 默认关闭：顶栏一行要挤模式切换 + 实例标签 + Unsloth + GitHub + 设置，
+  /// 窄屏上多一个图标就可能把最右侧的「设置」挤出屏幕（见 [_buildTopBar]）。
+  /// 关闭后连接状态仍由实例标签的状态点体现，隧道故障时横幅也自带
+  /// 「立即重试」入口，因此隐藏按钮不会让人失去唯一的自救通道。
+  bool _topbarRefreshEnabled = false;
+
   /// 缩放比例共享通知器：设置页可实时监听并展示。
   final ValueNotifier<double> _zoomScaleNotifier = ValueNotifier<double>(1.0);
 
@@ -802,18 +810,21 @@ class _WebViewScreenState extends State<WebViewScreen>
     MoonLocation.update(mode, latitude: latitude, longitude: longitude);
   }
 
-  /// 读取工具类功能开关（监控 / 资源查看 / 资源下载），并同步监控采样器。
+  /// 读取工具类功能开关（监控 / 资源查看 / 资源下载 / 顶栏刷新按钮），
+  /// 并同步监控采样器。
   Future<void> _loadToolSwitches() async {
     final hostMonitor = await SSHConfig.loadHostMonitorEnabled();
     final resourceView = await SSHConfig.loadResourceViewEnabled();
     final resourceDownload = await SSHConfig.loadResourceDownloadEnabled();
     final github = await SSHConfig.loadGithubEnabled();
+    final topbarRefresh = await SSHConfig.loadTopbarRefreshEnabled();
     if (!mounted) return;
     setState(() {
       _hostMonitorEnabled = hostMonitor;
       _resourceViewEnabled = resourceView;
       _resourceDownloadEnabled = resourceDownload;
       _githubEnabled = github;
+      _topbarRefreshEnabled = topbarRefresh;
     });
     // 同步监控采样器：关闭则不请求（曲线随之消失）。
     HostMonitor.instance.enabled = hostMonitor;
@@ -846,6 +857,13 @@ class _WebViewScreenState extends State<WebViewScreen>
     if (!mounted) return;
     setState(() => _githubEnabled = enabled);
     SSHConfig.saveGithubEnabled(enabled);
+  }
+
+  /// 顶栏「刷新云」按钮开关：持久化并立即刷新顶栏（默认关闭）。
+  void _setTopbarRefreshEnabled(bool enabled) {
+    if (!mounted) return;
+    setState(() => _topbarRefreshEnabled = enabled);
+    SSHConfig.saveTopbarRefreshEnabled(enabled);
   }
 
   /// 通过 CSS zoom 应用缩放比例（页面就绪后调用）。
@@ -1234,6 +1252,8 @@ class _WebViewScreenState extends State<WebViewScreen>
           onResourceDownloadChanged: _setResourceDownloadEnabled,
           githubEnabled: _githubEnabled,
           onGithubEnabledChanged: _setGithubEnabled,
+          topbarRefreshEnabled: _topbarRefreshEnabled,
+          onTopbarRefreshChanged: _setTopbarRefreshEnabled,
           // 实例级监控开关即时保存后：重新加载配置并刷新监控隧道
           onInstanceMonitorChanged: (_) => _load(),
         ),
@@ -2231,7 +2251,10 @@ class _WebViewScreenState extends State<WebViewScreen>
                         // 连接状态 / 主动刷新：旧版顶栏**没有任何重连入口**，隧道假死时
                         // 用户只能杀 App。现在状态点一眼看出健康与否，点一下 = 立即端到端
                         // 探活（探不通当场强制重建），并把结果一句话告诉用户。
-                        _buildConnectionButton(context),
+                        // 该图标占一格顶栏宽度，默认隐藏（设置页「顶栏连接刷新按钮」可开）；
+                        // 隐藏期间连接健康仍由实例标签的状态点体现，链路真出问题时
+                        // _buildTunnelBanner 上另有「立即重试」走同一条 _refreshConnection。
+                        if (_topbarRefreshEnabled) _buildConnectionButton(context),
                         _buildInstanceSwitcher(context),
                         // Unsloth 入口：全部实例未启用时隐藏（首页无意义）
                         if (_unslothAvailable)
