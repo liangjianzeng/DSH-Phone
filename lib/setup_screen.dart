@@ -220,7 +220,12 @@ class _SetupScreenState extends State<SetupScreen> {
   late bool _unslothUseSsh;
 
   /// Token 输入明文/密文切换（默认密文显示）。
-  bool _obscureToken = true;
+  // 三个 Token 输入框（DSH / Zcode / WorkBuddy）各自的显隐状态。
+  // 此前共用单个 _obscureToken：点任一可见性图标会把另外两个本应保密的
+  // Token 一起亮出来，属意外的信息泄露，按字段拆开。
+  bool _obscureAccessToken = true;
+  bool _obscureZcodeToken = true;
+  bool _obscureWorkbuddyToken = true;
 
   bool _saving = false;
   String? _testResult;
@@ -307,6 +312,7 @@ class _SetupScreenState extends State<SetupScreen> {
     _uploadMaxMb = SSHConfig.defaultUploadMaxMb;
     _asrMode = AsrMode.standard;
     _appVersion = SSHConfig.fallbackAppVersion;
+    _initProfileControllers();
     _loadFromProfile(_profileIndex);
     _loadUploadLimit();
     _loadAsrMode();
@@ -477,27 +483,49 @@ class _SetupScreenState extends State<SetupScreen> {
     _scheduleAutoSave();
   }
 
-  /// 把指定实例配置回填到表单控件。
+  /// 一次性创建实例表单的 17 个 controller（仅 initState 调用，
+  /// 必须先于 [_loadFromProfile]）。此后 [_loadFromProfile] **只改 .text
+  /// 不换实例**：早期实现每次切实例都重新 new 17 个且不 dispose 旧的，
+  /// State.dispose 只回收最后一批——来回切标签即每轮泄漏 17 个。
+  void _initProfileControllers() {
+    _host = TextEditingController();
+    _alias = TextEditingController();
+    _sshPort = TextEditingController();
+    _username = TextEditingController();
+    _password = TextEditingController();
+    _privateKey = TextEditingController();
+    _keyPassphrase = TextEditingController();
+    _localPort = TextEditingController();
+    _remotePort = TextEditingController();
+    _zcodeRemotePort = TextEditingController();
+    _workbuddyRemotePort = TextEditingController();
+    _accessToken = TextEditingController();
+    _zcodeToken = TextEditingController();
+    _workbuddyToken = TextEditingController();
+    _unslothPort = TextEditingController();
+    _unslothPassword = TextEditingController();
+  }
+
+  /// 把指定实例配置回填到表单控件（只改文本、保留 controller 实例，
+  /// 见 [_initProfileControllers] 的泄漏说明）。
   void _loadFromProfile(int index) {
     final c = widget.profiles[index];
-    _host = TextEditingController(text: c.host);
-    _alias = TextEditingController(text: c.alias);
-    _sshPort = TextEditingController(text: '${c.sshPort}');
-    _username = TextEditingController(text: c.username);
-    _password = TextEditingController(text: c.password);
-    _privateKey = TextEditingController(text: c.privateKeyPem);
-    _keyPassphrase = TextEditingController(text: c.keyPassphrase);
-    _localPort = TextEditingController(text: '${c.localPort}');
-    _remotePort = TextEditingController(text: '${c.remotePort}');
-    _zcodeRemotePort =
-        TextEditingController(text: '${c.zcodeRemotePort}');
-    _workbuddyRemotePort =
-        TextEditingController(text: '${c.workbuddyRemotePort}');
-    _accessToken = TextEditingController(text: c.accessToken);
-    _zcodeToken = TextEditingController(text: c.zcodeToken);
-    _workbuddyToken = TextEditingController(text: c.workbuddyToken);
-    _unslothPort = TextEditingController(text: '${c.unslothPort}');
-    _unslothPassword = TextEditingController(text: c.unslothPassword);
+    _host.text = c.host;
+    _alias.text = c.alias;
+    _sshPort.text = '${c.sshPort}';
+    _username.text = c.username;
+    _password.text = c.password;
+    _privateKey.text = c.privateKeyPem;
+    _keyPassphrase.text = c.keyPassphrase;
+    _localPort.text = '${c.localPort}';
+    _remotePort.text = '${c.remotePort}';
+    _zcodeRemotePort.text = '${c.zcodeRemotePort}';
+    _workbuddyRemotePort.text = '${c.workbuddyRemotePort}';
+    _accessToken.text = c.accessToken;
+    _zcodeToken.text = c.zcodeToken;
+    _workbuddyToken.text = c.workbuddyToken;
+    _unslothPort.text = '${c.unslothPort}';
+    _unslothPassword.text = c.unslothPassword;
     _authType = c.authType;
     _mode = c.mode;
     _zcodeEnabled = c.zcodeEnabled;
@@ -907,13 +935,21 @@ class _SetupScreenState extends State<SetupScreen> {
           // 独立加密存储，改其一不影响另一（连接时按当前模式取对应字段）。
           TextFormField(
             controller: _accessToken,
-            obscureText: _obscureToken,
-            decoration: const InputDecoration(
+            obscureText: _obscureAccessToken,
+            decoration: InputDecoration(
               labelText: 'DSH 访问 Token（可选）',
               hintText: '粘贴 DSH 访问 Token（留空则不启用）',
               helperText: '新版 DSH(≥0.1.2) 启用 token 鉴权，首次访问需携带；'
                   '换取 30 天签名 cookie 后免 token，过期需重新填写',
-              border: OutlineInputBorder(),
+              border: const OutlineInputBorder(),
+              suffixIcon: IconButton(
+                icon: Icon(_obscureAccessToken
+                    ? Icons.visibility_off_outlined
+                    : Icons.visibility_outlined),
+                tooltip: _obscureAccessToken ? '显示 Token' : '隐藏 Token',
+                onPressed: () => setState(
+                    () => _obscureAccessToken = !_obscureAccessToken),
+              ),
             ),
             onChanged: (_) => _scheduleAutoSave(),
           ),
@@ -955,7 +991,7 @@ class _SetupScreenState extends State<SetupScreen> {
               padding: const EdgeInsets.only(left: 24),
               child: TextFormField(
                 controller: _zcodeToken,
-                obscureText: _obscureToken,
+                obscureText: _obscureZcodeToken,
                 decoration: InputDecoration(
                   labelText: 'Zcode 服务访问 Token（Zcode 模式必填）',
                   hintText: '粘贴 zcode-phone-server 的访问令牌',
@@ -963,12 +999,12 @@ class _SetupScreenState extends State<SetupScreen> {
                       '的 token 字段或启动控制台；不填服务端会拒绝访问',
                   border: const OutlineInputBorder(),
                   suffixIcon: IconButton(
-                    icon: Icon(_obscureToken
+                    icon: Icon(_obscureZcodeToken
                         ? Icons.visibility_off_outlined
                         : Icons.visibility_outlined),
-                    tooltip: _obscureToken ? '显示 Token' : '隐藏 Token',
-                    onPressed: () =>
-                        setState(() => _obscureToken = !_obscureToken),
+                    tooltip: _obscureZcodeToken ? '显示 Token' : '隐藏 Token',
+                    onPressed: () => setState(
+                        () => _obscureZcodeToken = !_obscureZcodeToken),
                   ),
                 ),
                 onChanged: (_) => _scheduleAutoSave(),
@@ -1004,7 +1040,7 @@ class _SetupScreenState extends State<SetupScreen> {
               padding: const EdgeInsets.only(left: 24),
               child: TextFormField(
                 controller: _workbuddyToken,
-                obscureText: _obscureToken,
+                obscureText: _obscureWorkbuddyToken,
                 decoration: InputDecoration(
                   labelText: 'WorkBuddy 服务访问 Token（WorkBuddy 模式必填）',
                   hintText: '粘贴 workbuddy-phone-server 的访问令牌',
@@ -1012,12 +1048,13 @@ class _SetupScreenState extends State<SetupScreen> {
                       '的 token 字段或启动控制台；不填服务端会拒绝访问',
                   border: const OutlineInputBorder(),
                   suffixIcon: IconButton(
-                    icon: Icon(_obscureToken
+                    icon: Icon(_obscureWorkbuddyToken
                         ? Icons.visibility_off_outlined
                         : Icons.visibility_outlined),
-                    tooltip: _obscureToken ? '显示 Token' : '隐藏 Token',
-                    onPressed: () =>
-                        setState(() => _obscureToken = !_obscureToken),
+                    tooltip:
+                        _obscureWorkbuddyToken ? '显示 Token' : '隐藏 Token',
+                    onPressed: () => setState(() =>
+                        _obscureWorkbuddyToken = !_obscureWorkbuddyToken),
                   ),
                 ),
                 onChanged: (_) => _scheduleAutoSave(),
