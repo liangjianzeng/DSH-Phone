@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'config.dart';
 import 'foreground_service.dart';
+import 'host_key_verifier.dart';
 import 'local_port_binder.dart';
 import 'tunnel_diagnostics.dart';
 import 'tunnel_policy.dart';
@@ -450,6 +451,12 @@ class TunnelService {
   Timer? _watchdogTimer;
   Timer? _networkTimer;
   bool _rebuilding = false;
+  /// 探活在途标志：看门狗/回前台/页面失败并发进入 [_probeEndpoint] 时，
+  /// 多路探测共享 [_probeFailures] 会重复计数，提前打满阈值误触发重建。
+  bool _probing = false;
+  /// 上一次强制重建的时刻：连续重建时限制退避清零的"快恢复"待遇
+  /// （见 [_forceRebuildInner]），防连接→转发超时→重建的快退避风暴。
+  DateTime? _lastForceRebuildAt;
   int _attempt = 0;
   int _probeFailures = 0;
   int _forwardOpenFailures = 0;
@@ -609,6 +616,12 @@ class TunnelService {
     _watchdogTimer = null;
     _networkTimer?.cancel();
     _networkTimer = null;
+    // unsloth 转发监听与监控 SSH 会话一并释放：本函数存在的理由就是
+    // "isolate 死前没人 close 的 ServerSocket 会把端口占到进程退出"——
+    // 只清主隧道的话，unsloth 的 OS 分配监听与 monitor 会话每轮重拉起
+    // 各漏一份，端口保留池照样被烧穿。两者未启动时为空操作。
+    await stopUnslothForward();
+    await _closeMonitorClient();
     await _teardown();
     final n = await _sweepOrphanListeners();
     if (n > 0) _log('bind', '释放时额外清扫 $n 个遗留监听', level: TunnelEventLevel.warn);
@@ -628,7 +641,12 @@ class TunnelService {
     try {
       await _teardown();
       await _sweepOrphanListeners();
-    } catch (_) {}
+    } catch (e) {
+      // 不吞干净：这条正是"僵尸 FD"叙事的自救路径，teardown/清扫失败的
+      // 原因要能进日志（诊断页）供事后归因，否则只能猜。
+      _log('supervisor', '重启前释放失败（继续退出进程）：$e',
+          level: TunnelEventLevel.warn);
+    }
     ForegroundTunnelService.instance.stop();
     // 给内核一点时间把已发起的 close() 排完；剩下的 FD 由 exit 一并带走。
     await Future<void>.delayed(const Duration(milliseconds: 150));
@@ -864,14 +882,20 @@ class TunnelService {
     } catch (e) {
       // 立即回收半途而废的会话：否则这条 socket 会挂到下一次重试才被 close，
       // 期间既占着远端 sshd 的连接配额，也可能继续往已死的 TCP 里塞保活包。
+      // 所有权字段只在本会话仍是"当前会话"时摘除；**close 无条件执行**——
+      // 若本尝试在 `_client = client` 之后被更新的尝试抢先覆盖，_client 已
+      // 不等于 client，按旧写法这里既不摘所有权也不 close，而 done 回调侧
+      // （_onTransportClosed）同样按所有权不符拒收这条会话：一条已认证的
+      // socket 就此无人认领、keepAlive 每 10s 还在续命，白烧远端连接配额。
+      // SSHClient.close() 库侧幂等（:827 已有同款直接调用）。
       if (_client == client) {
         _client = null;
         _activeConfig = null;
         _activeProfileIndex = null;
-        try {
-          client.close();
-        } catch (_) {}
       }
+      try {
+        client.close();
+      } catch (_) {}
       // TOFU 拒绝要带类型上抛，供上层判成"配置类"而不是泛泛的链路故障。
       if (hostKeyMismatch) throw const TunnelHostKeyMismatchException();
       rethrow;
@@ -1074,6 +1098,9 @@ class TunnelService {
   void _resetAttempt() {
     _attempt = 0;
     _probeFailures = 0;
+    // 转发失败计数同样要随"新一段健康期"清零：漏掉它的话，上一段陈旧计数
+    // 会让下一次两个并发 forwardLocal 超时立刻凑满阈值、当场强制重建。
+    _forwardOpenFailures = 0;
     _retryTimer?.cancel();
     _retryTimer = null;
     _setState(_state.copyWith(clearNextRetry: true, attempt: 0));
@@ -1103,14 +1130,29 @@ class TunnelService {
     await _teardown();
     // kind 留给接下来的尝试去判定：这里写死 remoteDown 会让"转发建链超时"这类
     // 明明是该重建的场景，闪现一句"云端服务没有应答"的误导性文案。
-    _attempt = 0; // 新的一段故障：从快退避重新开始，让用户尽快看到恢复
+    // **退避清零要有节制**：旧实现每轮强制重建都把 _attempt 清零，配合
+    // "forwardLocal 半开超时即触发重建"（forwardOpenFailThreshold=2）与
+    // 成功路径清零，"握手能成、转发即死"的间歇链路会形成
+    // 连接→转发超时→重建→再连接 的循环，每轮都从 800ms 快退避重新起步，
+    // 白烧远端 sshd 配额与本机电量。只给每段故障的第一次重建快恢复待遇；
+    // 30s 内的连续重建保持当前退避层级，让指数退避真正生效。
+    final now = DateTime.now();
+    final rapid = _lastForceRebuildAt != null &&
+        now.difference(_lastForceRebuildAt!) < const Duration(seconds: 30);
+    _lastForceRebuildAt = now;
+    if (rapid) {
+      _log('supervisor', '距上次强制重建不足 30s：保持退避层级（第 $_attempt 次）'
+          '继续重建，避免快退避风暴', level: TunnelEventLevel.warn);
+    } else {
+      _attempt = 0; // 新的一段故障：从快退避重新开始，让用户尽快看到恢复
+    }
     _setState(_state.copyWith(
       status: TunnelStatus.disconnected,
       kind: TunnelFailureKind.none,
       probeOk: false,
-      // 界面计数必须跟着内部计数一起归零，否则横幅会显示"第 5 次尝试"而内部
+      // 界面计数必须跟着内部计数一起走，否则横幅会显示"第 5 次尝试"而内部
       // 其实已经开始第 1 次快退避（纯展示不一致，但正是这种不一致最伤信任）。
-      attempt: 0,
+      attempt: _attempt,
       clearConnectedSince: true,
       clearNextRetry: true,
     ));
@@ -1191,7 +1233,24 @@ class TunnelService {
     // 的服务，要么误报"云端无应答"，要么更糟——探通了个不相干的程序。
     final port = activeLocalPort;
     if (port == null) return false;
+    // 在途互斥：看门狗（周期）/回前台/页面失败可并发进入，不去重则多路
+    // 探测共享 _probeFailures 重复计数，提前打满阈值误触发强制重建。
+    // 在途期间的再入不再另起一路，只回报当前健康结论（在途那路很快会写）。
+    if (_probing) return _state.probeOk;
+    _probing = true;
+    try {
+      return await _probeEndpointInner(
+          reason: reason, port: port, forceRebuildOnFail: forceRebuildOnFail);
+    } finally {
+      _probing = false;
+    }
+  }
 
+  Future<bool> _probeEndpointInner({
+    required String reason,
+    required int port,
+    bool forceRebuildOnFail = false,
+  }) async {
     final last = _lastForwardActivity;
     if (reason == 'periodic' &&
         _state.probeOk &&
@@ -2222,68 +2281,32 @@ class TunnelService {
 
   /// 主机密钥 TOFU（Trust On First Use）校验。
   ///
-  /// 首次连接某 `host:port` 时记录其密钥指纹；后续连接比对指纹，
-  /// 一致则信任，不一致则拒绝（防止中间人替换主机密钥）。
-  /// 指纹按 `host:port + 算法类型` 分别持久化，互不干扰。
+  /// 主机密钥 TOFU 校验：核心规则在 [HostKeyVerifier]（独立可单测，含
+  /// "未记录算法一律拒绝"的防降级规则），这里只做 SSH 侧参数适配。
   ///
-  /// 返回 true 表示信任（首次连接时同时完成记录）；false 表示拒绝。
-  /// TOFU 校验：首次记录指纹、后续比对。
+  /// 返回 true 表示信任（绝对首连时同时完成记录）；false 表示拒绝。
   ///
-  /// [onMismatch] 只在**本次连接**的上下文里回传"指纹不匹配"，让调用方抛出带类型
+  /// [onMismatch] 只在**本次连接**的上下文里回传"校验失败"，让调用方抛出带类型
   /// 的 [TunnelHostKeyMismatchException]；不设全局标志（并发连接会互相串档）。
   Future<bool> _verifyHostKey(
     SSHConfig config,
     String hostkeyType,
     Uint8List fingerprint, {
     void Function()? onMismatch,
-  }) async {
-    final key = 'ssh_hostkey_${config.host}_${config.sshPort}_$hostkeyType';
-    final hex =
-        fingerprint.map((b) => b.toRadixString(16).padLeft(2, '0')).join(':');
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final saved = prefs.getString(key);
-      if (saved == null) {
-        // 首次连接：记录指纹并信任（TOFU 首连假设）
-        await prefs.setString(key, hex);
-        debugPrint('[DSH] host key first-seen for $key, recorded '
-            'fingerprint=$hex');
-        return true;
-      }
-      if (saved == hex) {
-        return true;
-      }
-      // 指纹变化：拒绝连接并提示（可能是中间人，也可能是服务器重装）
-      debugPrint('[DSH] host key MISMATCH for $key: '
-          'saved=$saved current=$hex');
-      onMismatch?.call();
-      return false;
-    } catch (e) {
-      // 存储不可用时拒绝连接（fail-closed）：指纹既读不出也记不下，
-      // 放行等于在这个窗口里跳过全部中间人防护。表现为普通建链失败，
-      // 用户重试或清指纹后可恢复。
-      debugPrint('[DSH] host key store unavailable, reject (fail-closed): $e');
-      return false;
-    }
-  }
+  }) =>
+      const HostKeyVerifier().verify(
+        config.host,
+        config.sshPort,
+        hostkeyType,
+        fingerprint,
+        onMismatch: onMismatch,
+      );
 
-  /// 清除全部已保存的主机密钥指纹（TOFU 记录）。
+  /// 清除全部已保存的主机密钥指纹与算法集合（TOFU 记录）。
   ///
-  /// 服务器重装/更换密钥导致指纹不匹配时调用，清除后下次连接重新记录。
-  static Future<void> clearHostKeyFingerprints() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final keys = prefs.getKeys()
-          .where((k) => k.startsWith('ssh_hostkey_'))
-          .toList();
-      for (final k in keys) {
-        await prefs.remove(k);
-      }
-      debugPrint('[DSH] cleared ${keys.length} host key fingerprint(s)');
-    } catch (e) {
-      debugPrint('[DSH] clear host key fingerprints failed: $e');
-    }
-  }
+  /// 服务器重装/更换密钥/更换算法导致被拒时调用，清除后下次连接重新记录。
+  static Future<void> clearHostKeyFingerprints() =>
+      HostKeyVerifier.clearAll();
 
   /// 健壮解码：先尝试 UTF-8 严格解码（合法即采用，避免中文文本被
   /// 误判为 GBK 产生乱码），失败再自动检测编码（UTF-8 → GBK/GB2312
