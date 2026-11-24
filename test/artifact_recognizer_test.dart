@@ -177,4 +177,45 @@ void main() {
     });
   });
 
+  group('ArtifactRules.isFullRemoteAddress（相对地址不进原生查看/下载）', () {
+    test('完整地址：POSIX 绝对 / Windows 盘符 / UNC / 家目录 ~', () {
+      expect(ArtifactRules.isFullRemoteAddress('/home/u/out/k40_lib.png'),
+          isTrue);
+      expect(ArtifactRules.isFullRemoteAddress(r'C:\Reports\out.md'), isTrue);
+      expect(ArtifactRules.isFullRemoteAddress('D:/work/app.apk'), isTrue);
+      expect(ArtifactRules.isFullRemoteAddress(r'\\server\share\x.zip'),
+          isTrue);
+      expect(ArtifactRules.isFullRemoteAddress('~/report.md'), isTrue);
+      expect(ArtifactRules.isFullRemoteAddress(r'~\report.md'), isTrue);
+      expect(ArtifactRules.isFullRemoteAddress('~'), isTrue);
+    });
+
+    test('完整地址：带协议 URL（含带 token 查询串的链接）', () {
+      expect(
+          ArtifactRules.isFullRemoteAddress(
+              'http://127.0.0.1:3080/api/files/k40_lib.png?token=x'),
+          isTrue);
+      expect(ArtifactRules.isFullRemoteAddress('https://a.b/c.md'), isTrue);
+    });
+
+    test('相对地址不是完整地址（真机 k40_lib.png 复现场景）', () {
+      // 相对项目目录的路径：SFTP 从家目录开必然 noSuchFile，
+      // 只能经 chips/目录反查补全后才允许走原生查看/下载。
+      expect(ArtifactRules.isFullRemoteAddress(r'var-real\k40_lib.png'),
+          isFalse);
+      expect(ArtifactRules.isFullRemoteAddress('outputs/报告.md'), isFalse);
+      expect(ArtifactRules.isFullRemoteAddress('build/app.apk'), isFalse);
+      expect(ArtifactRules.isFullRemoteAddress('./report.md'), isFalse);
+      expect(ArtifactRules.isFullRemoteAddress('k40_lib.png'), isFalse);
+      expect(ArtifactRules.isFullRemoteAddress(''), isFalse);
+      expect(ArtifactRules.isFullRemoteAddress('   '), isFalse);
+    });
+
+    test('首尾空白不影响判定', () {
+      expect(ArtifactRules.isFullRemoteAddress('  /home/u/x.md  '), isTrue);
+      expect(ArtifactRules.isFullRemoteAddress(' var-real\\k40_lib.png '),
+          isFalse);
+    });
+  });
+
 }

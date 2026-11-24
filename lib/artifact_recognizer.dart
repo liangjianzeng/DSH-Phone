@@ -185,6 +185,34 @@ class ArtifactRules {
     final lower = normalizeForSuffix(url);
     return fileUrlSuffixes.any((s) => lower.endsWith(s));
   }
+
+  /// 是否为「完整地址」——资源查看/下载原理下**唯一**能直接取到内容的形态：
+  ///  - 带协议的完整 URL（`http://…`，交给 fetch/WebView 自身）；
+  ///  - POSIX 绝对路径（`/home/u/out.md`）、Windows 盘符（`C:\x`、`D:/y`）、UNC（`\\srv\share`）；
+  ///  - 家目录相对 `~` / `~/x`（sftp-server 的 cwd 就是 home，`~` 形态是确定的）。
+  ///
+  /// 反过来，`var-real\k40_lib.png`、`outputs/报告.md` 这类**相对地址**是相对
+  /// 某个项目目录的：SFTP 候选（TunnelService._sftpPathCandidates）只会从家目录
+  /// 开，硬开必然 noSuchFile，用户看到的就是伪造的「云端不存在该文件」错误页
+  /// （2026-11-24 真机 `var-real\k40_lib.png` 复现）。相对地址只有经 chips 反查
+  /// 或候选目录反查**补全成绝对路径**后才允许走原生查看/下载，否则应放行给
+  /// WebView 自身处理（见 webview_bridges.dart 的 `isFullAddress`——
+  /// **JS 与 Dart 两份规则必须一致**）。
+  static bool isFullRemoteAddress(String path) {
+    final p = path.trim();
+    if (p.isEmpty) return false;
+    // 完整 URL（http/https/mailto…）；Windows 盘符 `C:\` 也会被此条命中，无碍。
+    if (RegExp(r'^[a-zA-Z][a-zA-Z0-9+.\-]*:').hasMatch(p)) return true;
+    if (p.startsWith('/')) return true; // POSIX 绝对 / 服务器根路径
+    if (p.startsWith(r'\')) return true; // UNC（含单反斜杠开头的罕见形态）
+    if (RegExp(r'^[a-zA-Z]:[\\/]').hasMatch(p)) return true; // Windows 盘符
+    if (p == '~' ||
+        p.startsWith('~/') ||
+        p.startsWith(r'~\')) {
+      return true; // 家目录相对 = 确定形态
+    }
+    return false;
+  }
 }
 
 /// 把 JS 桥返回的原始 Map 解析成 [ArtifactHit]。

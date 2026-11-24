@@ -1897,6 +1897,25 @@ class _WebViewScreenState extends State<WebViewScreen>
     final resolved = await _resolveHitPath(hit);
     if (!mounted) return;
     hit = resolved;
+    // 反查后仍是相对地址（`var-real\k40_lib.png` 这类）：SFTP 候选只会从家目录
+    // 开，硬开 viewer/下载就是伪造的「云端不存在该文件」错误页（2026-11-24 真机
+    // 复现）。资源查看/下载原理下只有**完整地址**才取得到内容：这里直接放弃劫持，
+    // 把查阅让给 WebView 自身；链接型（有 http(s) url）则清空 path 交给 viewer
+    // 走 URL 方式（图片直显 / 网页兜底），复用 WebView 的同源登录态。
+    if (hit.path.isNotEmpty && !ArtifactRules.isFullRemoteAddress(hit.path)) {
+      final linkUsable =
+          hit.url.startsWith('http://') || hit.url.startsWith('https://');
+      if (!linkUsable && hit.content.isEmpty) return; // 无名可查：当这次没点
+      hit = ArtifactHit(
+        type: hit.type,
+        url: hit.url,
+        language: hit.language,
+        content: hit.content,
+        path: '',
+        dirs: hit.dirs,
+        error: hit.error,
+      );
+    }
     // 资源型成果（apk/压缩包等）：转下载页（含断点续传 + 另存为）。
     // 工具开关：资源下载关闭时不触发下载能力。
     if (hit.type == ArtifactType.resource) {
@@ -1934,8 +1953,11 @@ class _WebViewScreenState extends State<WebViewScreen>
         return;
       }
       if (imageKey.isNotEmpty && ArtifactRules.isImageSuffix(imageKey)) {
-        if (hit.path.isEmpty || !_resourceViewEnabled) {
-          // 拿不到云端路径就读不了字节；查看开关关闭时退回下载，至少还能用。
+        final viaUrl =
+            hit.url.startsWith('http://') || hit.url.startsWith('https://');
+        if ((hit.path.isEmpty && !viaUrl) || !_resourceViewEnabled) {
+          // 既拿不到云端路径又没有可打开的链接：退回下载（至少还能用/有明确提示）；
+          // 查看开关关闭时同样退回下载。
           if (_resourceDownloadEnabled) {
             _openResourceDownload(hit);
           } else {
@@ -1943,7 +1965,7 @@ class _WebViewScreenState extends State<WebViewScreen>
           }
           return;
         }
-        final path = hit.path;
+        final path = hit.path; // 可为空：链接型图片由 viewer 直接用 URL 显示
         Navigator.of(context).push(
           MaterialPageRoute(
             fullscreenDialog: true,
@@ -1952,11 +1974,15 @@ class _WebViewScreenState extends State<WebViewScreen>
               url: hit.url,
               language: '',
               content: '',
-              fileName: _basename(path),
+              fileName:
+                  path.isNotEmpty ? _basename(path) : _basename(hit.url),
               path: path,
               // 读原始字节交 Image.memory：绝不能再走一遍文本解码。
-              rawBytesLoader: () =>
-                  TunnelService.instance.readRemoteFileBytes(path),
+              // 无云端路径时不传 loader：viewer 会在字节为空时改用 WebView
+              // 按链接直接显示图片（_canShowImageViaUrl，复用同源登录态）。
+              rawBytesLoader: path.isEmpty
+                  ? null
+                  : () => TunnelService.instance.readRemoteFileBytes(path),
             ),
           ),
         );
@@ -2042,6 +2068,9 @@ class _WebViewScreenState extends State<WebViewScreen>
   ///
   /// 旧判据是"含 `/` 或 `\` 就当完整路径直接早退"，于是 `./report.md`、
   /// `out/app.apk`、`~/x.md` 这类**相对路径**永远得不到目录反查的救机。
+  /// 注意：反查**失败**后不再拿相对路径硬开查看器/下载——相对地址只可能从
+  /// 家目录开出来，硬开就是伪造的"云端不存在该文件"（守卫见
+  /// [ArtifactRules.isFullRemoteAddress] 在 `_openArtifact` 的用法）。
   static bool _looksLikeBareName(String path) {
     if (path.trim().isEmpty) return true;
     final p = path.trim();
@@ -2068,6 +2097,16 @@ class _WebViewScreenState extends State<WebViewScreen>
         ..clearSnackBars()
         ..showSnackBar(const SnackBar(
             content: Text('该资源只有链接、拿不到云端路径，无法直接下载')));
+      return;
+    }
+    // 相对路径（`var-real\k40_lib.png`）从家目录开必然 noSuchFile：不下发一个
+    // 注定失败的下载任务，直接说清楚定位不了。
+    if (!ArtifactRules.isFullRemoteAddress(hit.path)) {
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..showSnackBar(const SnackBar(
+            content:
+                Text('云端路径是相对地址，无法定位到云端文件，不支持直接下载')));
       return;
     }
     final task = DownloadManager.instance.start(hit.path);

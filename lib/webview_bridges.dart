@@ -141,6 +141,22 @@ const String artifactBridgeJs = r'''
     return dirs;
   }
 
+  // 「完整地址」判据（与 Dart 侧 ArtifactRules.isFullRemoteAddress 同一规则，
+  // **两处必须一致**）：带协议完整 URL / POSIX 绝对 / Windows 盘符 / UNC / 家目录 `~`。
+  // `var-real\k40_lib.png`、`outputs/报告.md` 这类相对地址是相对项目目录的，
+  // SFTP 候选只会从家目录开，硬开必然「云端不存在该文件」——相对地址只有能经
+  // chips 反查（或页面产物目录反查）补全时才值得劫持，否则放行给 WebView 自己处理。
+  function isFullAddress(p) {
+    var s = String(p || '').trim();
+    if (!s) return false;
+    if (/^[a-zA-Z][a-zA-Z0-9+.\-]*:/.test(s)) return true; // http://… 完整 URL（盘符同被命中）
+    if (s.charAt(0) === '/') return true;                   // POSIX 绝对 / 服务器根路径
+    if (s.charAt(0) === '\\') return true;                  // UNC
+    if (/^[a-zA-Z]:[\\/]/.test(s)) return true;             // Windows 盘符
+    if (s === '~' || s.indexOf('~/') === 0 || s.indexOf('~\\') === 0) return true;
+    return false;
+  }
+
   // 成果链接前缀 + PDF/office 放行正则：click 与 contextmenu 两个处理器
   // 共用，声明在 IIFE 顶层，避免两处各写一份漂移。
   var isFileUrlPrefix = /\/api\/files\/|\/files\/|\/api\/artifact\/|\/artifacts\//i;
@@ -214,6 +230,10 @@ const String artifactBridgeJs = r'''
           var base = href.split(/[\\/?#]+/).pop() || '';
           var mentionPath = findMentionPath(base);
           var dirs = collectProducedDirs();
+          // 相对地址链接（非完整地址）且 chips 补全不了、页面也没有可反查的
+          // 产物目录：忽略劫持——SFTP 从家目录开这种路径只会伪造"云端不存在
+          // 该文件"，放行给 WebView 按当前页面解析自身打开。
+          if (!mentionPath && dirs.length === 0 && !isFullAddress(href)) return;
           send({type: 'resource', url: a.href, language: '', content: '', path: mentionPath, dirs: dirs});
           return;
         }
@@ -238,8 +258,11 @@ const String artifactBridgeJs = r'''
       var title = mention.getAttribute('title') || '';
       var label = mention.getAttribute('aria-label') || '';
       var filePath = elementPath(mention) || title || label || '';
-      var isMention = cls.indexOf('fileMention') >= 0 ||
-          isArtifactPath(filePath);
+      // 真实成果 chips（fileMention 类名 / data-*-path 显式属性）照旧整体劫持；
+      // 普通 button/span 只是恰好带个像路径的 title/aria-label：必须本身是
+      // 完整地址才劫持，否则（如 title="var-real\k40_lib.png"）放行给 WebView。
+      var isMention = isChipLike(mention) ||
+          (isArtifactPath(filePath) && isFullAddress(filePath));
       if (isMention && filePath) {
         // 真实成果 chips（fileMention 类名）的 PDF/office：放行给 Web 预览
         if (cls.indexOf('fileMention') >= 0 && passPreviewRe.test(filePath)) {
@@ -267,16 +290,19 @@ const String artifactBridgeJs = r'''
       var suffixRe = { test: isArtifactPath }; // 脚本内统一后缀表（含 ?/# 与 .so.N）
       if (singleLine && suffixRe.test(trimmed)) {
         // 先按文件名在整个文档的产物 chips 里反查完整路径；
-        // 若文本自身已含路径分隔符（/ 或 \），则直接用文本作为路径。
+        // 文本自身含路径分隔符（/ 或 \）**且是完整地址**时才直接当路径用——
+        // `var-real\k40_lib.png` 这类相对地址从家目录开必然"云端不存在该文件"，
+        // 不再直接劫持，只值得一次目录反查（下方 dirs 分支）。
         var mentionPath = findMentionPath(trimmed);
-        if (!mentionPath && /[\\/]/.test(trimmed)) mentionPath = trimmed;
+        if (!mentionPath && /[\\/]/.test(trimmed) && isFullAddress(trimmed)) mentionPath = trimmed;
         if (mentionPath) {
           var isResource = isResourcePath(mentionPath);
           send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: mentionPath});
           return;
         }
-        // 反查失败（该文件 chips 被隐藏）：回传文件名 + 可见产物目录，
-        // 由 Dart 侧逐个拼接目录定位云端路径。
+        // 反查失败（该文件 chips 被隐藏）：文件名/相对路径 + 可见产物目录，
+        // 由 Dart 侧逐个拼接目录定位云端路径（拼不成完整地址时 Dart 侧静默放弃）。
+        // 页面没有可反查的目录：不劫持成果流程，按普通代码文本给代码查看器显示。
         var dirs = collectProducedDirs();
         if (dirs.length > 0) {
           var isResource = isResourcePath(trimmed);
@@ -317,10 +343,15 @@ const String artifactBridgeJs = r'''
             (endsWithArtifact && hasSep && !/[。！？；，、]/.test(raw)) ||
             (raw.indexOf(' ') < 0 && endsWithArtifact);
         if (looksPath) {
+          var bodyDirs = collectProducedDirs();
+          // 相对地址（非完整地址）且 chips 补全不了、页面也没有可反查的产物
+          // 目录：忽略劫持、不 preventDefault——SFTP 只会从家目录开，硬开就是
+          // 伪造的"云端不存在该文件"；这条点击归 WebView / DSH Web 自己处理。
+          if (!bodyMention && !isFullAddress(raw) && bodyDirs.length === 0) return;
           ev.preventDefault();
           ev.stopPropagation();
           var isResource = isResourcePath(bodyPath);
-          send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: bodyPath, dirs: collectProducedDirs()});
+          send({type: isResource ? 'resource' : 'file', url: '', language: '', content: '', path: bodyPath, dirs: bodyDirs});
           return;
         }
       }
