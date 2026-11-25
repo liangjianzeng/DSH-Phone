@@ -1527,8 +1527,8 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   // ================= 测试机设备面板（原生顶栏入口）=================
 
-  /// 等待页面回传的 adb 请求，按 id 配对（页面侧 45s 超时兜底，这里再兜 60s，
-  /// 免得 WebView 被销毁后 Future 永远挂着）。
+  /// 等待页面回传的 adb 请求，按 id 配对（页面侧 65s 超时兜底，这里再兜 70s，
+  /// 给主机 60s 扫描看门狗留出回传余量）。
   final Map<String, Completer<Map<String, dynamic>>> _adbPending =
       <String, Completer<Map<String, dynamic>>>{};
   int _adbSeq = 0;
@@ -1550,11 +1550,11 @@ class _WebViewScreenState extends State<WebViewScreen>
               "${jsonEncode(method)}, ${jsonEncode(path)}, "
               "${jsonEncode(encodedBody ?? '')}, ${jsonEncode(id)})");
       return await completer.future.timeout(
-        const Duration(seconds: 60),
+        const Duration(seconds: 70),
         onTimeout: () => <String, dynamic>{
           'ok': false,
           'status': 0,
-          'error': '页面 60 秒没回传结果（页面可能被销毁或脚本被页面拦截）'
+          'error': '页面 70 秒没回传结果（页面可能被销毁或脚本被页面拦截）'
         },
       );
     } catch (e) {

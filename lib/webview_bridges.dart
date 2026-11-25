@@ -587,8 +587,8 @@ const String adbBridgeJs = r'''
         if (settled) return;
         settled = true;
         try { window.flutter_inappwebview.callHandler('onAdbResult',
-            { id: id, ok: false, status: 0, body: '', error: '请求超时（45 秒未响应）' }); } catch (e) {}
-      }, 45000);
+            { id: id, ok: false, status: 0, body: '', error: '请求超时（65 秒未响应）' }); } catch (e) {}
+      }, 65000);
       function done(payload) {
         if (settled) return;
         settled = true;

@@ -39,13 +39,31 @@ class _DevicePanelPageState extends State<DevicePanelPage> {
   String _adbPath = '';
   String? _adbVersion;
   int _lastScanAt = 0;
-  bool _everScanned = false;
   bool _busy = false;
   String? _error;
   String? _hint;
   final Set<String> _selected = <String>{};
   String _template = 'default';
   final TextEditingController _target = TextEditingController();
+
+  // 设备列表最多铺 3 行，其余滚动：面板整体高度按内容收缩，不再固定占掉大半屏。
+  // 行高取实测值（各台的通道标签行数不同），首帧还没量到先用估算值兜底。
+  static const int _visibleRows = 3;
+  static const double _rowHeightFallback = 150;
+  double? _rowHeight;
+  final GlobalKey _firstRowKey = GlobalKey();
+
+  /// 量一次首行高度。行高不随列表可视高度变化，最多收敛一帧。
+  void _measureRowHeight() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final box = _firstRowKey.currentContext?.findRenderObject();
+      if (box is! RenderBox || !box.hasSize || box.size.height <= 0) return;
+      final measured = box.size.height;
+      if (_rowHeight != null && (measured - _rowHeight!).abs() < 1) return;
+      setState(() => _rowHeight = measured);
+    });
+  }
 
   static const List<(String, String)> _templates = <(String, String)>[
     ('default', '默认（清单 + 通道 + 排查建议）'),
@@ -62,7 +80,7 @@ class _DevicePanelPageState extends State<DevicePanelPage> {
   @override
   void initState() {
     super.initState();
-    // 打开先读缓存（DSH 侧存 registry.json，秒回）；从没扫过才摆「扫描可用设备」。
+    // 打开先读缓存（DSH 侧存 registry.json，秒回）。
     _load(listAction: 'list');
   }
 
@@ -79,16 +97,24 @@ class _DevicePanelPageState extends State<DevicePanelPage> {
       return null;
     }
     try {
-      final decoded = jsonDecode(raw);
+      var decoded = jsonDecode(raw);
       if (decoded is! Map<String, dynamic>) {
         _error = '返回不是 JSON 对象';
         return null;
       }
-      // DSH 侧的应答是 {ok, text, data}；ok=false 时把 text 当失败原因摊出来，
-      // 不能当成功渲染（否则"没有可注入的设备"会被显示成正常列表）。
+      // 外层是 RPC 信封 {ok, value:{ok, text, data}}；HTTP 与 RPC 两条通道共用同一
+      // handle()，所以 HTTP 也带这层壳（Web 客户端剥了，这里不剥就永远渲染 0 台）。
       if (decoded['ok'] == false) {
-        _error = (decoded['text'] ?? decoded['error'] ?? '执行失败').toString();
+        _error = _failureText(decoded);
         return null;
+      }
+      final inner = decoded['value'];
+      if (inner is Map<String, dynamic>) {
+        if (inner['ok'] == false) {
+          _error = _failureText(inner);
+          return null;
+        }
+        decoded = inner;
       }
       return decoded;
     } catch (e) {
@@ -97,24 +123,40 @@ class _DevicePanelPageState extends State<DevicePanelPage> {
     }
   }
 
+  /// 失败文案：优先 text，其次 error.message（RPC 信封里的错误是对象不是字符串）。
+  String _failureText(Map<String, dynamic> envelope) {
+    final text = envelope['text'] ?? envelope['message'];
+    if (text is String && text.trim().isNotEmpty) return text;
+    final error = envelope['error'];
+    if (error is Map<String, dynamic>) {
+      return (error['message'] ?? error['code'] ?? '执行失败').toString();
+    }
+    if (error is String && error.trim().isNotEmpty) return error;
+    return '执行失败';
+  }
+
   void _apply(Map<String, dynamic>? envelope) {
     if (envelope == null) return;
     final data = envelope['data'];
     if (data is! Map<String, dynamic>) return;
+    final rawSnapshot = data['snapshot'];
+    final snapshot = rawSnapshot is Map<String, dynamic> ? rawSnapshot : data;
     setState(() {
-      _devices = (data['devices'] as List?)?.cast<Map<String, dynamic>>() ?? const [];
-      _counts = data['counts'] is Map<String, dynamic>
-          ? (data['counts'] as Map<String, dynamic>)
+      _devices = (snapshot['devices'] as List?)?.cast<Map<String, dynamic>>() ?? const [];
+      _counts = snapshot['counts'] is Map<String, dynamic>
+          ? (snapshot['counts'] as Map<String, dynamic>)
           : const {};
-      _hostName = (data['hostName'] ?? '').toString();
-      _adbPath = (data['adbPath'] ?? '').toString();
-      _adbVersion = data['adbVersion']?.toString();
-      _lastScanAt = (data['lastScanAt'] as num?)?.toInt() ?? _lastScanAt;
-      _everScanned = _everScanned || _lastScanAt > 0 || _devices.isNotEmpty;
+      _hostName = (data['hostName'] ?? snapshot['hostName'] ?? '').toString();
+      _adbPath = (data['adbPath'] ?? snapshot['adbPath'] ?? '').toString();
+      _adbVersion = (data['adbVersion'] ?? snapshot['adbVersion'])?.toString();
+      _lastScanAt = (data['lastScanAt'] as num?)?.toInt() ??
+          (snapshot['lastScanAt'] as num?)?.toInt() ??
+          _lastScanAt;
       // 选中项必须仍然存在，否则注入时会带上已消失的设备。
       final alive = _devices.map((d) => '${d['serial']}').toSet();
       _selected.retainWhere(alive.contains);
     });
+    _measureRowHeight();
   }
 
   Future<void> _load({required String listAction}) async {
@@ -143,14 +185,12 @@ class _DevicePanelPageState extends State<DevicePanelPage> {
     final scan = await widget.request('POST', '/adb-devices/scan', <String, dynamic>{});
     if (!mounted) return;
     final envelope = _decode(scan);
-    final text = envelope?['text']?.toString();
-    setState(() => _hint = text);
-    if (envelope != null) _apply(envelope);
-    if (_error != null) {
-      setState(() => _busy = false);
-      return;
-    }
-    await _load(listAction: 'list');
+    setState(() {
+      _busy = false;
+      _hint = envelope?['text']?.toString();
+    });
+    _apply(envelope);
+    if (_error != null) setState(() {});
   }
 
   Future<void> _composeAndInject() async {
@@ -301,6 +341,11 @@ class _DevicePanelPageState extends State<DevicePanelPage> {
                       const SizedBox(
                           width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
                     IconButton(
+                      tooltip: '重新扫描设备',
+                      icon: const Icon(Icons.radar),
+                      onPressed: _busy ? null : _scan,
+                    ),
+                    IconButton(
                       tooltip: '只读刷新（探已知通道）',
                       icon: const Icon(Icons.refresh),
                       onPressed: _busy ? null : () => _load(listAction: 'status'),
@@ -342,16 +387,20 @@ class _DevicePanelPageState extends State<DevicePanelPage> {
                   child: Text(_hint!, style: const TextStyle(fontSize: 11), maxLines: 4,
                       overflow: TextOverflow.ellipsis),
                 ),
-              if (!_everScanned && !_busy)
+              if (_devices.isEmpty && !_busy)
                 Padding(
                   padding: const EdgeInsets.all(24),
                   child: Column(
                     children: [
                       const Icon(Icons.devices_other_outlined, size: 44),
                       const SizedBox(height: 8),
-                      Text('还没扫过设备。点下面这个按钮，让那台机器上的 adb 找一遍：',
-                          style: TextStyle(fontSize: 12, color: theme.hintColor),
-                          textAlign: TextAlign.center),
+                      Text(
+                        _lastScanAt == 0
+                            ? '还没扫过设备。点下面这个按钮，让那台机器上的 adb 找一遍：'
+                            : '没有已知设备。可以重新扫描，发现新接入的测试机：',
+                        style: TextStyle(fontSize: 12, color: theme.hintColor),
+                        textAlign: TextAlign.center,
+                      ),
                       const SizedBox(height: 12),
                       FilledButton.icon(
                         onPressed: _scan,
@@ -362,16 +411,22 @@ class _DevicePanelPageState extends State<DevicePanelPage> {
                   ),
                 )
               else
-                Expanded(
-                  child: _devices.isEmpty
-                      ? Center(
-                          child: Text(_busy ? '正在读取…' : '没有已知设备',
-                              style: TextStyle(fontSize: 12, color: theme.hintColor)))
-                      : ListView.builder(
-                          shrinkWrap: true,
-                          itemCount: _devices.length,
-                          itemBuilder: (context, i) => _row(_devices[i]),
-                        ),
+                Flexible(
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                        maxHeight: (_rowHeight ?? _rowHeightFallback) * _visibleRows),
+                    child: _devices.isEmpty
+                        ? Center(
+                            child: Text(_busy ? '正在读取…' : '没有已知设备',
+                                style: TextStyle(fontSize: 12, color: theme.hintColor)))
+                        : ListView.builder(
+                            shrinkWrap: true,
+                            itemCount: _devices.length,
+                            itemBuilder: (context, i) => i == 0
+                                ? KeyedSubtree(key: _firstRowKey, child: _row(_devices[i]))
+                                : _row(_devices[i]),
+                          ),
+                  ),
                 ),
               if (_devices.isNotEmpty)
                 Container(
@@ -381,14 +436,24 @@ class _DevicePanelPageState extends State<DevicePanelPage> {
                   child: Column(
                     children: [
                       Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Expanded(
+                            // 模板名可以是用户自定义的长文案（实测「默认（清单 + 通道 +
+                            // 排查建议）」）。DropdownButtonFormField 不开 isExpanded 时
+                            // 按内容宽度绘制、会溢出到 Expanded 盒子外面，压到右边输入框上。
+                            flex: 5,
                             child: DropdownButtonFormField<String>(
                               isDense: true,
+                              isExpanded: true,
                               value: _template,
                               items: _templates
                                   .map((t) => DropdownMenuItem<String>(
-                                      value: t.$1, child: Text(t.$2, style: const TextStyle(fontSize: 12))))
+                                      value: t.$1,
+                                      child: Text(t.$2,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(fontSize: 12))))
                                   .toList(),
                               onChanged: (v) => setState(() => _template = v ?? 'default'),
                               decoration: const InputDecoration(
@@ -397,13 +462,14 @@ class _DevicePanelPageState extends State<DevicePanelPage> {
                           ),
                           const SizedBox(width: 8),
                           Expanded(
-                            flex: 2,
+                            flex: 6,
                             child: TextField(
                               controller: _target,
                               style: const TextStyle(fontSize: 12),
                               decoration: const InputDecoration(
                                   isDense: true,
-                                  labelText: '调试目标（写进消息里）',
+                                  labelText: '调试目标',
+                                  hintText: '写进消息里，可留空',
                                   labelStyle: TextStyle(fontSize: 11)),
                             ),
                           ),
