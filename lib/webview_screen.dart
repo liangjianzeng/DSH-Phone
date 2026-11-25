@@ -133,6 +133,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   static const String _sunSwitchPrefKey = 'moon_sun_switch_enabled';
 
   // ---- 工具类功能开关（设置页"工具"分类控制）----
+  bool _devicePanelEnabled = true; // 原生顶栏「测试机设备」入口（默认显示）
   bool _hostMonitorEnabled = true; // 主机监控（默认开：采样并呈现曲线）
   bool _resourceViewEnabled = true; // 资源查看（默认开）
   bool _resourceDownloadEnabled = true; // 资源下载（默认开）
@@ -822,6 +823,7 @@ class _WebViewScreenState extends State<WebViewScreen>
     final resourceDownload = await SSHConfig.loadResourceDownloadEnabled();
     final github = await SSHConfig.loadGithubEnabled();
     final topbarRefresh = await SSHConfig.loadTopbarRefreshEnabled();
+    final devicePanel = await SSHConfig.loadDevicePanelEnabled();
     if (!mounted) return;
     setState(() {
       _hostMonitorEnabled = hostMonitor;
@@ -829,12 +831,20 @@ class _WebViewScreenState extends State<WebViewScreen>
       _resourceDownloadEnabled = resourceDownload;
       _githubEnabled = github;
       _topbarRefreshEnabled = topbarRefresh;
+      _devicePanelEnabled = devicePanel;
     });
     // 同步监控采样器：关闭则不请求（曲线随之消失）。
     HostMonitor.instance.enabled = hostMonitor;
   }
 
   /// 主机监控开关：持久化并同步采样器（关闭 → 停止请求并清空曲线）。
+  /// 「测试机设备」顶栏入口开关：只影响入口呈现，不动已建好的 adb 桥与缓存。
+  void _setDevicePanelEnabled(bool enabled) {
+    if (!mounted) return;
+    setState(() => _devicePanelEnabled = enabled);
+    SSHConfig.saveDevicePanelEnabled(enabled);
+  }
+
   void _setHostMonitorEnabled(bool enabled) {
     if (!mounted) return;
     setState(() => _hostMonitorEnabled = enabled);
@@ -1263,6 +1273,7 @@ class _WebViewScreenState extends State<WebViewScreen>
           onMoonLocationChanged: _setMoonLocation,
           hostMonitorEnabled: _hostMonitorEnabled,
           onHostMonitorChanged: _setHostMonitorEnabled,
+          onDevicePanelChanged: _setDevicePanelEnabled,
           resourceViewEnabled: _resourceViewEnabled,
           onResourceViewChanged: _setResourceViewEnabled,
           resourceDownloadEnabled: _resourceDownloadEnabled,
@@ -2462,7 +2473,7 @@ class _WebViewScreenState extends State<WebViewScreen>
                         _buildInstanceSwitcher(context),
                         // 测试机设备面板：只有 DSH 模式有意义（Zcode 模式页面不是 DSH，
                         // 没有 /adb-devices 这条路由，点了只会报错）。
-                        if (!_config.isZcodeMode)
+                        if (!_config.isZcodeMode && _devicePanelEnabled)
                           IconButton(
                             tooltip: '测试机设备',
                             icon: const Icon(Icons.devices_other_outlined),

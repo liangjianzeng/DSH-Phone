@@ -46,6 +46,7 @@ class SetupScreen extends StatefulWidget {
     this.onMoonLocationChanged,
     this.hostMonitorEnabled = true,
     this.onHostMonitorChanged,
+    this.onDevicePanelChanged,
     this.resourceViewEnabled = true,
     this.onResourceViewChanged,
     this.resourceDownloadEnabled = true,
@@ -137,6 +138,8 @@ class SetupScreen extends StatefulWidget {
   /// 主机监控开关（默认开启；关闭则不请求不呈现曲线）。
   final bool hostMonitorEnabled;
   final ValueChanged<bool>? onHostMonitorChanged;
+  /// 「测试机设备」顶栏入口开关回调（呈现/隐藏原生顶栏的设备图标）。
+  final ValueChanged<bool>? onDevicePanelChanged;
 
   /// 资源查看开关（默认开启；关闭后不触发查看能力）。
   final bool resourceViewEnabled;
@@ -214,6 +217,9 @@ class _SetupScreenState extends State<SetupScreen> {
 
   /// 当前编辑实例的"默认主机资源监控"开关（实例级，随实例切换回填）。
   late bool _instanceHostMonitorEnabled;
+
+  /// 「测试机设备」顶栏入口开关（全局：关掉顶栏就不摆这个图标）。
+  bool _devicePanelEnabled = true;
 
   /// Unsloth Studio 启用开关与连接方式（随实例切换回填）。
   late bool _unslothEnabled;
@@ -531,6 +537,9 @@ class _SetupScreenState extends State<SetupScreen> {
     _zcodeEnabled = c.zcodeEnabled;
     _workbuddyEnabled = c.workbuddyEnabled;
     _instanceHostMonitorEnabled = c.hostMonitorEnabled;
+    SSHConfig.loadDevicePanelEnabled().then((v) {
+      if (mounted) setState(() => _devicePanelEnabled = v);
+    });
     _unslothEnabled = c.unslothEnabled;
     _unslothUseSsh = c.unslothUseSsh;
   }
@@ -1384,6 +1393,21 @@ class _SetupScreenState extends State<SetupScreen> {
           onChanged: (v) {
             setState(() => _hostMonitorEnabled = v);
             widget.onHostMonitorChanged?.call(v);
+          },
+        ),
+        // 原生顶栏「测试机设备」入口：默认开启；关掉只是不摆图标，
+        // 已建好的 adb 桥与设备缓存不受影响，重新打开立刻可用。
+        SwitchListTile(
+          title: const Text('顶栏测试机设备入口'),
+          subtitle: const Text(
+            '默认开启；顶栏摆一个图标，点开是原生设备面板：扫描本机 USB / 局域网 / Tailscale 上的测试机，'
+            '看连接方式与状态（在线、锁屏、常亮、电量），勾选后把调试消息注入当前会话输入框（不自动发送）。\n'
+            '扫描在那台 DSH 所在机器上执行——若该实例没装设备管理插件，面板会直接说明原因。',
+          ),
+          value: _devicePanelEnabled,
+          onChanged: (v) {
+            setState(() => _devicePanelEnabled = v);
+            widget.onDevicePanelChanged?.call(v);
           },
         ),
         // 顶栏「刷新云」按钮：默认关闭（顶栏图标位紧张，且故障横幅已自带重试入口）

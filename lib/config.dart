@@ -107,6 +107,8 @@ class SSHConfig {
 
   // 工具类功能开关
   static const String keyHostMonitor = 'host_monitor_enabled';
+  /// 原生顶栏「测试机设备」图标开关（全局；关闭后顶栏不摆这个入口）。
+  static const String keyDevicePanel = 'device_panel_enabled';
   static const String keyResourceView = 'resource_view_enabled';
   static const String keyResourceDownload = 'resource_download_enabled';
 
@@ -594,6 +596,17 @@ class SSHConfig {
   static Future<void> saveHostMonitorEnabled(bool enabled) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(keyHostMonitor, enabled);
+  }
+
+  /// 读取「测试机设备」顶栏入口开关（默认开启：功能刚上线，藏起来等于没人用）。
+  static Future<bool> loadDevicePanelEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(keyDevicePanel) ?? true;
+  }
+
+  static Future<void> saveDevicePanelEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(keyDevicePanel, enabled);
   }
 
   /// 读取资源查看开关（默认开启）。

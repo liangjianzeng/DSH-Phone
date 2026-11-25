@@ -557,6 +557,8 @@ export function apply(ctx, rawConfig) {
           { name: 'mDNS', ok: mdns.available, detail: mdns.available ? `${mdns.services.length} 个无线调试服务` : (mdns.note ?? '不可用') },
           { name: 'tailscale', ok: tailnet.ok, detail: tailnet.ok ? `${tailnet.peers?.length ?? 0} 个 peer` : (tailnet.error ?? tailnet.skipped ? '已关闭' : '不可用') },
           { name: '局域网扫描', ok: true, detail: config.sources.lan.enabled ? `已开：${config.sources.lan.cidrs.join(', ') || '未配 CIDR'}` : '默认关闭（需显式配 CIDR）' },
+          { name: '路由注册', ok: registration.route === 'ok', detail: registration.route === 'ok' ? '/adb-devices/* 已注册（App 面板与 /api 通道的命脉）' : `${registration.route}${registration.errors.length ? ` ｜ ${registration.errors.join('；')}` : ' ｜ 未注册，面板会 404'}` },
+          { name: '工具注册', ok: registration.tool !== 'failed', detail: registration.tool === 'pending' ? '等待宿主 tools 服务…' : registration.tool },
           { name: '缓存', ok: true, detail: `${dataDir}（${Object.keys(state.registry.devices ?? {}).length} 台设备，上次扫描 ${state.lastScanAt ? new Date(state.lastScanAt).toLocaleTimeString('zh-CN', { hour12: false }) : '从未'}）` },
           {
             name: '会话投递服务',
@@ -605,6 +607,15 @@ export function apply(ctx, rawConfig) {
 
   // ── Agent 工具 ────────────────────────────────────────────────────────────
   const tools = service(ctx, 'tools');
+  if (!tools?.register) {
+    // 同样等一等；本轮激活窗口已过就只能如实记账，doctor 会指名让人重新启用插件。
+    waitForService('tools').then((found) => {
+      if (registration.tool !== 'pending') return;
+      registration.tool = found?.register
+        ? 'failed（tools 服务已到但激活窗口已过，请在插件管理里关掉再打开本插件）'
+        : 'failed（宿主 tools 服务 6s 未就绪，adb_devices 工具不可用）';
+    });
+  }
   if (tools?.register) {
     try {
       const dispose = tools.register({
@@ -666,6 +677,7 @@ export function apply(ctx, rawConfig) {
         return handle(endpoint, payload, { source: 'rpc' });
       });
       ctx.effect?.(() => async () => { try { await dispose?.(); } catch { /* 忽略 */ } });
+      registration.tool = 'ok';
     } catch (error) {
       log('注册 RPC 通道失败', String(error?.message ?? error));
     }
@@ -744,8 +756,46 @@ export function apply(ctx, rawConfig) {
   /** 从 URL 或字符串里取 action（WebAuthRequest.url 声明是 URL，但传字符串也要能判）。 */
   const actionOfRequest = (request) => resolveAction(toUrl(request?.url));
 
-  const webServer = service(ctx, 'webServer');
-  if (webServer?.register) {
+  /**
+   * 服务就绪状态。冷启动时宿主各服务不保证同批可用（webServer 常常比插件激活晚到），
+   * 只 ctx.get 一次会**静默**丢掉路由注册：表现为 /adb-devices/* 全线 404，而插件条目
+   * 显示 active、工具也在、面板图标也在——排查者完全看不到原因（2026-11-25 08:43 冷启动
+   * 复现，App 侧「扫描总是 404」就是这个）。所以：等它，且把结果记进 registration，
+   * 让 doctor 和面板能如实说"路由没注册上"。
+   */
+  const registration = { route: 'pending', tool: 'pending', prompt: 'skipped', errors: [] };
+
+  /**
+   * 轮询等待宿主服务出现；超时返回 undefined，调用方自己记账。
+   *
+   * 必须是**函数声明**而不是 const 箭头：工具注册段在文件更靠前的位置就要用它，
+   * const 会撞 TDZ（ReferenceError: Cannot access 'waitForService' before
+   * initialization），而那是运行时错误，`node --check` 查不出来——冷启动实测抓到过。
+   */
+  function waitForService(key, { attempts = 60, delayMs = 100 } = {}) {
+    return new Promise((resolve) => {
+      let tried = 0;
+      const tick = () => {
+        const found = service(ctx, key);
+        if (found) return resolve(found);
+        if (tried++ >= attempts) return resolve(undefined);
+        setTimeout(tick, delayMs);
+      };
+      tick();
+    });
+  }
+
+  let routeRegistered = false;
+  function markRouteFailed(reason) {
+    if (routeRegistered) return;
+    registration.route = 'failed';
+    registration.errors.push(`${reason}（/adb-devices/* 未注册，App 面板会 404）`);
+    log('HTTP 路由未注册', reason);
+  }
+  const registerHttpRoute = (from = ctx) => {
+    if (routeRegistered) return true;
+    const webServer = service(from, 'webServer');
+    if (!webServer?.register) return false;
     try {
       const dispose = webServer.register({
         kind: 'prefix',
@@ -762,14 +812,37 @@ export function apply(ctx, rawConfig) {
         resource: routeResource,
       });
       ctx.effect?.(() => dispose);
+      routeRegistered = true;
+      registration.route = 'ok';
+      log('HTTP 路由已注册 /adb-devices/*');
+      return true;
     } catch (error) {
+      registration.route = 'failed';
+      registration.errors.push(`HTTP 路由注册异常：${String(error?.message ?? error)}`);
       log('注册 HTTP 路由失败', String(error?.message ?? error));
+      return true; // 已尝试过，不再重试（重试只会重复抛）
+    }
+  };
+  if (!registerHttpRoute(ctx)) {
+    // 官方机制（practices.md：可选服务放 inject / ctx.inject，缺服务的 profile 里整段
+    // 不激活而不是抛）：webServer 由 web 侧稍晚提供，冷启动时 ctx.get 是快照查询，
+    // 自己轮询 ctx.get 等不到——必须走 ctx.inject 让加载器等依赖。
+    if (typeof ctx.inject === 'function') {
+      ctx.inject(['webServer'], (inner) => {
+        if (!registerHttpRoute(inner ?? ctx)) markRouteFailed('ctx.inject 回调里仍取不到 webServer');
+      });
+    } else {
+      waitForService('webServer').then((found) => {
+        if (found?.register) registerHttpRoute(ctx);
+        if (!routeRegistered) markRouteFailed('宿主 webServer 服务在 6s 内未就绪（ctx.inject 也不可用）');
+      });
     }
   }
 
   // ── 会话上下文：让模型自己知道有哪些设备（可关） ───────────────────────────
-  const systemPrompt = service(ctx, 'systemPrompt');
-  if (systemPrompt?.section && config.exposeToModel) {
+  const registerPromptSection = (from = ctx) => {
+    const systemPrompt = service(from, 'systemPrompt');
+    if (!systemPrompt?.section) return false;
     try {
       const dispose = systemPrompt.section({
         name: 'device-manager',
@@ -788,8 +861,31 @@ export function apply(ctx, rawConfig) {
         },
       });
       ctx.effect?.(() => dispose);
+      registration.prompt = 'ok';
+      return true;
     } catch (error) {
+      registration.prompt = 'failed';
+      registration.errors.push(`系统提示词段注册异常：${String(error?.message ?? error)}`);
       log('注册系统提示词段失败', String(error?.message ?? error));
+      return true;
+    }
+  };
+  if (config.exposeToModel && !registerPromptSection(ctx)) {
+    if (typeof ctx.inject === 'function') {
+      ctx.inject(['systemPrompt'], (inner) => {
+        if (!registerPromptSection(inner ?? ctx) && registration.prompt === 'pending') {
+          registration.prompt = 'failed';
+          registration.errors.push('ctx.inject 回调里仍取不到 systemPrompt，模型看不到设备清单');
+        }
+      });
+    } else {
+      waitForService('systemPrompt').then((found) => {
+        if (found?.section) registerPromptSection(ctx);
+        if (registration.prompt === 'pending') {
+          registration.prompt = 'failed';
+          registration.errors.push('宿主 systemPrompt 服务在 6s 内未就绪，模型看不到设备清单');
+        }
+      });
     }
   }
 
