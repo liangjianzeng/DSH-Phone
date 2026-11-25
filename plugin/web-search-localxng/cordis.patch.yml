@@ -1,0 +1,4 @@
+# web-search-localxng bundle patch: insert the direct-engine search provider row.
+- insert:
+    - id: web-search-localxng
+      name: web-search-localxng

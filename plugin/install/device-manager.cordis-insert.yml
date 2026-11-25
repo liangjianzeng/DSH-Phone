@@ -1,0 +1,44 @@
+# ── 安卓测试机管理（dsh-device-manager）───────────────────────────────────
+# 顶栏手机图标 → 设备面板；主机扫 USB/网段/Tailscale，勾选后注入调试消息。
+# 包体部署在 profiles/web/node_modules/@local/dsh-device-manager；源码在本仓库
+# plugin/dsh-device-manager，部署与启用步骤见 plugin/README.md。
+# 局域网扫段默认关闭，需要时把 lan.enabled 改 true 并写 cidrs。
+- insert:
+    - id: device-manager
+      name: '@local/dsh-device-manager'
+      config:
+        adbPath: auto
+        exposeToModel: true
+        sources:
+          usb:
+            enabled: true
+          lan:
+            enabled: false
+            cidrs: []
+            ports: [ 5555 ]
+            useMdnsFirst: true
+            ratePerSec: 200
+            connectTimeoutMs: 250
+            maxConcurrency: 32
+            maxIps: 512
+          tailscale:
+            enabled: true
+            ports: [ 5555 ]
+          emulator:
+            enabled: true
+          remoteAdbServers: []
+        poll:
+          enabled: true
+          panelMs: 3000
+          backgroundMs: 30000
+          staleAfterMs: 120000
+          pruneAfter: 3
+        collect:
+          concurrency: 4
+          perCommandTimeoutMs: 3000
+          factTimeoutMs: 5000
+          roundBudgetMs: 20000
+        inject:
+          mode: queue
+          template: default
+          allowSteer: true

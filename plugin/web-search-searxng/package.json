@@ -1,0 +1,19 @@
+{
+  "name": "web-search-searxng",
+  "description": "Local SearXNG-backed search provider for the DeepSeek Harness web capability seam (ctx.web) — no API key required",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-invariants": "workspace:^",
+    "@deepseek-ai/dsh-web": "workspace:^",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  }
+}

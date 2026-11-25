@@ -5,9 +5,11 @@
 DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 用户名 / 认证方式（SSH 密钥或密码），应用自动建立 SSH 隧道（`127.0.0.1:<localPort>` → 远程 `127.0.0.1:3080`），并通过 WebView 加载 DSH Web UI。内置本地缓存加速、SSH 保活、界面缩放与全屏显示、主题自适应，以及手动修改连接配置 / 刷新缓存 / 查看关于的入口。
 
 - **开源地址**：https://github.com/liangjianzeng/DSH-Phone
-- **当前版本**：v0.2.3（build 19）
+- **当前源码版本**：v0.2.6（build 22）
 - **安装包**：
-  - **当前版本 v0.2.3 直接下载**：<https://github.com/liangjianzeng/DSH-Phone/releases/download/v0.2.3/app-release-v0.2.3.apk> —— 23,631,615 bytes（≈22.54 MiB），release 签名 `CN=TongYiLite`，sha256 `5132995ce5bf69f275d38ae76aed009f76bce7bf3912e78bef9e9c9cc99a0cde`；覆盖安装即可，数据保留
+  - **最近正式发布 v0.2.3 直接下载**：<https://github.com/liangjianzeng/DSH-Phone/releases/download/v0.2.3/app-release-v0.2.3.apk> —— 23,631,615 bytes（≈22.54 MiB），release 签名 `CN=TongYiLite`，sha256 `5132995ce5bf69f275d38ae76aed009f76bce7bf3912e78bef9e9c9cc99a0cde`；覆盖安装即可，数据保留
+  - **v0.2.4 本机构建包**：`apk/app-release-v0.2.4.apk` —— 23,683,666 bytes（≈22.59 MiB），release 签名 `CN=TongYiLite`，sha256 `dc3088240c493ee7a637198342a28fe72927cdbaaac5728da6e89906929f6638`
+  - **v0.2.5 / v0.2.6 本机构建包**（尚未发 Release，仅真机验证用）：`apk/app-release-v0.2.5.apk` —— 23,684,111 bytes，sha256 `6ae6995e53a34a04cc1a76bce461ad6548b23f1c44cfecfd0a41b82739137f78`；`apk/app-release-v0.2.6.apk` —— 23,685,118 bytes，sha256 `854a09772feda07e4c7ac37694b68efe734dc86d2095be83f0dee40232973e57`；同为 release 签名 `CN=TongYiLite`
   - **仓库内镜像**（同版本同 sha256，走 raw CDN 时可能有几分钟缓存时差，故不作主链宣传）：`apk/app-release-v0.2.3.apk`，见 <https://github.com/liangjianzeng/DSH-Phone/tree/main/apk>
   - **APK 目录**：<https://github.com/liangjianzeng/DSH-Phone/tree/main/apk>　｜　**Releases**：<https://github.com/liangjianzeng/DSH-Phone/releases>
   - 自己编译：`./tool/build_apk.sh`，产物 `build/app/outputs/flutter-apk/app-release.apk`，结尾自动打印绝对地址 / 大小 / sha256 / 签名
@@ -208,13 +210,17 @@ lib/
 ├── task_notifier.dart        # AI 任务进行中/完成系统通知（锁屏可见）
 └── foreground_service.dart   # 前台服务保活封装（隧道连接期间后台保持进程/网络）
 third_party/dartssh2/                 # 本地 fork 的 dartssh2（吞吐优化 + SFTP 会话释放 + 半开连接/通道泄漏等 5 处本地加固，同步上游时须保留）
+plugin/                               # 自研 DSH 插件的唯一源码存放处（主机 node_modules 里只是部署副本）：dsh-device-manager（adb 设备管理，App 面板与 Web 顶栏共用）/ web-search-localxng / web-search-searxng；install/ 存 profile 注册块、tools/pack.mjs 打安装包到 dist/；维护与部署步骤见 plugin/README.md
 tool/build_apk.sh                     # 打包机一键脚本（环境自检 / 补齐 aarch64 主机的官方 AOT 产物 / 构建）
 tool/check_bridges_js.mjs             # 注入式 JS 桥校验（假 DOM 跑点击分发；桥脚本写在 Dart 字符串里，analyze/test 看不见其内部）
-test/                                 # 单元测试 112 例（隧道失败分类与退避 / 热词校正 / 成果识别与渲染 / 查看器布局回归 / 日出日落 …）；CI 跑 analyze + test + JS 桥校验
+test/                                 # 单元测试 161 例（隧道失败分类与退避 / 热词校正 / 成果识别与渲染 / 设备面板扫描回归 / 查看器布局回归 / 日出日落 …）；CI 跑 analyze + test + JS 桥校验
 ```
 
 ## 版本记录
 
+- **v0.2.6（build 22）**：**设备面板可读性**——原生面板设备列表最多铺 3 行、其余滚动（面板高度按内容收缩，不再固定占掉大半屏；行高实测，首帧未量到时用估算值兜底）；DSH Web 顶栏面板由半透明菜单底色改为**实底 + 同色叠加**（此前对话正文透出，adb 列表读不清），底栏拆成「控件行 / 输入行 / 动作行」，长模板名不再把按钮挤到第三行；插件版本同步 `@local/dsh-device-manager` 0.1.5。
+- **v0.2.5（build 21）**：原生设备面板底部「模板 / 调试目标」重叠修复——`DropdownButtonFormField` 未开 `isExpanded` 时按内容宽度绘制，长模板名溢出到输入框上；同时把用户自定义插件的**唯一源码**收进仓库 `plugin/`（设备管理 + 两个搜索），配 `plugin/tools/pack.mjs` 出包、`plugin/install/` 存注册块、`plugin/README.md` 记两台主机的部署与激活步骤。
+- **v0.2.4（build 20）**：**设备管理扫描链路修复**——原生面板保留持续可用的扫描入口，正确消费主机返回的 `snapshot`，扫描完成后即时解除忙碌状态；启动只读刷新不再冒充全量扫描，客户端超时也与主机 60 秒看门狗对齐。
 - **v0.2.3（build 19）**：**成果预览与下载重做 + 本地端口占用自愈 + CI 门禁复活 + 发版链路修复**——
   - **成果查看器重做**：HTML / Markdown / CSV / JSON 交给系统 WebView 主渲染（外链 CSS、字体、表格、报告里的相对路径截图、图表脚本全部可用），代码走原生语法高亮并带**行号 + 横向滚动 + 可选中复制**，CSV 渲染成真表格、JSON 自动美化，右上角一键切换「网页渲染 ⇄ 原生渲染」（超长文件用原生更稳）；**图片成果可直接预览**（双指缩放、SVG 按矢量渲染），此前只能下载。
   - **预览失败可自查**：失败卡片显示**试过的云端路径/链接**（可选中、一键复制），按失败分类给下一步建议（不存在 / 是目录 / 无权限 / 超时 / SSH 通道耗尽 / 隧道未连 / 文件超大），链接可达时再给「用网页方式打开」兜底；顶栏改为 3 个高频图标 + ⋯ 菜单，标题显示**文件名**（真机曾被 6 个图标挤成"文…"）并支持长按复制「文件名 + 路径 + 链接」。

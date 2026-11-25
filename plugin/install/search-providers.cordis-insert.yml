@@ -1,0 +1,38 @@
+# 搜索 provider 的 profile 级注册块（GeekPro `profiles/web/cordis.patch.yml` 在用的那份）。
+# 只包含 localxng / searxng 两行与选择默认引擎的 web 配置；**不含任何密钥**。
+#
+# 注意两台的差别：
+#   - GeekPro：靠这个 `- insert:` 块启用（profiles/web/package.json 的 bundles 里没有列它们），
+#     且 searxng 那行指向官方包 '@deepseek-ai/dsh-web-search-searxng'。
+#   - DGX：靠 profiles/web/package.json 的 `dsh.profile.bundles` 列名启用，
+#     插件自带的 cordis.patch.yml 会把行插进树；这里的 config 只在需要覆盖预算时再追加。
+#
+# ⚠️ 别把主机上整份 cordis.patch.yml 拷进仓库：里面 `- id: web-search-deepseek`
+#    那行带着明文 DEEPSEEK_API_KEY。要保存配置就只摘需要的块，密钥走凭证库。
+- insert:
+    # localxng: 直连中文引擎（bing_cn/baidu/sogou/so360/quark/chinaso）的多引擎
+    # 聚合 provider —— 不依赖 API key，也不需要 SearXNG 实例。
+    # 包放在 ~/.dsh/profiles/node_modules/web-search-localxng（实体目录，非软链）。
+    # 预算语义：lowRisk（bing_cn/so360/chinaso）默认 6 次/窗口；highRisk
+    # （sogou/baidu/quark，快速请求 4-9 次即触发验证码）默认 2 次/窗口；
+    # 窗口默认 10 分钟，用光即本轮跳过（budget），不报错。超限即熔断退避。
+    - id: web-search-localxng
+      name: web-search-localxng
+      config:
+        lowRiskPerWindow: 6
+        highRiskPerWindow: 2
+        maxResults: 8
+        resolveLinks: true
+    - id: web-search-searxng
+      name: '@deepseek-ai/dsh-web-search-searxng'
+      config:
+        baseURL: http://100.81.83.59:8080
+        timeoutMs: 15000
+        probeIntervalMs: 300000
+- id: web
+  config:
+    # localxng 为默认；它抛错（全引擎失败）时由 deepseek-official 兜底。
+    # 想换回 SearXNG：把下面改成 searchProvider: searxng 再重启 dsh。
+    searchProvider: localxng
+    searchFallbackProvider: deepseek-official
+    fetchProvider: http

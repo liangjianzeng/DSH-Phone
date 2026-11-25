@@ -1,0 +1,4 @@
+# web-search-searxng bundle patch: insert the SearXNG-backed search provider row.
+- insert:
+    - id: web-search-searxng
+      name: web-search-searxng
