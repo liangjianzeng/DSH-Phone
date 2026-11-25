@@ -1,0 +1,7 @@
+tailscale.exe : failed to connect to local tailscaled (no tailscaled process found): Get "http://local-tailscaled.sock/
+localapi/v0/status": open \\.\pipe\ProtectedPrefix\Administrators\Tailscale\tailscaled: Access is denied.
+At line:9 char:39
++ function Cap($name,$exe,$args2){ $o = & $exe @args2 2>&1 | Out-String ...
++                                       ~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (failed to conne...cess is denied.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError

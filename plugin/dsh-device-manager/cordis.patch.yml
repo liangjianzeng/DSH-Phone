@@ -1,0 +1,44 @@
+- insert:
+    - id: device-manager
+      name: '@local/dsh-device-manager'
+      config:
+        # adb 可执行文件：auto = PATH → ANDROID_HOME → %LOCALAPPDATA%\Android\Sdk\platform-tools
+        adbPath: auto
+        # 把"当前有哪些测试机、什么状态"写进系统提示词，让模型自己知道该去哪台机器验证
+        exposeToModel: true
+        sources:
+          usb:
+            enabled: true
+          # 局域网扫段默认关闭：必须显式写 CIDR 才扫（安全默认）
+          lan:
+            enabled: false
+            cidrs: []
+            ports: [5555]
+            useMdnsFirst: true
+            ratePerSec: 200
+            connectTimeoutMs: 250
+            maxConcurrency: 32
+            maxIps: 512
+          tailscale:
+            enabled: true
+            ports: [5555]
+          emulator:
+            enabled: true
+          # 其它机器上挂的设备：adb -a -P 5037 fork-server server 后填 "host:5037"
+          remoteAdbServers: []
+        poll:
+          enabled: true
+          panelMs: 3000
+          backgroundMs: 30000
+          staleAfterMs: 120000
+          pruneAfter: 3
+        collect:
+          concurrency: 4
+          perCommandTimeoutMs: 3000
+          factTimeoutMs: 5000
+          roundBudgetMs: 20000
+        inject:
+          # queue = 排队不打断当前回合；steer = 中途纠偏
+          mode: queue
+          template: default
+          allowSteer: true

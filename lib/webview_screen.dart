@@ -15,6 +15,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'artifact_recognizer.dart';
 import 'artifact_viewer_screen.dart';
 import 'config.dart';
+import 'device_panel.dart';
 import 'download_manager.dart';
 import 'download_screen.dart';
 import 'github_screen.dart';
@@ -1481,8 +1482,28 @@ class _WebViewScreenState extends State<WebViewScreen>
   }
 
   /// 消息输入框文本注入桥：注入桥脚本（页面导航 DOM 重建后需重新注入）。
+  ///
+  /// adb 设备面板的数据桥也在这里挂：handler 随 controller 常驻（与任务状态桥同
+  /// 一约定），脚本随控制器建立注入一次，导航后再注入一次。
   void _setupComposerBridge(InAppWebViewController controller) {
     controller.evaluateJavascript(source: composerBridgeJs);
+    controller.addJavaScriptHandler(
+      handlerName: 'onAdbResult',
+      callback: (List<Object?> args) async {
+        if (args.isEmpty) return null;
+        // origin 校验：面板内容会被用户当作事实勾选、再一键注入 DSH 输入框。
+        // 第三方页面（WebView 里打开的外链）同样能 callHandler('onAdbResult', …)，
+        // 不校验就等于让它伪造设备清单、借用户的手把文本喂进 DSH（提示注入）。
+        if (!await _bridgeOriginOk(controller)) return null;
+        final raw = args.first;
+        if (raw is! Map) return null;
+        final id = raw['id']?.toString();
+        if (id == null) return null;
+        _adbPending.remove(id)?.complete(Map<String, dynamic>.from(raw));
+        return null;
+      },
+    );
+    controller.evaluateJavascript(source: adbBridgeJs);
   }
 
   /// 页面导航后重新注入文本注入桥（每次导航 DOM 重建）。
@@ -1490,6 +1511,74 @@ class _WebViewScreenState extends State<WebViewScreen>
     final c = _controller;
     if (c == null) return;
     c.evaluateJavascript(source: composerBridgeJs);
+    c.evaluateJavascript(source: adbBridgeJs);
+  }
+
+  // ================= 测试机设备面板（原生顶栏入口）=================
+
+  /// 等待页面回传的 adb 请求，按 id 配对（页面侧 45s 超时兜底，这里再兜 60s，
+  /// 免得 WebView 被销毁后 Future 永远挂着）。
+  final Map<String, Completer<Map<String, dynamic>>> _adbPending =
+      <String, Completer<Map<String, dynamic>>>{};
+  int _adbSeq = 0;
+
+  /// 在页面上下文里请求 DSH 侧 `/adb-devices/*`（同源、同 cookie、同隧道）。
+  Future<Map<String, dynamic>> _adbRequest(
+      String method, String path, [Map<String, dynamic>? body]) async {
+    final c = _controller;
+    if (c == null) {
+      return <String, dynamic>{'ok': false, 'status': 0, 'error': '页面还没就绪（WebView 未创建）'};
+    }
+    final id = 'adb-${DateTime.now().millisecondsSinceEpoch}-${_adbSeq++}';
+    final completer = Completer<Map<String, dynamic>>();
+    _adbPending[id] = completer;
+    final encodedBody = body == null ? null : jsonEncode(body);
+    try {
+      await c.evaluateJavascript(
+          source: "window.__dshAdbBridge.request("
+              "${jsonEncode(method)}, ${jsonEncode(path)}, "
+              "${jsonEncode(encodedBody ?? '')}, ${jsonEncode(id)})");
+      return await completer.future.timeout(
+        const Duration(seconds: 60),
+        onTimeout: () => <String, dynamic>{
+          'ok': false,
+          'status': 0,
+          'error': '页面 60 秒没回传结果（页面可能被销毁或脚本被页面拦截）'
+        },
+      );
+    } catch (e) {
+      return <String, dynamic>{'ok': false, 'status': 0, 'error': '请求发不出去：$e'};
+    } finally {
+      _adbPending.remove(id);
+    }
+  }
+
+  /// 经页面自带的 composer 桥把文本塞进 DSH 输入框。成功返回 null。
+  ///
+  /// 只注入不发送：调试消息落进输入框后由用户看过再按发送，避免误触发模型回合
+  /// （语音场景才自动发送，见 _injectComposerTextAndSend）。
+  Future<String?> _adbInjectText(String text) async {
+    final c = _controller;
+    if (c == null) return '页面还没就绪，无法注入';
+    final result = await c.evaluateJavascript(
+        source: "window.__dshComposerBridge.insertText(${jsonEncode(text)})");
+    if (result is Map && result['ok'] == false) {
+      return '注入失败：${result['error'] ?? '未知错误'}';
+    }
+    return null;
+  }
+
+  /// 顶栏「测试机」入口：底部弹出设备面板。
+  Future<void> _openDevicePanel() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (BuildContext sheetContext) => DevicePanelPage(
+        request: _adbRequest,
+        inject: _adbInjectText,
+      ),
+    );
   }
 
   // ================= 任务状态桥（熄屏通知）=================
@@ -2371,6 +2460,14 @@ class _WebViewScreenState extends State<WebViewScreen>
                         // _buildTunnelBanner 上另有「立即重试」走同一条 _refreshConnection。
                         if (_topbarRefreshEnabled) _buildConnectionButton(context),
                         _buildInstanceSwitcher(context),
+                        // 测试机设备面板：只有 DSH 模式有意义（Zcode 模式页面不是 DSH，
+                        // 没有 /adb-devices 这条路由，点了只会报错）。
+                        if (!_config.isZcodeMode)
+                          IconButton(
+                            tooltip: '测试机设备',
+                            icon: const Icon(Icons.devices_other_outlined),
+                            onPressed: _openDevicePanel,
+                          ),
                         // Unsloth 入口：全部实例未启用时隐藏（首页无意义）
                         if (_unslothAvailable)
                           IconButton(

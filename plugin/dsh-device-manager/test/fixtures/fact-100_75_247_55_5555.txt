@@ -1,0 +1,8 @@
+﻿adb.exe : adb.exe: device '100.75.247.55:5555' not found
+At line:15 char:28
++   Save "fact-$safe.txt" (((& $adb -s $t shell $script 2>&1 | Out-Stri ...
++                            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (adb.exe: device...5555' not found:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+

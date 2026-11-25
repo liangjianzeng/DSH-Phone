@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Android device manager",
+    "description": "Adds a phone icon to the session header that opens a dropdown of Android test devices reachable from this host. The host scans its own USB, configured LAN CIDRs, Tailscale peers and remote adb servers; several adb transports of one phone are merged into a single device by ro.serialno. Each row shows the connection channel, screen on/off, lock state, stay-awake, battery and foreground app. Select one or all devices and inject a “debug on this device, its state, how to connect” message into the composer, or queue it into the session. The agent also gets the same view through the adb_devices tool and a system-prompt section. LAN scanning stays off until you list CIDRs in the plugin config; every scan runs on the host process, never in the agent sandbox."
+  }
+}

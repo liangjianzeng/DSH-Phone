@@ -567,6 +567,63 @@ const String photoBridgeJs = r'''
 ///    结构与 undo 栈，框架监听 input 事件同步模型）；
 /// 3. 兜底：直接追加 textContent + 派发 input。
 /// 返回 `{ok, error}` 供 Flutter 侧提示。
+/// adb 测试机桥：原生顶栏「设备面板」的数据通道。
+///
+/// 为什么必须在页面里 fetch，而不是 Flutter 侧发 HTTP：SSH 隧道映射的是
+/// **WebView 的 loopback 端口**，DSH 的会话 cookie / token 也只存在于 WebView 的
+/// cookie jar。Flutter 自己发请求就得复制端口与鉴权配置，实例一切换（3080/8787/
+/// 8790、多实例、随机借用端口）就全对不上；在页面上下文里 fetch 则天然同源、同
+/// cookie、同隧道，切到哪一路实例都跟着走。
+///
+/// 结果经 `callHandler('onAdbResult', {id, ok, status, body, error})` 回传 Flutter
+/// ——`evaluateJavascript` 不等 Promise，所以走项目既有的 JS→Dart 回调通道，
+/// 与成果桥同一个套路。
+const String adbBridgeJs = r'''
+(function() {
+  window.__dshAdbBridge = {
+    request: function(method, path, bodyJson, id) {
+      var settled = false;
+      var timer = setTimeout(function() {
+        if (settled) return;
+        settled = true;
+        try { window.flutter_inappwebview.callHandler('onAdbResult',
+            { id: id, ok: false, status: 0, body: '', error: '请求超时（45 秒未响应）' }); } catch (e) {}
+      }, 45000);
+      function done(payload) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        payload.id = id;
+        try { window.flutter_inappwebview.callHandler('onAdbResult', payload); } catch (e) {}
+      }
+      var opts = { method: method, credentials: 'same-origin', cache: 'no-store' };
+      if (String(method).toUpperCase() === 'POST') {
+        opts.headers = { 'content-type': 'application/json' };
+        opts.body = bodyJson || '{}';
+      }
+      try {
+        fetch(path, opts).then(function(r) {
+          return r.text().then(function(text) {
+            var why = '';
+            if (!r.ok) {
+              why = 'HTTP ' + r.status + ((r.status === 401 || r.status === 403)
+                ? '（登录态失效，需在设置里重填 DSH 访问 Token）'
+                : (r.status === 404 ? '（这台 DSH 没装设备管理插件，或插件未启用）' : ''));
+            }
+            done({ ok: r.ok, status: r.status, body: text, error: why });
+          });
+        }).catch(function(err) {
+          done({ ok: false, status: 0, body: '', error: (err && err.message) ? err.message : String(err) });
+        });
+      } catch (e) {
+        done({ ok: false, status: 0, body: '', error: String(e) });
+      }
+      return { started: true };
+    }
+  };
+})();
+''';
+
 const String composerBridgeJs = r'''
 (function() {
   function findComposer() {

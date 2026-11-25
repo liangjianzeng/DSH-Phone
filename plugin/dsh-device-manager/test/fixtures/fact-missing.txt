@@ -1,0 +1,6 @@
+adb.exe : adb.exe: device 'no-such-device:5555' not found
+At line:9 char:39
++ function Cap($name,$exe,$args2){ $o = & $exe @args2 2>&1 | Out-String ...
++                                       ~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (adb.exe: device...5555' not found:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError

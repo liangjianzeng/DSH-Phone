@@ -1,0 +1,3 @@
+List of devices attached
+8b1e8747               device product:alioth model:M2012K11AC device:alioth transport_id:5
+192.168.1.151:5555     device product:alioth model:M2012K11AC device:alioth transport_id:6
