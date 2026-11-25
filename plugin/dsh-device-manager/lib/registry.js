@@ -36,6 +36,24 @@ function transportKey(kind, endpoint, server) {
 }
 
 /**
+ * 找出已经把该端点登记为自己通道的真实设备（非 tmp:）。
+ * 一轮探测拿不到 ro.serialno 时（离线/unauthorized），观测只能落到 tmp:端点 身份；
+ * 而同一 host:port 很可能在上一轮已经挂在真实设备下了——不并回去，面板就会
+ * 同时列出"真身"和"tmp:端点"两行重复设备。
+ */
+function ownerOfEndpoint(registry, endpoint) {
+  const host = String(endpoint).split(':')[0];
+  for (const [identity, device] of Object.entries(registry.devices ?? {})) {
+    if (identity.startsWith('tmp:')) continue;
+    for (const transport of Object.values(device.transports ?? {})) {
+      const ep = String(transport.endpoint ?? '');
+      if (ep === String(endpoint) || (host && ep.split(':')[0] === host)) return identity;
+    }
+  }
+  return null;
+}
+
+/**
  * 建立/复位一个注册表。
  * @param {{devices?: Record<string, object>}} initial
  */
@@ -70,6 +88,10 @@ export function observe(registry, observed, options = {}) {
     const endpointIdentity = `tmp:${endpoint}`;
     const plainSerial = !/^\d+(\.\d+){3}:\d+$/.test(String(item.serial ?? '')) ? item.serial : null;
     let identity = shellSerial || (kind === 'emulator' ? item.serial : null) || plainSerial || endpointIdentity;
+    if (identity === endpointIdentity) {
+      const owner = ownerOfEndpoint(registry, endpoint);
+      if (owner) identity = owner;
+    }
     let device = registry.devices[identity];
     const orphan = identity !== endpointIdentity ? registry.devices[endpointIdentity] : undefined;
 

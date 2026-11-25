@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-device-manager",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "description": "Android 测试机（adb）管理：主机扫描 USB / 局域网 / Tailscale 上可连设备，顶栏面板看状态并把调试消息注入会话。",

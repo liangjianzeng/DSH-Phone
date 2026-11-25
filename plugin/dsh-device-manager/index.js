@@ -218,6 +218,7 @@ export function apply(ctx, rawConfig) {
   });
 
   const state = { registry: loadedRegistry, scanning: null, lastScanAt: 0, lastScan: null, adbSource: adb.source, adbVersion: null };
+  const registration = { route: 'pending', tool: 'pending', prompt: 'skipped', errors: [] };
   const sessions = new Map(); // sessionId → { selected: [], injectedAt, lastSummary }
 
   const sessionOf = (sessionId) => {
@@ -338,7 +339,7 @@ export function apply(ctx, rawConfig) {
             `来源：${sources}`,
             result.ok ? '' : `错误：${(result.run.errors ?? []).map((e) => `${e.source ?? e.stage ?? ''} ${e.message}`).join('；')}`,
           ].filter(Boolean).join('\n'),
-          data: { snapshot: snap, run: result.run, firstTime, hostName, adbPath: adb.path, adbVersion: state.adbVersion ?? null },
+          data: { snapshot: snap, run: result.run, firstTime, hostName, adbPath: adb.path, adbVersion: state.adbVersion ?? null, lastScanAt: state.lastScanAt },
         };
       }
       case 'status': {
@@ -637,6 +638,7 @@ export function apply(ctx, rawConfig) {
         isConcurrencySafe: (args) => args?.action === 'list' || args?.action === 'history',
       });
       ctx.effect?.(() => dispose);
+      registration.tool = 'ok';
     } catch (error) {
       log('注册工具失败', String(error?.message ?? error));
     }
@@ -757,17 +759,13 @@ export function apply(ctx, rawConfig) {
   const actionOfRequest = (request) => resolveAction(toUrl(request?.url));
 
   /**
-   * 服务就绪状态。冷启动时宿主各服务不保证同批可用（webServer 常常比插件激活晚到），
+   * 冷启动时宿主各服务不保证同批可用（webServer 常常比插件激活晚到），
    * 只 ctx.get 一次会**静默**丢掉路由注册：表现为 /adb-devices/* 全线 404，而插件条目
    * 显示 active、工具也在、面板图标也在——排查者完全看不到原因（2026-11-25 08:43 冷启动
    * 复现，App 侧「扫描总是 404」就是这个）。所以：等它，且把结果记进 registration，
    * 让 doctor 和面板能如实说"路由没注册上"。
-   */
-  const registration = { route: 'pending', tool: 'pending', prompt: 'skipped', errors: [] };
-
-  /**
-   * 轮询等待宿主服务出现；超时返回 undefined，调用方自己记账。
    *
+   * 轮询等待宿主服务出现；超时返回 undefined，调用方自己记账。
    * 必须是**函数声明**而不是 const 箭头：工具注册段在文件更靠前的位置就要用它，
    * const 会撞 TDZ（ReferenceError: Cannot access 'waitForService' before
    * initialization），而那是运行时错误，`node --check` 查不出来——冷启动实测抓到过。
@@ -792,6 +790,42 @@ export function apply(ctx, rawConfig) {
     registration.errors.push(`${reason}（/adb-devices/* 未注册，App 面板会 404）`);
     log('HTTP 路由未注册', reason);
   }
+  /**
+   * HTTP 入口本体。宿主 webServer 的 `resource` 路由按设计只应答 GET/HEAD，
+   * 其它方法在匹配之前就回 405（Allow: GET, HEAD），POST /adb-devices/scan 因此全废
+   * （2026-11-25 实测：面板点扫描 → HTTP 405）。要收 POST 只能注册 `handler`，
+   * 自己把 node 的 req/res 适配成 Fetch 的 Request/Response，业务逻辑仍留在 routeResource。
+   */
+  const routeHandler = async (req, res) => {
+    const method = String(req?.method ?? 'GET').toUpperCase();
+    let body;
+    if (method !== 'GET' && method !== 'HEAD') {
+      const chunks = [];
+      for await (const part of req) chunks.push(part);
+      body = Buffer.concat(chunks);
+    }
+    const headers = new Headers();
+    for (const [key, value] of Object.entries(req?.headers ?? {})) {
+      if (value === undefined) continue;
+      for (const one of Array.isArray(value) ? value : [value]) headers.append(key, one);
+    }
+    const request = new Request(new URL(String(req?.url ?? '/'), 'http://localhost'), {
+      method,
+      headers,
+      body: body === undefined ? undefined : body,
+    });
+    const response = await routeResource(request);
+    // arrayBuffer() 是 ArrayBuffer，node 的 res.end 只吃 Buffer/Uint8Array，
+    // 直接传会 ERR_INVALID_ARG_TYPE 并把连接打断（表现为 GET 也拿不到响应）。
+    const payload = method === 'HEAD' ? null : Buffer.from(await response.arrayBuffer());
+    const flat = {};
+    response.headers.forEach((value, key) => {
+      flat[key] = value;
+    });
+    res.writeHead(response.status, flat);
+    res.end(payload);
+  };
+
   const registerHttpRoute = (from = ctx) => {
     if (routeRegistered) return true;
     const webServer = service(from, 'webServer');
@@ -809,7 +843,7 @@ export function apply(ctx, rawConfig) {
           const action = actionOfRequest(request);
           return method === 'GET' && READ_ONLY.has(action) ? 'anonymous' : 'required';
         },
-        resource: routeResource,
+        handler: routeHandler,
       });
       ctx.effect?.(() => dispose);
       routeRegistered = true;
@@ -901,9 +935,9 @@ export function apply(ctx, rawConfig) {
     ctx.effect?.(() => () => clearInterval(timer));
   }
 
-  // 启动即做一次轻量刷新（不扫网段），让面板首屏就有东西。
+  // 启动即做一次轻量刷新（不扫网段），让面板首屏就有东西；它不等于全量扫描，
+  // 因此不能改写 lastScanAt，否则原生面板会误以为已经扫过并隐藏扫描入口。
   scanner.refreshStatus(state, {}).then((result) => {
-    state.lastScanAt = Date.now();
     log('首屏状态刷新完成', `${result.probed} 条通道 / ${result.durationMs}ms`);
     store.state = state.registry;
     store.touch();

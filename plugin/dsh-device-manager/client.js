@@ -173,6 +173,11 @@ window.__ModuleLoader__.load({
 
     // 只用宿主已声明的主题令牌（--dsw-alias-* / --dsw-specific-* / --dsw-elevation-*），
     // 每个可能缺失的令牌都带兜底值，保证亮/暗两套主题都可读。
+    //
+    // 面板底色不能直接用 --dsw-specific-menu：那是带 alpha 的菜单色，宿主自己配
+    // backdrop-filter 才敢浮在正文上。插件面板没有底衬，直接吃这个色会把聊天正文
+    // 透出来压花 adb 列表（2026-11-25 真机）。做法是先用不透明的主题底色铺实底，
+    // 再把菜单色作为渐变叠在上层——观感跟宿主菜单一致，但保证不透。
     const STYLE = `
 .dm-root{position:relative;display:inline-flex}
 .dm-trigger{position:relative;width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;
@@ -184,8 +189,10 @@ window.__ModuleLoader__.load({
   font-size:9px;line-height:13px;text-align:center;background:var(--dsw-alias-state-success-primary);color:var(--dsw-alias-bg-base)}
 .dm-badge[data-tone="warn"]{background:var(--dsw-alias-state-warn-primary)}
 .dm-badge[data-tone="error"]{background:var(--dsw-alias-state-error-primary)}
-.dm-panel{position:fixed;inset:auto;top:52px;right:16px;width:378px;max-height:min(560px,72vh);display:flex;flex-direction:column;
-  background:var(--dsw-specific-menu,var(--dsw-alias-bg-overlay));border:1px solid var(--dsw-alias-border-l1);border-radius:16px;
+.dm-panel{position:fixed;inset:auto;top:52px;right:16px;width:min(378px,calc(100vw - 24px));max-height:min(560px,72vh);display:flex;flex-direction:column;
+  background-color:var(--dsw-alias-bg-base,#fff);
+  background-image:linear-gradient(var(--dsw-specific-menu,var(--dsw-alias-bg-overlay)),var(--dsw-specific-menu,var(--dsw-alias-bg-overlay)));
+  border:1px solid var(--dsw-alias-border-l1);border-radius:16px;
   box-shadow:var(--dsw-elevation-prominent,0 12px 32px rgba(0,0,0,.24));color:var(--dsw-alias-label-primary);font-size:13px;overflow:hidden;z-index:1000}
 .dm-head{display:flex;flex-direction:column;gap:6px;padding:10px 12px 8px;border-bottom:1px solid var(--dsw-alias-border-l1)}
 .dm-title{display:flex;align-items:center;justify-content:space-between;gap:8px;font-weight:600}
@@ -193,13 +200,13 @@ window.__ModuleLoader__.load({
 .dm-chip{padding:1px 6px;border-radius:7px;background:var(--dsw-alias-bg-layer-2)}
 .dm-actions{display:flex;gap:6px}
 .dm-btn{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);
-  border-radius:8px;padding:3px 9px;font-size:12px;cursor:pointer}
+  border-radius:8px;padding:3px 9px;font-size:12px;cursor:pointer;white-space:nowrap;flex:none}
 .dm-btn:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
 .dm-btn:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary))}
 .dm-btn:disabled{opacity:.5;cursor:default}
 .dm-btn[data-primary="true"]{background:var(--dsw-alias-brand-primary);border-color:transparent;color:var(--dsw-alias-bg-base)}
 .dm-filters{display:flex;gap:4px;padding:6px 12px;border-bottom:1px solid var(--dsw-alias-border-l1)}
-.dm-filter{border:none;background:transparent;color:var(--dsw-alias-label-secondary);border-radius:7px;padding:3px 8px;font-size:12px;cursor:pointer}
+.dm-filter{border:none;background:transparent;color:var(--dsw-alias-label-secondary);border-radius:7px;padding:3px 8px;font-size:12px;cursor:pointer;white-space:nowrap}
 .dm-filter[data-active="true"]{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
 .dm-list{flex:1;overflow:auto;padding:4px 6px}
 .dm-device{display:flex;gap:8px;padding:8px;border-radius:10px}
@@ -221,15 +228,18 @@ window.__ModuleLoader__.load({
 .dm-empty{padding:22px 16px;display:flex;flex-direction:column;align-items:center;gap:10px;text-align:center;color:var(--dsw-alias-label-secondary)}
 .dm-foot{display:flex;flex-direction:column;gap:8px;padding:8px 12px 10px;border-top:1px solid var(--dsw-alias-border-l1)}
 .dm-line{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.dm-input{flex:1;min-width:110px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);
-  color:var(--dsw-alias-label-primary);border-radius:8px;padding:3px 8px;font-size:12px}
+.dm-line[data-right="true"]{justify-content:flex-end}
+/* 输入框独占一行：378px 的面板里塞下输入框 + 三个按钮必然错位换行（2026-11-25 真机
+   「复制文本」被单独挤到第三行）。basis 100% 让它自己一行，按钮组整体换到下一行。 */
+.dm-input{flex:1 1 100%;min-width:0;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);
+  color:var(--dsw-alias-label-primary);border-radius:8px;padding:4px 8px;font-size:12px}
 .dm-input:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary))}
 .dm-select{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);
-  border-radius:8px;padding:3px 6px;font-size:12px}
+  border-radius:8px;padding:3px 6px;font-size:12px;white-space:nowrap;flex:none;max-width:100%}
 .dm-hint{font-size:11px;color:var(--dsw-alias-label-secondary);min-height:14px;white-space:pre-wrap}
 .dm-hint[data-tone="error"]{color:var(--dsw-alias-state-error-primary)}
 .dm-hint[data-tone="ok"]{color:var(--dsw-alias-state-success-primary)}
-.dm-count{font-size:11px;color:var(--dsw-alias-label-secondary);margin-left:auto}
+.dm-count{font-size:11px;color:var(--dsw-alias-label-secondary);margin-left:auto;flex:none}
 `;
 
     function Icon() {
@@ -639,7 +649,8 @@ window.__ModuleLoader__.load({
               value: target,
               onChange: (event) => setTarget(event.target.value),
               onKeyDown: (event) => { if (event.key === 'Enter' && !busy) { event.preventDefault(); send(); } },
-            }),
+            })),
+          h('div', { className: 'dm-line', 'data-right': 'true' },
             h('button', {
               className: 'dm-btn', type: 'button', 'data-primary': 'true', disabled: busyAny, onClick: fill,
             }, tr('footer.fill')),
