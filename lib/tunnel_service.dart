@@ -1024,6 +1024,119 @@ class TunnelService {
   /// 最近一次"端口彻底起不来"的结论，界面上据此决定要不要把「重启应用」提为主按钮。
   TunnelLocalPortOccupiedException? _lastPortFailure;
 
+  // ---- 黏性本地端口（端口稳定 = DSH 登录 cookie 不白丢）----
+  //
+  // DSH Web 的登录 cookie 名字是 `dsh-auth-<sha256("127.0.0.1:<本地端口>")>`，而浏览器
+  // 发 cookie **不看端口**（同主机所有端口共享 cookie jar）。于是隧道每换一次本地端口，
+  // 远端按新端口算出的 cookie 名字就查不到那颗 30 天的 cookie，只能退回 URL 上的 token
+  // 重新签发——而 token 是 DSH **进程启动时**随机生成的（`PROCESS_LAUNCH_TOKENS`），
+  // 服务器只要重启过一次，App 里存的那份就永久对不上。两个条件一凑齐就是主文档 401
+  // 「dsh web authentication required; reopen the URL printed by dsh web.」，App 拿同一
+  // 个废 token 重试一万次也不会变好——只有杀进程把配置端口腾回来，cookie 才重新管用。
+  // 这正是用户报的"从后台回前台经常报鉴权未通过，只有杀掉进程重启才行"：回前台 → 探活
+  // 失败 → 重建 → 旧版每次都从随机保留池借端口 → cookie 跟着一起作废。
+  //
+  // 对策：**记住并复用上次实际生效的端口**。绑定阶梯因此变成
+  // 配置端口 → 上次实际生效端口 → 随机保留池，端口不再来回漂，cookie 一直对得上。
+
+  /// 每个实例上次**实际生效**的本地端口（落盘，跨 isolate 存活——回前台换 isolate 时
+  /// 正是最需要它的时刻）。键 = 实例下标（无实例时为 -1）。
+  final Map<int, int> _stickyPorts = {};
+  bool _stickyPortsLoaded = false;
+
+  static String _stickyPortKey(int? profileIndex) =>
+      'tunnel.stickyLocalPort.${profileIndex ?? -1}';
+
+  /// 取该实例上次实际生效的本地端口（首次调用时从 prefs 整表读一次）。
+  Future<int?> _loadStickyPort(int? profileIndex) async {
+    if (!_stickyPortsLoaded) {
+      _stickyPortsLoaded = true;
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        for (var i = -1; i < SSHConfig.maxProfiles; i++) {
+          final v = prefs.getInt(_stickyPortKey(i));
+          if (v != null && v > 0 && v <= 65535) _stickyPorts[i] = v;
+        }
+      } catch (e) {
+        debugPrint('[DSH] sticky port load failed: $e');
+      }
+    }
+    return _stickyPorts[profileIndex ?? -1];
+  }
+
+  /// 记下本次实际生效的端口；绑回配置端口即撤销黏性（配置端口永远优先）。
+  void _rememberStickyPort(int? profileIndex, int port, int configPort) {
+    final key = profileIndex ?? -1;
+    final backToConfig = port == configPort;
+    if (backToConfig) {
+      if (_stickyPorts.remove(key) == null) return;
+    } else {
+      if (_stickyPorts[key] == port) return;
+      _stickyPorts[key] = port;
+    }
+    unawaited(SharedPreferences.getInstance()
+        .then((p) => backToConfig
+            ? p.remove(_stickyPortKey(profileIndex))
+            : p.setInt(_stickyPortKey(profileIndex), port))
+        .catchError((Object _) => false));
+  }
+
+  /// 把正在监听的本地入口**原地搬到** [port]（SSH 会话与转发目标都不动）。
+  ///
+  /// 这是 401 的自愈路径：DSH 的登录 cookie 按端口签发，隧道重建时端口漂了，WebView 里
+  /// 那颗 cookie 就认不出来；若 App 里存的 token 又已随服务端重启失效，页面必然卡在
+  /// 「dsh web authentication required」，用户唯一出路是杀进程（把原端口腾回来）。把入口
+  /// 搬回**上次成功鉴权**的那个端口，cookie 立刻重新管用——既不用重填 Token，也不用杀进程。
+  ///
+  /// 搬不动返回 false：端口被别的程序、或被上一世代 isolate 的僵尸监听占着（后者只有进程
+  /// 重开才收得回来，界面应据此给出「重启应用」）。
+  Future<bool> rebindLocalPort(int port, {required String reason}) async {
+    if (_client == null || _inflight != null || _rebuilding) return false;
+    if (port <= 0 || port > 65535) return false;
+    if (activeLocalPort == port) return true;
+    final client = _client;
+    final configPort = _activeConfig?.localPort ?? port;
+    final profileIndex = _activeProfileIndex;
+    try {
+      // 先清自家残骸：最常见占着那个端口的，就是上一轮没关干净的监听。
+      if (await _releaseOurStaleListenersOn(port)) {
+        _log('bind', '迁回 :$port 之前回收了自家残留监听（$reason）');
+      }
+      final server = await ServerSocket.bind(
+          InternetAddress.loopbackIPv4, port)
+          .timeout(const Duration(seconds: 3));
+      // 上面两个 await 都会让出事件循环：期间可能已断开 / 正在重建 / 换了会话。
+      // 那时把监听挂到一条没人要的隧道上，就是本文件反复钉过的那类鬼故事
+      // （"已断开的隧道又被在途尝试连回来"），当场收掉。
+      if (!identical(_client, client) || _inflight != null || _rebuilding) {
+        await _closeListener(server);
+        _log('bind', '迁回 :$port 时隧道已易主/在重建，放弃（$reason）');
+        return false;
+      }
+      _trackListener(server);
+      final old = _server;
+      _server = server;
+      _localPortFallback = port == configPort ? null : port;
+      server.listen(_handleLocalConnection);
+      // 旧入口上的连接必须全拆：WebView 的 HTTP keep-alive 按端口复用，留着它就会把
+      // 后续请求继续打到旧入口（模式切换同款坑，见 _forwardConns 注释）。
+      _destroyForwardConns(reason: '本地入口迁回 :$port');
+      if (old != null) await _closeListener(old);
+      _rememberStickyPort(profileIndex, port, configPort);
+      _log('bind',
+          '本地入口已迁回 :$port（$reason）：DSH 的登录 cookie 按端口签发，端口对上'
+          '就不必重填 Token',
+          level: TunnelEventLevel.warn);
+      return true;
+    } catch (e) {
+      _log('bind',
+          '本地入口迁回 :$port 失败（$reason）：$e —— 该端口被别的程序、或上一世代 isolate '
+          '的僵尸监听占着',
+          level: TunnelEventLevel.warn);
+      return false;
+    }
+  }
+
   /// 端口占用是否疑似"自家上一世代 isolate 的僵尸监听"（只有杀进程能解）。
   bool get localPortSelfZombieSuspected =>
       _lastPortFailure?.selfZombieSuspected ?? false;
@@ -1045,6 +1158,9 @@ class TunnelService {
       _lastPortFailure = null;
       _rememberBoundPorts(
           configPort, server.port == configPort ? null : server.port);
+      // 记住实际生效端口：下次重建优先搬回这里，而不是再随机借一个——端口一漂，
+      // DSH 按端口签发的登录 cookie 就作废（见"黏性本地端口"一节）。
+      _rememberStickyPort(_desiredProfileIndex, server.port, configPort);
     },
     sweepOrphans: _sweepOrphanListeners,
     releaseOwnedOn: _releaseOurStaleListenersOn,
@@ -1056,14 +1172,16 @@ class TunnelService {
 
   /// 绑定本地监听端口：先归位自己人，再让路给现实。
   ///
-  /// 阶梯（全量清扫自家残骸 → 绑配置端口 → 定向回收后重试 → 扫遍保留池
-  /// 3090-3149、每个候选先回收再绑 → 抛带结论的异常）在
+  /// 阶梯（全量清扫自家残骸 → 绑配置端口 → 定向回收后重试 → **沿用上次的实际端口** →
+  /// 扫遍保留池 3090-3149、每个候选先回收再绑 → 抛带结论的异常）在
   /// [LocalPortBinder.bindListener]；每一步对应的真实翻车现场与"为什么顺序不能换"
   /// 注释在那里，并由 test/local_port_binder_test.dart 用真 socket 钉死。
-  /// 这里只保留监督器独占的两件事：
+  /// 这里只保留监督器独占的三件事：
   ///  1. 上一轮 teardown 没走完 / 并发 connect 时 `_server` 可能还占着同一个端口，
   ///     必须先 close——它是"活动监听"，不在残骸之列，清扫不会碰它；
-  ///  2. 最终结论记进 [_lastPortFailure]，界面据此决定「重启应用」是不是主按钮。
+  ///  2. 把该实例**上次实际生效**的端口作为黏性首选交下去（DSH 的登录 cookie 按端口
+  ///     签发，随机漂端口等于每重建一次就把用户登出一次）；
+  ///  3. 最终结论记进 [_lastPortFailure]，界面据此决定「重启应用」是不是主按钮。
   Future<ServerSocket> _bindLocalListener(SSHConfig config) async {
     final stale = _server;
     if (stale != null) {
@@ -1072,8 +1190,11 @@ class TunnelService {
       _log('bind', '释放本进程在用的本地监听 :${stale.port}',
           level: TunnelEventLevel.warn);
     }
+    final preferred =
+        await _loadStickyPort(_desiredProfileIndex ?? _activeProfileIndex);
     try {
-      return await _portBinder.bindListener(config.localPort);
+      return await _portBinder.bindListener(config.localPort,
+          preferredPort: preferred);
     } on TunnelLocalPortOccupiedException catch (e) {
       _lastPortFailure = e;
       rethrow;

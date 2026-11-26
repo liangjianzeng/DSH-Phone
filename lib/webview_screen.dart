@@ -92,6 +92,28 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 打扰——服务端刚重启、cookie 未续上都可能瞬时 401。
   int _authRetryCount = 0;
 
+  /// **上次成功加载主文档时实际生效的本地端口**（= 那枚 DSH 登录 cookie 有效的端口）。
+  ///
+  /// DSH Web 的鉴权 cookie 名字是 `dsh-auth-<sha256("127.0.0.1:<端口>")>`，而浏览器发
+  /// cookie 不看端口：隧道一换本地端口，远端按新端口算名字 → 查不到那颗 30 天 cookie →
+  /// 只能靠 URL 上的 token 重签；token 又是 DSH 进程启动时生成的，服务器重启过一次，
+  /// App 里存的就成了废 token，于是主文档 401、重试无解，只有杀进程把原端口腾回来才恢复。
+  /// 界面据此区分"端口漂了"与"Token 真失效"：前者先把本地入口搬回这个端口，cookie 立刻
+  /// 重新管用（见 [TunnelService.rebindLocalPort]），后者才要用户填 Token。
+  int? _lastAuthorizedPort;
+
+  /// 本次主文档加载是否收到过 HTTP 错误响应。`onLoadStop` 对 401 的鉴权失败页**同样会
+  /// 触发**（Chromium 把错误页当正常文档渲染），不能拿它当"鉴权成功"的证据。
+  bool _mainFrameHttpError = false;
+
+  /// 已为哪个端口漂移尝试过"搬回原端口"，避免在两个端口之间来回搬。
+  int? _portRestoreTriedFor;
+
+  /// 当前这张鉴权错误卡的原因是不是"端口漂移 + Cookie 随端口一起作废"。
+  /// 决定标题与要不要把「重启应用」摆成主行动——那种情况杀进程才是真解，
+  /// 让用户去改 Token 是把他骗上死路。
+  bool _authPortDrift = false;
+
   /// 本页面最近一次 `connect()` 的序号。dispose 时若序号已被别的页面推进，说明
   /// 隧道已归属新页面（路由替换场景），此时绝不能断开。
   int _myConnectSeq = 0;
@@ -1131,6 +1153,7 @@ class _WebViewScreenState extends State<WebViewScreen>
       // 现在 WebView 常驻了，这里要显式收掉，等隧道健康时再新建）。
       _webViewAlive = false;
     });
+    _resetAuthBookkeeping();
     _controller = null;
     await SSHConfig.setActiveIndex(index);
     await TunnelService.instance.disconnect();
@@ -1321,6 +1344,7 @@ class _WebViewScreenState extends State<WebViewScreen>
           _pageLoading = false;
           _authError = false;
         });
+        _resetAuthBookkeeping();
       }
       // 其它改动（token / 模式 / 端口）：新旧地址可能完全相同，也要强制重新加载
       // 一次，否则常驻的 WebView 会停在旧会话上。
@@ -2234,6 +2258,7 @@ class _WebViewScreenState extends State<WebViewScreen>
   void _onPageLoadStart() {
     _loadTimeoutTimer?.cancel();
     if (!mounted) return;
+    _mainFrameHttpError = false;
     setState(() {
       _pageLoading = true;
       _authError = false;
@@ -2262,11 +2287,27 @@ class _WebViewScreenState extends State<WebViewScreen>
     setState(() => _loadProgress = progress);
   }
 
-  void _onPageLoadStop() {
+  void _onPageLoadStop({String? url}) {
     _loadTimeoutTimer?.cancel();
     _pageRetryCount = 0;
     _pageNeedsReload = false;
-    _authRetryCount = 0; // 成功加载 = 鉴权链走通，下次 401 重新给一次自动重试机会
+    // **只有主文档干净落地才算鉴权链走通**：401 的鉴权失败页同样会触发 onLoadStop
+    // （Chromium 把它当普通文档渲染），照单全收会把"漂过去的端口"记成成功端口，
+    // 下一次自愈就搬错地方。
+    if (!_mainFrameHttpError) {
+      final uri = Uri.tryParse(url ?? '');
+      if (uri != null &&
+          uri.scheme == 'http' &&
+          (uri.host == '127.0.0.1' || uri.host == 'localhost') &&
+          uri.hasPort) {
+        // 这里**不比对当前生效端口**：端口刚漂过时按新端口比，会把刚加载成功的页面
+        // 判成第三方页，_lastAuthorizedPort 就永远记不上。
+        _lastAuthorizedPort = uri.port;
+        _authRetryCount = 0; // 成功加载 = 鉴权链走通，下次 401 重新给一次自动重试机会
+        _portRestoreTriedFor = null;
+      }
+    }
+    _mainFrameHttpError = false;
     if (!mounted) return;
     setState(() {
       _pageLoading = false;
@@ -2304,15 +2345,33 @@ class _WebViewScreenState extends State<WebViewScreen>
 
   /// Token 鉴权失败（HTTP 401/403）。
   ///
-  /// 先**自动带已保存的 Token 重试一次**再下结论：服务端刚重启、30 天签名
-  /// cookie 尚未续上都可能瞬时 401，一上来就喊"你的 Token 已失效"是误报式
-  /// 打扰（[_loadTargetUrl] 带 `Cache-Control: no-cache`，重试会真正重跑
+  /// **先排除"本地端口漂了"**——这是回前台最常见、也最容易被误判成"Token 失效"的一种：
+  /// DSH 的登录 cookie 名字里带着 `127.0.0.1:<端口>`，隧道重建时借了别的端口，那颗 cookie
+  /// 就查不到；此时若保存的 Token 已随服务端重启而轮换（进程启动时生成），主文档必然 401。
+  /// 拿同一个废 Token 重试一万次也不会变好，唯一真正管用的是**把本地入口搬回上次成功鉴权
+  /// 的那个端口**（正是用户手动杀进程所做的事，见 [TunnelService.rebindLocalPort]）。
+  ///
+  /// 端口没问题才按"鉴权本身失败"处理：先**自动带已保存的 Token 重试一次**再下结论
+  /// （服务端刚重启、30 天签名 cookie 尚未续上都可能瞬时 401，一上来就喊"你的 Token
+  /// 已失效"是误报式打扰；[_loadTargetUrl] 带 `Cache-Control: no-cache`，重试会真正重跑
   /// token → 303 → Set-Cookie 鉴权链）。仍然 401 才展示内嵌 Token 输入框。
   void _onAuthError(int statusCode) {
     _loadTimeoutTimer?.cancel();
     if (!mounted) return;
+    final expected = _lastAuthorizedPort;
+    final current = TunnelService.instance.activeLocalPort;
+    if (expected != null &&
+        current != null &&
+        current != expected &&
+        _portRestoreTriedFor != current) {
+      _portRestoreTriedFor = current;
+      _snackThrottled('本地端口漂到 $current，正在搬回 $expected 以延用已登录的会话…');
+      unawaited(_restoreAuthorizedPort(expected, driftedFrom: current));
+      return;
+    }
     if (_authRetryCount == 0 && _config.activeModeToken.isNotEmpty) {
       _authRetryCount = 1;
+      _authPortDrift = false;
       _snackThrottled('鉴权未通过，正在用已保存的 Token 重试…');
       unawaited(_retryLoad());
       return;
@@ -2320,9 +2379,53 @@ class _WebViewScreenState extends State<WebViewScreen>
     setState(() {
       _pageLoading = false;
       _authError = true;
+      _authPortDrift = false;
+      // 说清"去哪拿 Token"：它是 `dsh web` 启动时打印的入口 URL 上 `?token=` 那段，
+      // 只存在于那次进程运行期间（进程一重启就换）。只说"Token 已失效"等于让用户
+      // 自己去猜去哪儿找。
       _pageError = '访问被拒绝（HTTP $statusCode）：远程服务已启用 Token 鉴权，'
-          '当前保存的 Token 已失效（服务端重启后会轮换）。\n'
-          '请在下方填入最新的访问 Token，保存后自动重连。';
+          '当前保存的 Token 已失效（DSH 进程每次启动都会换一个 Token）。\n'
+          '在服务器上运行 `dsh web`，把打印的「dsh web: http://…?token=XXXX」里 '
+          'token= 后面那段贴到下方，保存后自动重连。';
+    });
+  }
+
+  /// 换服务端 / 换实例 / 换 Token 时清掉鉴权账本。
+  ///
+  /// `_lastAuthorizedPort` 记的是"**那个服务端**在哪个端口上给这台 WebView 签过 cookie"：
+  /// 换实例就是换签名密钥，端口对上也没用，留着它会让 401 自愈去搬一个毫无意义的端口。
+  void _resetAuthBookkeeping() {
+    _lastAuthorizedPort = null;
+    _portRestoreTriedFor = null;
+    _authPortDrift = false;
+    _mainFrameHttpError = false;
+    _authRetryCount = 0;
+  }
+
+  /// 把本地入口搬回上次成功鉴权的端口，让那枚 DSH 登录 cookie 重新被认出来。
+  ///
+  /// 搬得回去就静默重载（用户只会看到一条"正在搬回…"的短提示）；搬不回去——那个端口
+  /// 正被别的程序、或上一世代 isolate 的僵尸监听占着——就把**真实原因**写进错误卡，
+  /// 并把「重启应用」摆成能真正解决它的动作（用户今天本来就在手动杀进程）。
+  Future<void> _restoreAuthorizedPort(int port,
+      {required int driftedFrom}) async {
+    final ok = await TunnelService.instance
+        .rebindLocalPort(port, reason: '主文档 401：登录 cookie 按端口签发');
+    if (!mounted) return;
+    if (ok) {
+      await _retryLoad();
+      return;
+    }
+    setState(() {
+      _pageLoading = false;
+      _authError = true;
+      _authPortDrift = true;
+      _pageError = '本地入口从 :$port 漂到了 :$driftedFrom，而且搬不回去——那个端口正被'
+          '别的程序或上一世代残留的监听占着。\n'
+          'DSH 的登录 Cookie 按端口签发，端口一换就必须重新鉴权，而保存的 Token 已随'
+          '服务端重启失效。\n'
+          '两个办法：①「重启应用」找回原端口（推荐，不用重填 Token）；'
+          '②在下方填入最新的访问 Token。';
     });
   }
 
@@ -2343,6 +2446,8 @@ class _WebViewScreenState extends State<WebViewScreen>
       _pageLoading = true;
       _loadProgress = 0;
     });
+    // 换了 Token 就是重新开始一段鉴权：旧的"成功端口"属于废 Token 时代，不作数。
+    _resetAuthBookkeeping();
     await _loadTargetUrl();
     _onPageLoadStart();
   }
@@ -2661,7 +2766,13 @@ class _WebViewScreenState extends State<WebViewScreen>
           fit: StackFit.expand,
           children: [
             InAppWebView(
-              initialUrlRequest: URLRequest(url: WebUri(_targetUrl)),
+              // 首帧就要带 `Cache-Control: no-cache`：主文档命中旧缓存会整段跳过
+              // 「token → 303 → Set-Cookie」鉴权链（_loadTargetUrl 早就带了这个头，
+              // 只有冷启动这条路漏了——"杀进程重启就好了"里，重启走的正是这条路）。
+              initialUrlRequest: URLRequest(
+                url: WebUri(_targetUrl),
+                headers: const {'Cache-Control': 'no-cache'},
+              ),
               initialSettings: InAppWebViewSettings(
                 // 缓存策略：LOAD_DEFAULT 尊重 HTTP 缓存头——zcode-phone-server
                 // 对 HTML 发 no-store，保证页面代码始终最新。曾因
@@ -2712,7 +2823,17 @@ class _WebViewScreenState extends State<WebViewScreen>
               onProgressChanged: (controller, progress) =>
                   _onPageProgress(progress),
               onLoadStop: (controller, url) async {
-                _onPageLoadStop();
+                // Android 上回调自带的 url 常为 null：回退查 controller，否则
+                // _lastAuthorizedPort 记不上，端口漂移时就没人知道该搬回哪里。
+                var loaded = url?.toString();
+                if (loaded == null || loaded.isEmpty) {
+                  try {
+                    loaded = (await controller.getUrl())?.toString();
+                  } catch (_) {
+                    loaded = null;
+                  }
+                }
+                _onPageLoadStop(url: loaded);
                 // 页面就绪后应用持久化的缩放比例
                 _applyZoom();
                 // 桥只服务隧道 loopback origin：被外链/重定向带去的第三方页
@@ -2745,6 +2866,7 @@ class _WebViewScreenState extends State<WebViewScreen>
                 // 抖动等）在长连接页面里是常态，整页报错会反复打断使用
                 // （表现为一点会话切换就「无法加载远程界面 net::ERR_FAILED」）。
                 if (request.isForMainFrame != true) return;
+                _mainFrameHttpError = true;
                 _onPageError(
                   '加载失败：${error.description}\n'
                   '（${error.type}）',
@@ -2754,6 +2876,8 @@ class _WebViewScreenState extends State<WebViewScreen>
                 // 只处理主文档响应；子资源（图标等）的 401/404 不打扰页面
                 if (request.isForMainFrame != true) return;
                 final code = errorResponse.statusCode ?? 0;
+                // 主文档吃到了 HTTP 错误响应：这次的 onLoadStop 不能算"鉴权成功"
+                _mainFrameHttpError = true;
                 if (code == 401 || code == 403) {
                   // Token 鉴权未通过：停掉自动重试，错误页内嵌 Token 输入
                   _onAuthError(code);
@@ -3047,7 +3171,11 @@ class _WebViewScreenState extends State<WebViewScreen>
                   size: 56, color: _authError ? Colors.orange : Colors.red),
               const SizedBox(height: 16),
               Text(
-                  _authError ? '需要更新 DSH 访问 Token' : '无法加载远程界面',
+                  _authError
+                      ? (_authPortDrift
+                          ? '本地端口漂移，登录 Cookie 失效'
+                          : '需要更新 DSH 访问 Token')
+                      : '无法加载远程界面',
                   style: theme.textTheme.titleMedium),
               const SizedBox(height: 12),
               ConstrainedBox(
@@ -3057,8 +3185,12 @@ class _WebViewScreenState extends State<WebViewScreen>
                     Text(
                       '$_pageError',
                       textAlign: TextAlign.center,
-                      maxLines: _pageErrorExpanded ? null : 3,
-                      overflow: _pageErrorExpanded
+                      // 鉴权卡的正文就是"该干什么"（去哪拿 Token / 为什么端口漂了），
+                      // 折叠成 3 行等于把解法藏起来；只有链路类长排查文才默认折叠。
+                      maxLines: _pageErrorExpanded || _authError
+                          ? null
+                          : 3,
+                      overflow: _pageErrorExpanded || _authError
                           ? TextOverflow.visible
                           : TextOverflow.ellipsis,
                       style:
@@ -3066,7 +3198,7 @@ class _WebViewScreenState extends State<WebViewScreen>
                     ),
                     // 长文（VPN/QoS 排查提示）默认折叠：主界面只给结论，
                     // 技术细节想看再展开，别一上来糊一屏。
-                    if ('$_pageError'.length > 60)
+                    if ('$_pageError'.length > 60 && !_authError)
                       TextButton(
                         onPressed: () => setState(
                             () => _pageErrorExpanded = !_pageErrorExpanded),
@@ -3102,6 +3234,18 @@ class _WebViewScreenState extends State<WebViewScreen>
                   onPressed: _saveTokenAndReload,
                   icon: const Icon(Icons.key),
                   label: const Text('保存 Token 并重连'),
+                ),
+                // 端口漂移把登录 cookie 一起作废时，真正能解决的是**找回原端口**：
+                // 进程重开会释放上一世代 isolate 的僵尸监听，配置端口腾回来，那颗
+                // 30 天 cookie 立刻重新管用——不用重填 Token。用户今天本来就在手动
+                // 杀进程，这里把它变成一键。
+                const SizedBox(height: 4),
+                TextButton.icon(
+                  onPressed: _restartAppForPorts,
+                  icon: const Icon(Icons.power_settings_new),
+                  label: Text(_authPortDrift
+                      ? '重启应用（找回原端口，推荐）'
+                      : '重启应用（找回原端口）'),
                 ),
               ],
               const SizedBox(height: 20),

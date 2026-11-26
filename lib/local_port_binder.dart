@@ -107,16 +107,25 @@ class LocalPortBinder {
   ///     此时提示用户"关闭其它程序"是误导。
   ///  2. 仍被占 → 定向回收该端口上的残骸 + 再清扫一次，重试一次（并发尝试可能
   ///     刚好在让路期间又漏下一个）。
-  ///  3. 让路给临时池：**每个候选先回收自家残骸再绑**。少了这一步，临时段里的
+  ///  3. **黏性端口**：配置端口拿不到时，先试 [preferredPort]（上次实际生效的那个），
+  ///     再进随机池。端口稳定不是洁癖，而是**鉴权正确性**：DSH Web 的登录 cookie 名字是
+  ///     `dsh-auth-<sha256("127.0.0.1:<端口>")>`，而浏览器发 cookie 不看端口——换了端口
+  ///     的第一次请求，服务端按新端口算名字，必然查不到那颗 30 天 cookie，只能退回
+  ///     URL 上的 token 重签。token 是 DSH **进程启动时**随机生成的，服务器只要重启过
+  ///     一次，App 里存的那份就永久对不上 → 主文档 401，怎么重试都没用，只有杀进程
+  ///     让端口回到原样才恢复。用户报的"从后台回前台就报鉴权未通过，只能杀进程"就是
+  ///     这条：端口在每次重建时随机漂移，cookie 跟着一起作废。
+  ///  4. 让路给临时池：**每个候选先回收自家残骸再绑**。少了这一步，临时段里的
   ///     孤儿就永远没人管——上一版正是这样把可借端口一个个烧光的。
-  ///  4. 两种"端口被占"的形态都算数（见 [isPortUnavailableToUs] 的实测对照表）：
-  ///     内核 `EADDRINUSE` = 别的进程占着；Dart 的 `shared flag to bind()` =
-  ///     **本进程**占着。其它 bind 异常原样上抛（权限、地址族之类不是端口占用，
-  ///     把它判成 localPort 会把用户骗去杀进程）。
+  ///     两种"端口被占"的形态在这一步和第 1、2 步里都算数（见
+  ///     [isPortUnavailableToUs] 的实测对照表）：内核 `EADDRINUSE` = 别的进程占着；
+  ///     Dart 的 `shared flag to bind()` = **本进程**占着。其它 bind 异常原样上抛
+  ///     （权限、地址族之类不是端口占用，把它判成 localPort 会把用户骗去杀进程）。
   ///  5. 整池皆满 → 抛 [TunnelLocalPortOccupiedException]，带**试过的端口**与
   ///     "是否疑似自家僵尸 FD"的判断：前者回应用户"你到底随机试了没有"，后者
   ///     决定界面把「重启应用」还是"改设置"摆成主行动。
-  Future<ServerSocket> bindListener(int configPort) async {
+  Future<ServerSocket> bindListener(int configPort,
+      {int? preferredPort}) async {
     final tried = <int>[];
     /// 本进程占着、却不在自家登记表里的端口 = **上一个 isolate 留下的僵尸监听**
     /// （Android 回前台常见：进程没死、isolate 换了一个，老 isolate 没 close 的
@@ -166,7 +175,43 @@ class LocalPortBinder {
       if (again != null) return again;
     }
 
-    // 3) 让路：扫遍整个保留池。
+    // 3) 黏性端口：配置端口拿不到时，先回到**上次实际生效**的那个，再谈随机池。
+    //    随机池每次都换一个端口，等于每次重建隧道都把 DSH 的登录 cookie 作废一次
+    //    （cookie 名字里带着端口）；token 又可能早已随服务端重启而失效，于是回前台
+    //    必然 401。沿用上次成功的端口，才不需要用户重填 Token、也不需要杀进程。
+    final sticky = preferredPort == null ||
+            preferredPort == configPort ||
+            preferredPort <= 0 ||
+            preferredPort > 65535
+        ? null
+        : preferredPort;
+    if (sticky != null) {
+      if (await releaseOwnedOn(sticky)) {
+        log('黏性端口 :$sticky 正被自家残骸占着，已回收后重试', warn: true);
+      }
+      var kept = await tryBind(sticky);
+      if (kept == null) {
+        // 绑不上最常见的原因就是"自家上一轮没关干净的监听还挂在这个端口上"（登记表里
+        // 有 = 关得掉）。少了这次**回收 + 重试**，黏性端口会被当成"这个端口没了"直接
+        // 跳随机池 = 每次重建换一个端口 = 把 DSH 的登录 cookie 作废一次。与配置端口
+        // 那一步（第 2 步）同款处理。
+        final released = await releaseOwnedOn(sticky);
+        final sweptAgain = await sweepOrphans();
+        if (released || sweptAgain > 0) {
+          log('回收了 :$sticky 上的自家残留（定向 $released、全量 $sweptAgain），重试绑定',
+              warn: true);
+          kept = await tryBind(sticky);
+        }
+      }
+      if (kept != null) {
+        log('本地端口 $configPort 被占用，沿用上次实际生效的 :$sticky'
+            '（DSH 登录 cookie 按端口签发，端口保持稳定）', warn: true);
+        return kept;
+      }
+      log('黏性端口 :$sticky 也用不了，转入临时端口保留池', warn: true);
+    }
+
+    // 4) 让路：扫遍整个保留池。
     final holder = await _describeHolder(configPort);
     await ensureRespawnChecked();
     for (final candidate in candidates()) {

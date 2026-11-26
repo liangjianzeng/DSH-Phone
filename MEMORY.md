@@ -273,6 +273,66 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 
 ---
 
+## 回前台必然「鉴权未通过，正在用已保存的 Token 重试…」、只能杀进程（2026-11-26）
+
+**现象**：从后台返回前台经常整屏显示 `dsh web authentication required; reopen the URL
+printed by dsh web.`（WebView 直接把 401 的纯文本正文当文档渲染）+ 顶部 SnackBar
+「鉴权未通过，正在用已保存的 Token 重试…」，重试/刷新都救不回来，**只有杀掉进程重启才好**。
+
+**根因（两条同时成立才炸，所以是"经常"而不是"每次"）**：
+1. **DSH Web 的登录 cookie 是按端口签发的**：名字 = `dsh-auth-<sha256(Host 头)>`，
+   Host 头带着端口 → 名字随端口变（`packages/host/authentication-token/src/browser-auth.ts`
+   的 `cookieName(authority)`，`authority` 来自 `requestAudience()`）。而**浏览器发 cookie
+   不看端口**（同主机所有端口共享 jar）：隧道借了新端口，请求照发旧 cookie，服务端按新端口
+   算名字 → 查不到 → 只能退回 URL 上的 `?token=` 重签。
+2. **App 里存的 Token 通常早就是废的**：token 由 DSH **进程启动时**随机生成
+   （`PROCESS_LAUNCH_TOKENS` WeakMap，不落盘，只在 `dsh web` 启动那一行打印），服务器重启
+   过一次，`SSHConfig.accessToken` 就永久对不上。平时靠那颗 30 天 cookie 兜着（同端口 +
+   废 token = 303，照样打开 = "杀进程重启就好了"的真相）；cookie 一失效立刻无路可走。
+
+于是链路：**回前台 → 探活失败 → `_forceRebuild` → 旧版每次都从随机保留池借端口 →
+cookie 名字对不上 + token 已废 → 主文档 401 → 拿同一个废 token 重试一万次也不会变好 →
+只有杀进程把配置端口腾回来（旧 cookie 重新对得上名字）才恢复。**
+对照实验（一条命令复现出截图那句 401，五组对照坐实两条条件）：
+`node tool/dsh_cookie_port_scoping.mjs`。
+
+**修复（三层，都要保留）**：
+- **黏性本地端口**（`LocalPortBinder.bindListener(configPort, {preferredPort})`）：阶梯由
+  「配置端口 → 随机池」变成「配置端口 → **上次实际生效端口** → 随机池」，黏性值按实例存
+  `SharedPreferences['tunnel.stickyLocalPort.<index>']`（`TunnelService._stickyPorts`，
+  绑回配置端口即撤销）。**端口稳定不是洁癖，是鉴权正确性**：漂一次端口 = 把用户登出一次。
+  黏性端口绑不上时必须**先回收自家残骸再重试一次**（与配置端口那一步同款），少了这一步
+  它会被当成"端口没了"直接跳随机池 —— 新增的 5 条测试就是在这里把第一版实现抓出来的。
+- **401 自愈**（`TunnelService.rebindLocalPort(port, reason:)`）：主文档 401 且
+  `activeLocalPort != _lastAuthorizedPort` 时，先把本地入口**原地搬回**上次成功鉴权的端口
+  （不动 SSH 会话；拆掉旧入口上的 keep-alive 连接，否则 WebView 复用旧端口的连接），
+  搬回去就静默重载 —— 这正是用户手动杀进程在做的事。搬不动才给错误卡，且卡上把
+  「重启应用（找回原端口）」摆成推荐动作，**不是**让用户去改一个改了也没用的 Token。
+- **鉴权账本**（`webview_screen.dart`）：`_lastAuthorizedPort` 只在"主文档干净落地在
+  loopback 上"时记录——**`onLoadStop` 对 401 的鉴权失败页同样会触发**（Chromium 把错误页
+  当普通文档渲染），必须用 `_mainFrameHttpError`（由主文档的 `onReceivedHttpError` /
+  `onReceivedError` 置位、`onLoadStart` 清零）排除，否则会把漂走的端口记成成功端口，
+  下一次自愈搬错地方。`_portRestoreTriedFor` 防两个端口来回搬；换实例/换服务端/换 Token
+  一律 `_resetAuthBookkeeping()`（换服务端就是换签名密钥，端口对上也没用）。
+
+**顺带修掉的同类漏**：`initialUrlRequest` **没带** `Cache-Control: no-cache`（只有
+`_loadTargetUrl` 带了）——主文档命中缓存会整段跳过「token → 303 → Set-Cookie」鉴权链。
+冷启动走的正是这条漏的路，现已补齐。
+
+**仍然存在的硬限制（别再当 bug 查）**：token 只在 DSH 进程内存里，**没有任何运行时接口能
+从正在跑的实例把它取出来**（`webserver/entry-url` 只在启动时被 emit 一次去打印）。所以
+服务端重启 + cookie 过期（30 天绝对过期，`authorizeIndex` 的"已鉴权"分支**不续期**）这两件事
+凑齐时，只能让用户重新粘 Token —— 错误卡已写明去哪拿（服务器上跑 `dsh web`，取
+`dsh web: http://…?token=XXXX` 里那段），并且鉴权卡的正文**不许再折叠成 3 行**（折叠等于
+把解法藏起来）。
+
+**回归**：`test/local_port_binder_test.dart` 的「黏性端口」组（真 ServerSocket 钉死：配置
+端口被占必须沿用黏性端口且**随机池一个都不试**、黏性端口也占才进池、黏性端口上的自家残骸
+必须回收后重试、配置端口空着时黏性一个都不试、非法/同值 preferredPort 完全等价于没有）。
+改绑定阶梯必须先过这组。
+
+---
+
 ## Linux(aarch64) 打包机：本机编 APK（2026-10-19）
 
 > 本机的 Linux 侧构建记录（Ubuntu 24.04 / aarch64，`Linux 7.0.0-1019-nvidia`）。结论：**能本机出 release APK**，
@@ -402,7 +462,10 @@ MSYS2 进程会崩，git 无法走 SSH。此时：
 - **UI 侧不变量（`webview_screen.dart`）**：
   - `_webViewAlive`：连上过就**常驻** WebView。旧结构按状态切分支、WebView 只活在 connected 分支，每次闪断都 dispose 整棵 WebView（SPA 状态全丢 + 整站重载），把网络抖动放大成"老是重新加载"。换实例时显式置假强制重建。
   - 链路不健康时：不弹红色全屏、不显示加载遮罩、**不烧** `_pageRetryCount`，只挂非阻塞横幅（`_buildTunnelBanner`）+ 置 `_pageNeedsReload`；`_onTunnelState` 在恢复健康时自动补载。
-  - `_onAuthError` 先带已保存 token 自动重试一次（`_authRetryCount`）再要用户填 Token。
+  - `_onAuthError` 先看**本地端口是不是漂了**（对比 `_lastAuthorizedPort`，漂了就
+    `TunnelService.rebindLocalPort()` 搬回去 —— DSH 的登录 cookie 按端口签发，见"回前台必然
+    鉴权未通过"一节）；端口没问题才带已保存 token 自动重试一次（`_authRetryCount`），
+    再失败才要用户填 Token。
   - 顶栏必须有主动刷新入口：`_buildConnectionButton` → `forceRefresh()`（旧版顶栏没有任何重连入口，假死时用户只能杀 App）。
 - **回归**：`test/tunnel_policy_test.dart`（分类 / 退避单调+封顶+抖动 / 分级 / 状态文案 / 环形缓冲）。改策略层必须让这些断言继续成立。
 

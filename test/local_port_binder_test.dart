@@ -255,6 +255,105 @@ void main() {
     });
   });
 
+  group('黏性端口（"回前台就报鉴权未通过、只能杀进程"的根因）', () {
+    // DSH Web 的登录 cookie 名字是 `dsh-auth-<sha256("127.0.0.1:<本地端口>")>`，而浏览器
+    // 发 cookie **不看端口**（同主机所有端口共享 jar）。隧道每换一个本地端口，远端按新
+    // 端口算出的名字就查不到那颗 30 天 cookie，只能退回 URL 上的 token 重签；token 是
+    // DSH **进程启动时**生成的，服务端重启过一次，App 里存的那份就永久对不上 → 主文档
+    // 401「dsh web authentication required」，同一个 token 重试一万次也不会变好，只有
+    // 杀进程把配置端口腾回来才恢复。所以"配置端口拿不到时先沿用上次的实际端口"是**鉴权
+    // 正确性**，不是端口洁癖。（对照实验：`node tool/dsh_cookie_port_scoping.mjs`，一条命令复现出截图上那句 401）
+
+    test('配置端口被占 → 先沿用上次实际生效端口，**随机池一个都不试**', () async {
+      final config = await _freePort();
+      final sticky = await _freePort();
+      await holdUnregistered(config); // 真机现场：上一世代 isolate 占着配置端口
+
+      final server =
+          await makeBinder(candidates: () => [tunnelFallbackPoolMax])
+              .bindListener(config, preferredPort: sticky);
+
+      expect(server.port, sticky,
+          reason: '随机换端口等于把 DSH 的登录 cookie 作废一次，用户当场被登出');
+      expect(bindLog, [config, sticky],
+          reason: '黏性端口排在随机池前面；走到池子那一步就是这次修复要消灭的行为');
+      await server.close();
+    });
+
+    test('黏性端口也被占 → 才转入随机池（不比修复前更差）', () async {
+      final config = await _freePort();
+      final sticky = await _freePort();
+      await holdUnregistered(config);
+      await holdUnregistered(sticky);
+
+      final server =
+          await makeBinder(candidates: () => [tunnelFallbackPoolMax])
+              .bindListener(config, preferredPort: sticky);
+
+      expect(server.port, tunnelFallbackPoolMax);
+      expect(bindLog, [config, sticky, tunnelFallbackPoolMax]);
+      await server.close();
+    });
+
+    test('黏性端口上的自家残骸 → **先回收再绑**，不许当成"端口没了"跳去随机池',
+        () async {
+      final config = await _freePort();
+      const sticky = tunnelFallbackPortMin; // 3090：正是旧版随机借走没还的那类端口
+      await holdUnregistered(config);
+      var stickyAttempts = 0;
+      final binder = makeBinder(
+        candidates: () => [tunnelFallbackPoolMax],
+        bind: (address, p) async {
+          if (p == sticky && stickyAttempts++ == 0) {
+            // 黏性端口上还挂着自家上一轮没关干净的监听（已登记 = 本该由我们回收）
+            await holdAsOurOrphan(p);
+            throw sharedFlag(p);
+          }
+          return ServerSocket.bind(address, p);
+        },
+      );
+
+      final server = await binder.bindListener(config, preferredPort: sticky);
+
+      expect(server.port, sticky,
+          reason: '自家残骸回收掉就能复用原端口 = cookie 继续管用；'
+              '直接跳随机池就是"每次重建换一个端口"的老毛病');
+      expect(bindLog, [config, sticky, sticky]);
+      await server.close();
+    });
+
+    test('配置端口空着时，黏性端口一个都不试（配置端口永远优先）', () async {
+      final config = await _freePort();
+      final sticky = await _freePort();
+
+      final server = await makeBinder(candidates: () => [tunnelFallbackPoolMax])
+          .bindListener(config, preferredPort: sticky);
+
+      expect(server.port, config);
+      expect(bindLog, [config], reason: '能回到配置端口就必须回去，顺便撤销黏性');
+      await server.close();
+    });
+
+    test('preferredPort 等于配置端口或非法值 → 与没有黏性完全一致', () async {
+      final config = await _freePort();
+      const candidate = tunnelFallbackPoolMax;
+      await holdUnregistered(config);
+
+      final same = await makeBinder(candidates: () => [candidate])
+          .bindListener(config, preferredPort: config);
+      expect(same.port, candidate, reason: '同值不该多打一次绑定');
+      expect(bindLog, [config, candidate]);
+      await same.close();
+
+      bindLog.clear();
+      final bogus = await makeBinder(candidates: () => [candidate])
+          .bindListener(config, preferredPort: 70000);
+      expect(bogus.port, candidate);
+      expect(bindLog, [config, candidate], reason: '越界的"黏性端口"必须被忽略');
+      await bogus.close();
+    });
+  });
+
   group('自家僵尸 vs 第三方 App（决定界面主按钮是哪一个）', () {
     test('本进程占着且不在登记表 → 判成自家僵尸，界面给「重启应用」', () async {
       final port = await _freePort();
