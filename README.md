@@ -7,7 +7,8 @@ DSH-Phone 是一个 Flutter Android 应用：首次启动时配置 SSH 地址 / 
 - **开源地址**：https://github.com/liangjianzeng/DSH-Phone
 - **当前源码版本**：v0.2.7（build 23）
 - **安装包**：
-  - **最近正式发布 v0.2.3 直接下载**：<https://github.com/liangjianzeng/DSH-Phone/releases/download/v0.2.3/app-release-v0.2.3.apk> —— 23,631,615 bytes（≈22.54 MiB），release 签名 `CN=TongYiLite`，sha256 `5132995ce5bf69f275d38ae76aed009f76bce7bf3912e78bef9e9c9cc99a0cde`；覆盖安装即可，数据保留
+  - **当前正式版 v0.2.7 直接下载**：<https://github.com/liangjianzeng/DSH-Phone/releases/download/v0.2.7/app-release-v0.2.7.apk>（tag 触发的 CI `build-apk` 构建并上传，签名指纹与 `CN=TongYiLite` 不符直接失败）；**仓库内 raw 直链（绑定 tag、主分发，国内拉 Release asset 不稳时用这条）**：<https://github.com/liangjianzeng/DSH-Phone/raw/v0.2.7/apk/app-release-v0.2.7.apk> = `apk/app-release-v0.2.7.apk` —— 23,686,104 bytes（≈22.59 MiB），release 签名 `CN=TongYiLite`，sha256 `b60f28902226936aa804da6fa9702c3b2f73adcdd971ee235fe873784d496dd1`，对应提交 `250cc79`（包=已提交树）；覆盖安装即可，数据保留
+  - **上一版正式发布 v0.2.3 直接下载**：<https://github.com/liangjianzeng/DSH-Phone/releases/download/v0.2.3/app-release-v0.2.3.apk> —— 23,631,615 bytes（≈22.54 MiB），release 签名 `CN=TongYiLite`，sha256 `5132995ce5bf69f275d38ae76aed009f76bce7bf3912e78bef9e9c9cc99a0cde`；覆盖安装即可，数据保留
   - **v0.2.4 本机构建包**：`apk/app-release-v0.2.4.apk` —— 23,683,666 bytes（≈22.59 MiB），release 签名 `CN=TongYiLite`，sha256 `dc3088240c493ee7a637198342a28fe72927cdbaaac5728da6e89906929f6638`
   - **v0.2.5 / v0.2.6 本机构建包**（尚未发 Release，仅真机验证用）：`apk/app-release-v0.2.5.apk` —— 23,684,111 bytes，sha256 `6ae6995e53a34a04cc1a76bce461ad6548b23f1c44cfecfd0a41b82739137f78`；`apk/app-release-v0.2.6.apk` —— 23,685,118 bytes，sha256 `854a09772feda07e4c7ac37694b68efe734dc86d2095be83f0dee40232973e57`；同为 release 签名 `CN=TongYiLite`
   - **仓库内镜像**（同版本同 sha256，走 raw CDN 时可能有几分钟缓存时差，故不作主链宣传）：`apk/app-release-v0.2.3.apk`，见 <https://github.com/liangjianzeng/DSH-Phone/tree/main/apk>
