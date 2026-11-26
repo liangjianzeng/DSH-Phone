@@ -384,6 +384,25 @@ cookie 名字对不上 + token 已废 → 主文档 401 → 拿同一个废 toke
   要它就得用户手发 fine-grained PAT；③ SSH 私钥只能 git push，**Releases 是纯 API 功能，
   SSH 里没有这个动作**，别指望"有仓库密钥就能发 release"。CI 那条路（证书 Secrets +
   `GITHUB_TOKEN`）仍在，配好后可用 `tool/publish_release.sh` 手动补 Release。
+- **v0.2.7 发版实况与两条补票路（2026-11-27）**：Releases 里 **v0.2.7 至今没有 asset**，
+  两条路都断在凭据上，**都不是代码问题，别再当回归查**：
+  ① CI 发版 job 两次触发都红在「还原 release 签名证书」= 仓库 Secrets 未配置（设计行为：
+  宁可失败也不发静默 debug 签名的包）。修法：Settings → Secrets 配
+  `ANDROID_KEYSTORE_BASE64`=`base64 -w0 android/key.jks`、
+  `ANDROID_KEY_PROPERTIES_BASE64`=`base64 -w0 android/key.properties`，然后
+  `git push -f origin v<tag>` 重跑（force-push tag 会重新触发 workflow）。
+  ② `tool/publish_release.sh` 手动补：`~/.config/dsh-gh/pat` 那把 fine-grained 令牌
+  **已过期**（2026-11-27 建 release 直接 `HTTP 401 Bad credentials`），要用户换一把
+  Contents: Read and write、只授权 DSH-Phone 的新令牌再跑。
+  实际分发以 raw tag 直链为准（已核 HTTP 200、23,686,104 bytes 与本地一致）。
+- **main 有两台机器在推**（这台 aarch64 Linux + 一台 Windows）：2026-11-27 push 被拒才
+  发现本地落后 6 个提交——**v0.2.4 / v0.2.5 / v0.2.6 与整套设备面板都在对面**。
+  **push 前一律先 `git fetch` + `git rebase origin/main`**，别把对面的提交当成杂七杂八的
+  远端改动；对面也会改 pubspec 版本号，本地 `pubspec.yaml` 落后时先看清再动。
+- **本机到 github.com 的大流量只有 ~60 KiB/s**：`git ls-remote` / api.github.com 都正常，
+  而 `git fetch` 传包会"看起来挂死、毫无输出"——**是慢不是卡**（`GIT_TRACE_PACKET` 能看到
+  已收到 ACK 与 PACK）。补拉那 6 个提交（含 `apk/*.apk` 三个 23MB + `plugin/dist/*.tar.gz`）
+  实际 14 分钟。**大 fetch 必须丢后台任务再轮询**，前台 `timeout` 掐掉等于白拉。
 - **发版闭环（写进 BUILD.md 交付规范，`tool/build_apk.sh` 会主动提醒）**：打完 release 包
   必须 ① 推 tag 让 CI 上传 Releases，② 回 README.md/README.html 同步「安装包」的最新
   正式版说明（版本号、大小、sha256、asset 名）。只发本地 APK 不改 README 视为发版未完成。
