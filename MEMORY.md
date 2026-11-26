@@ -331,6 +331,35 @@ cookie 名字对不上 + token 已废 → 主文档 401 → 拿同一个废 toke
 必须回收后重试、配置端口空着时黏性一个都不试、非法/同值 preferredPort 完全等价于没有）。
 改绑定阶梯必须先过这组。
 
+### 二次复盘（2026-11-27 00:51，v0.2.7 装上的第二天又炸一次）
+
+上面那版只修了"**运行中**漂移"。**冷启动**这一路照样漏：logcat 拍到
+`00:51:09 新进程 :3081 被占 → 借随机端口 3094` 与 `00:51:19 上一个 isolate 才走到 detached
+把监听关掉`——**占用者就是还没退干净的自己，再等一秒端口就还回来**。而且新进程的
+`_lastAuthorizedPort` 是内存态、冷启动为 null，于是 401 之后 App 既不知道该搬回哪里、
+又只会劝用户重填一个填了也没用的 Token；截图上连鉴权卡都没有，只剩一屏
+`dsh web authentication required…` 生肉文本（主文档 401 **未必回调** `onReceivedHttpError`：
+命中缓存、错误页复用、部分 ROM 实现都会漏）。三条补齐：
+
+- **`LocalPortBinder` 第 2.5 步「等正在死的自己」**：配置端口绑不上时先
+  `releaseOwnedOn` + holdoff 400ms × 3 轮再下台阶（抢回来就一个随机端口都不烧）。
+  第三方永久占用只多花 ~1.2s。测试：`configPortHoldoffRounds` 注入，现有用例默认 0
+  （否则 bindLog 断言全被 holdoff 的额外尝试污染）。
+- **cookie 名反查端口**（`lib/dsh_cookie.dart`，纯计算 + 单测）：`dsh-auth-` +
+  **unpadded base64url(sha256(authority))**，`authority` = Host 头 = `127.0.0.1:<端口>`
+  （DSH 侧 `cookieName()`，`node_modules/@deepseek-ai/dsh-host-authentication-token/src/browser-auth.ts`）。
+  浏览器发 cookie 不看端口 ⇒ jar 里那颗 cookie 的**名字**就是"活会话在哪个端口签的"这份
+  **跨进程、跨重启都不丢**的证据。`CookieManager.getCookies()` 取名字 → 与候选端口逐个比
+  → `rebindLocalPort(它)`。**候选必须含配置端口**（cookie 最常签在那儿），只喂"当前端口 +
+  保留池"永远认不出来——这条在测试里写死了。DSH 改了 cookie 算法，`test/dsh_cookie_test.dart`
+  的期望值（node 实算）必须同步改，否则反查静默失效。
+- **认正文兜底**：`onLoadStop` 后读 `document.body.innerText` 前 160 字，命中
+  `dshAuthRequiredText` 就按 401 处理（并撤回被误记的 `_lastAuthorizedPort`）。
+  **`onReceivedHttpError` 不能单独信**。
+- 顺带：搬端口失败**不许**把这条路锁死（`_portRestoreTriedFor` 只在搬成功时才该留痕，
+  失败要清掉——用户就是那个会去关掉占用者再点「重试」的人）；`rebindLocalPort` 也加了
+  "回收 + 400ms×3 再试"，目标端口同样常被上一世代的自己占着。
+
 ---
 
 ## Linux(aarch64) 打包机：本机编 APK（2026-10-19）

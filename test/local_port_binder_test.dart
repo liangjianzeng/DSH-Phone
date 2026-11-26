@@ -60,9 +60,15 @@ void main() {
     required List<int> Function() candidates,
     bool sameProcessRespawn = false,
     Future<ServerSocket> Function(InternetAddress, int)? bind,
+    // 默认关掉"等正在死的自己"那几轮：现有用例钉的是**阶梯顺序**，把 holdoff 的
+    // 额外尝试混进 bindLog 会把断言搞成噪音。holdoff 自己的用例（见下面那个组）
+    // 显式把轮数打开。
+    int configPortHoldoffRounds = 0,
   }) {
     return LocalPortBinder(
       log: (_, {required bool warn}) {},
+      configPortHoldoffRounds: configPortHoldoffRounds,
+      configPortHoldoff: Duration.zero,
       onBound: (server, configPort) => registry.owned.add(server),
       sweepOrphans: registry.sweep,
       releaseOwnedOn: (port) async {
@@ -351,6 +357,51 @@ void main() {
       expect(bogus.port, candidate);
       expect(bindLog, [config, candidate], reason: '越界的"黏性端口"必须被忽略');
       await bogus.close();
+    });
+  });
+
+  group('配置端口「等正在死的自己」（2026-11-27 K90 真机现场）', () {
+    // 真机 logcat：00:51:09 新进程绑 :3081 失败 → 借随机端口 3094 → DSH 登录 cookie
+    // 名字里带着 :3081 → 主文档 401；00:51:19 上一个 isolate 才走到 detached 把监听关掉。
+    // 也就是说：**再等一秒就能抢回配置端口**，而我们提前放弃，代价是用户只能杀进程。
+    test('配置端口先被占、下一拍还回来 → 必须抢回配置端口，随机池一个都不试', () async {
+      final port = await _freePort();
+      var configTries = 0;
+      final server = await makeBinder(
+        candidates: () => [tunnelFallbackPoolMin],
+        configPortHoldoffRounds: 3,
+        bind: (address, p) async {
+          if (p == port) {
+            configTries++;
+            // 前两次：上一个世代还没退干净（内核报 EADDRINUSE）
+            if (configTries <= 2) throw eaddrInUse(p);
+          }
+          return ServerSocket.bind(address, p);
+        },
+      ).bindListener(port);
+
+      expect(server.port, port,
+          reason: '端口换一次 = DSH 的登录 cookie 作废一次，能等回来就必须等回来');
+      expect(bindLog, isNot(contains(tunnelFallbackPoolMin)),
+          reason: '抢回配置端口后不该烧掉任何一个保留池端口');
+      expect(configTries, greaterThanOrEqualTo(3));
+      await server.close();
+    });
+
+    test('配置端口被**永久**占用 → 只多试 N 轮就下台阶，不许无限等', () async {
+      final port = await _freePort();
+      const candidate = tunnelFallbackPoolMin;
+      await holdUnregistered(port); // 第三方 App 常年占着配置端口
+
+      final server = await makeBinder(
+        candidates: () => [candidate],
+        configPortHoldoffRounds: 2,
+      ).bindListener(port);
+
+      expect(server.port, candidate);
+      expect(bindLog.where((p) => p == port).length, 3,
+          reason: '第 1 步 1 次 + holdoff 2 轮，到此为止；第三方占用不该让我们干等');
+      await server.close();
     });
   });
 

@@ -27,8 +27,14 @@ class LocalPortBinder {
     required this.candidates,
     Future<ServerSocket> Function(InternetAddress address, int port)? bind,
     Duration probeTimeout = const Duration(milliseconds: 400),
+    Duration configPortHoldoff = const Duration(milliseconds: 400),
+    int configPortHoldoffRounds = 3,
+    Future<void> Function(Duration)? delay,
   })  : _bind = bind ?? ServerSocket.bind,
-        _probeTimeout = probeTimeout;
+        _probeTimeout = probeTimeout,
+        _configPortHoldoff = configPortHoldoff,
+        _configPortHoldoffRounds = configPortHoldoffRounds,
+        _delay = delay ?? Future.delayed;
 
   /// 事件（进连接诊断页）。`warn` = true 是"用户该知道"级别的。
   final void Function(String message, {required bool warn}) log;
@@ -61,6 +67,11 @@ class LocalPortBinder {
   final Future<ServerSocket> Function(InternetAddress address, int port) _bind;
 
   final Duration _probeTimeout;
+
+  /// 配置端口绑不上时，**先给它几秒钟让路**再放弃（见 [bindListener] 第 2.5 步）。
+  final Duration _configPortHoldoff;
+  final int _configPortHoldoffRounds;
+  final Future<void> Function(Duration) _delay;
 
   /// 「本进程已经占着这个端口」的标志性文案（Dart 自己拦的，不是内核 errno）。
   static const String _sharedFlagSignature = 'shared flag to bind';
@@ -173,6 +184,25 @@ class LocalPortBinder {
           warn: true);
       final again = await tryBind(configPort);
       if (again != null) return again;
+    }
+
+    // 2.5) 等一等"正在死的自己"。真机现场（2026-11-27 K90 logcat）：
+    //      00:51:09 新进程第 1 次尝试 → :3081 被占 → 借了随机端口 3094；
+    //      00:51:19 上一个 isolate 才走到 detached、把自己的监听关掉。
+    //      占用者就是**上一个世代的本 App 进程/isolate**，它一两秒后就会把端口还回来，
+    //      而我们提前两秒放弃 = 借随机端口 = 把 DSH 的登录 cookie 作废一次 = 用户看到
+    //      「dsh web authentication required」，只能杀进程。所以这里**先等再退**：
+    //      定向回收 + 短暂 holdoff + 重试，几轮都不行才往下走（总耗时 ~1.2s，远小于一次
+    //      SSH 握手，第三方永久占用配置端口的场景也只多等这一点）。
+    for (var round = 0; round < _configPortHoldoffRounds; round++) {
+      await _delay(_configPortHoldoff);
+      await releaseOwnedOn(configPort);
+      final later = await tryBind(configPort);
+      if (later != null) {
+        log('等了 ${_configPortHoldoff.inMilliseconds}ms×${round + 1} 后抢到配置端口 '
+            ':$configPort（占用者多半是上一个还没退干净的自己）', warn: true);
+        return later;
+      }
     }
 
     // 3) 黏性端口：配置端口拿不到时，先回到**上次实际生效**的那个，再谈随机池。

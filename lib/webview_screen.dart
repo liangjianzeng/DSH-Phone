@@ -18,6 +18,7 @@ import 'config.dart';
 import 'device_panel.dart';
 import 'download_manager.dart';
 import 'download_screen.dart';
+import 'dsh_cookie.dart';
 import 'github_screen.dart';
 import 'host_monitor.dart';
 import 'moon_astronomy.dart';
@@ -113,6 +114,10 @@ class _WebViewScreenState extends State<WebViewScreen>
   /// 决定标题与要不要把「重启应用」摆成主行动——那种情况杀进程才是真解，
   /// 让用户去改 Token 是把他骗上死路。
   bool _authPortDrift = false;
+
+  /// 是否正在读 WebView 的 cookie jar 反查"活 cookie 属于哪个端口"。
+  /// 读 jar 要跨到原生层，401 往往连着触发几次回调，不许并行跑第二遍。
+  bool _authPortRecovering = false;
 
   /// 本页面最近一次 `connect()` 的序号。dispose 时若序号已被别的页面推进，说明
   /// 隧道已归属新页面（路由替换场景），此时绝不能断开。
@@ -2358,17 +2363,77 @@ class _WebViewScreenState extends State<WebViewScreen>
   void _onAuthError(int statusCode) {
     _loadTimeoutTimer?.cancel();
     if (!mounted) return;
-    final expected = _lastAuthorizedPort;
     final current = TunnelService.instance.activeLocalPort;
-    if (expected != null &&
-        current != null &&
-        current != expected &&
-        _portRestoreTriedFor != current) {
-      _portRestoreTriedFor = current;
-      _snackThrottled('本地端口漂到 $current，正在搬回 $expected 以延用已登录的会话…');
-      unawaited(_restoreAuthorizedPort(expected, driftedFrom: current));
+    // 0) **先问 cookie jar**。冷启动（新进程）时 `_lastAuthorizedPort` 是空的，光靠内存
+    //    账本认不出"该搬回哪个端口"——2026-11-27 真机就是这么又炸了一次：上一个世代还没
+    //    退干净、占着配置端口 :3081，新进程借了随机端口 3094，于是主文档 401，而 App 只
+    //    好劝用户"重填 Token"（填了也没用）。cookie 是**跨进程、跨重启都还在**的那份证据：
+    //    它的名字唯一决定了自己是在哪个端口签发的（浏览器发 cookie 不看端口）。
+    if (!_authPortRecovering && current != null) {
+      _authPortRecovering = true;
+      unawaited(_recoverPortByCookie(statusCode, current));
       return;
     }
+    _authErrorWithoutPortRecovery(statusCode);
+  }
+
+  /// 从 cookie jar 里认出"活 cookie 属于哪个端口"，能把本地入口搬回去就搬。
+  ///
+  /// 搬不动（端口被第三方或上一世代的僵尸监听占着）、或 jar 里根本没有 DSH 鉴权
+  /// cookie（= 真的从没鉴权成功过 / Token 确实失效），才落到 [_authErrorWithoutPortRecovery]
+  /// 那套"重试一次 → 要用户填 Token"的流程。
+  Future<void> _recoverPortByCookie(int statusCode, int current) async {
+    int? fromCookie;
+    try {
+      fromCookie = await _cookieAuthorizedPort(current);
+    } catch (e) {
+      // 读不到 jar 就退回旧的内存账本，绝不因为原生层抽风而什么都不做。
+      debugPrint('[DSH] 读 cookie jar 失败（按"无 cookie"处理）：$e');
+    } finally {
+      _authPortRecovering = false;
+    }
+    if (!mounted) return;
+    final expected = _lastAuthorizedPort;
+    final target = fromCookie ??
+        (expected != null && expected != current ? expected : null);
+    if (target == null || target == current || _portRestoreTriedFor == current) {
+      _authErrorWithoutPortRecovery(statusCode);
+      return;
+    }
+    _portRestoreTriedFor = current;
+    _snackThrottled(fromCookie != null
+        ? '本地端口漂到 $current，正在按已登录的 Cookie 搬回 :$target…'
+        : '本地端口漂到 $current，正在搬回 $target 以延用已登录的会话…');
+    await _restoreAuthorizedPort(target, driftedFrom: current);
+  }
+
+  /// 隧道 origin 在 cookie jar 里那批 cookie 的**名字**，反查哪一颗 DSH 登录 cookie 是活的。
+  ///
+  /// `getCookies` 按 URL 取，但 cookie 的存取**不看端口**（同主机共享 jar），所以拿当前
+  /// 端口去查也能捞到别的端口签发的 `dsh-auth-*`——这正是我们要的。
+  Future<int?> _cookieAuthorizedPort(int current) async {
+    final configPort = TunnelService.instance.configLocalPort;
+    final expected = _lastAuthorizedPort;
+    const host = '127.0.0.1';
+    final cookies = await CookieManager.instance()
+        .getCookies(url: WebUri('http://$host:${configPort ?? current}/'));
+    return findAuthorizedPort(
+      cookies.map((c) => c.name),
+      host: host,
+      // 顺序 = 可信度：配置端口（cookie 最常签在这儿）→ 本次会话成功鉴权过的端口 →
+      // 当前端口 → 整个保留池（历史上借过的都可能留过名字）。
+      candidatePorts: <int>[
+        if (configPort != null) configPort,
+        if (expected != null) expected,
+        current,
+        for (var p = tunnelFallbackPoolMin; p <= tunnelFallbackPoolMax; p++) p,
+      ],
+    );
+  }
+
+  /// 端口层面无解时的鉴权处理：先带已保存的 Token 自动重试一次，仍然 401 才要用户填。
+  void _authErrorWithoutPortRecovery(int statusCode) {
+    if (!mounted) return;
     if (_authRetryCount == 0 && _config.activeModeToken.isNotEmpty) {
       _authRetryCount = 1;
       _authPortDrift = false;
@@ -2400,6 +2465,39 @@ class _WebViewScreenState extends State<WebViewScreen>
     _authPortDrift = false;
     _mainFrameHttpError = false;
     _authRetryCount = 0;
+    _authPortRecovering = false;
+  }
+
+  /// 主文档吃 401 时 `onReceivedHttpError` **未必回调**：主文档命中缓存、Chromium 复用
+  /// 上一次错误页、部分 ROM 的 WebView 实现都会漏掉它。漏掉的后果很难看——页面停在服务端
+  /// 那行生肉文本 `dsh web authentication required; reopen the URL printed by dsh web.`
+  /// 上，而 App 以为"加载成功"，既不弹鉴权卡也不给提示（2026-11-27 真机就是这副样子，
+  /// 用户只能再杀一次进程）。正文是唯一不会说谎的证据：**认正文**。
+  Future<void> _sniffMainFrameAuthFailure(InAppWebViewController controller,
+      {required String? url}) async {
+    if (_mainFrameHttpError) return; // 回调已经报过，别重复处理
+    if (!_isTunnelOrigin(url)) return; // 第三方页的正文不归我们管
+    String? text;
+    try {
+      final raw = await controller.evaluateJavascript(source: '''
+        (function () {
+          try { return (document.body && document.body.innerText || '').slice(0, 160); }
+          catch (e) { return ''; }
+        })();
+      ''');
+      text = raw is String ? raw : raw?.toString();
+    } catch (_) {
+      return; // controller 已失效之类：这次不判，下次加载再判
+    }
+    if (!mounted || !looksLikeDshAuthRequired(text)) return;
+    debugPrint('[DSH] 主文档正文是 DSH 鉴权失败文本（HTTP 错误回调漏了）→ 按 401 处理');
+    _mainFrameHttpError = true;
+    // 刚才那次 onLoadStop 可能已把这个端口记成"成功鉴权端口"——撤回来，否则下一次
+    // 自愈会往这个错的端口上搬（cookie 恰恰不在那儿）。
+    if (_lastAuthorizedPort == TunnelService.instance.activeLocalPort) {
+      _lastAuthorizedPort = null;
+    }
+    _onAuthError(401);
   }
 
   /// 把本地入口搬回上次成功鉴权的端口，让那枚 DSH 登录 cookie 重新被认出来。
@@ -2416,6 +2514,10 @@ class _WebViewScreenState extends State<WebViewScreen>
       await _retryLoad();
       return;
     }
+    // **搬失败不许把这条路锁死**。`_portRestoreTriedFor` 是给"两个端口来回搬"设的闸，
+    // 而只有真的搬成功过才存在来回搬的风险；搬失败（端口当时被别人占着）不该连带禁掉
+    // 以后机会成熟时的重试——用户正是那个会去把占用者关掉、然后点「重试」的人。
+    _portRestoreTriedFor = null;
     setState(() {
       _pageLoading = false;
       _authError = true;
@@ -2834,6 +2936,11 @@ class _WebViewScreenState extends State<WebViewScreen>
                   }
                 }
                 _onPageLoadStop(url: loaded);
+                // 兜底：主文档的 401 未必触发 onReceivedHttpError（见
+                // [_sniffMainFrameAuthFailure]），漏了就会把鉴权失败页当"加载成功"，
+                // 用户只剩一屏没人管的生肉文本。不阻塞桥注入，异步认正文。
+                unawaited(
+                    _sniffMainFrameAuthFailure(controller, url: loaded));
                 // 页面就绪后应用持久化的缩放比例
                 _applyZoom();
                 // 桥只服务隧道 loopback origin：被外链/重定向带去的第三方页

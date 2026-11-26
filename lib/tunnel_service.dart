@@ -402,6 +402,14 @@ class TunnelService {
   /// 本次隧道是否在用临时端口（界面要如实告诉用户"端口换了"）。
   bool get usingFallbackLocalPort => _localPortFallback != null;
 
+  /// 配置里写死的本地端口——**不是**当前实际生效的那个（那是 [activeLocalPort]）。
+  ///
+  /// 401 自愈必须同时知道这两个：DSH 的登录 cookie 绝大多数签在配置端口上，而隧道此
+  /// 刻可能正借临时端口跑着。按 cookie 名反查"该搬回哪个端口"时，配置端口一定要进候选
+  /// （只喂当前端口 + 保留池就永远认不出来）。
+  int? get configLocalPort =>
+      _activeConfig?.localPort ?? _desiredConfig?.localPort;
+
   /// 当前激活（已连接/正在连接）的实例索引，null 表示无。
   int? _activeProfileIndex;
   int? get activeProfileIndex => _activeProfileIndex;
@@ -1102,9 +1110,24 @@ class TunnelService {
       if (await _releaseOurStaleListenersOn(port)) {
         _log('bind', '迁回 :$port 之前回收了自家残留监听（$reason）');
       }
-      final server = await ServerSocket.bind(
-          InternetAddress.loopbackIPv4, port)
-          .timeout(const Duration(seconds: 3));
+      // **搬端口要肯等一拍**：目标端口最常是被"上一个还没退干净的自己"占着（冷启动/
+      // 回前台时旧 isolate 还活在进程里，detached 才 close 监听，实测差 1~10 秒）。
+      // 一次绑不上就判"搬不回去"，用户看到的还是那屏 401 生肉 + 只能杀进程。
+      ServerSocket? server;
+      Object? lastError;
+      for (var round = 0; round <= 3; round++) {
+        if (round > 0) await Future.delayed(const Duration(milliseconds: 400));
+        try {
+          server = await ServerSocket.bind(
+                  InternetAddress.loopbackIPv4, port)
+              .timeout(const Duration(seconds: 3));
+          break;
+        } catch (e) {
+          lastError = e;
+          await _releaseOurStaleListenersOn(port);
+        }
+      }
+      if (server == null) throw lastError ?? StateError('bind :$port 失败');
       // 上面两个 await 都会让出事件循环：期间可能已断开 / 正在重建 / 换了会话。
       // 那时把监听挂到一条没人要的隧道上，就是本文件反复钉过的那类鬼故事
       // （"已断开的隧道又被在途尝试连回来"），当场收掉。
