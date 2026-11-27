@@ -625,3 +625,62 @@ cookie 名字对不上 + token 已废 → 主文档 401 → 拿同一个废 toke
   （真机截图就是"文…"）。栏上只留 3 个高频动作 + ⋯ 菜单，标题显示文件名并支持
   长按复制「文件名 + 路径 + 链接」。查看器要报错就得知道自己在读哪条路——
   `ArtifactViewerScreen.path` 就是为此而加（此前它根本不知道自己读的是哪条路径）。
+
+## 设备管理插件"模型搞不清设备"：提示词段要慢变 + 可执行 + 认人话（2026-11-27）
+
+用户报"模型经常搞不清楚设备"。注入链路本来是通的（`systemPrompt.section()`），坏在**内容**上。四条根因，
+都是机制层面的，不是模型能力问题：
+
+- **易变字段写进了系统提示词**。旧版把电量/屏幕/锁屏/前台应用印进 section，后台 30 秒刷一次 facts，
+  而 DSH 的规则是 *section 文本一变就 append 一条 `system/message`*（`dsh-system-prompt` 的
+  `systemUpdates()` / `assembleSystemAdmission()`）。于是会话里同时躺着十几版互相矛盾的设备表，
+  模型回看历史就引用过期那版。**现在 section 只放慢变事实**（身份/别名/通道/可用性/`adb -s` 目标），
+  电量屏幕交给 `adb_devices{action:"status"|"inspect"}` 现取；采集时间用粗粒度分桶
+  （30 秒内／2 分钟内／10 分钟内／已过期），否则"上次更新时间"自己就是抖动源。
+  回归断言在 selftest：facts 变了 → 渲染文本必须逐字节相同。
+- **给了 ID 却没说怎么用**。只印 endpoint 和序列号，模型拿型号名当 `adb -s` 参数（`adb -s 2211133C`），
+  连不上就误判"设备掉线"。现在清单里每台直接给可照抄的 `-s` 目标（网络＝`IP:端口`，USB＝序列号）＋备用通道，
+  并写明"型号名不能当 `-s` 参数"；`device not found` 的第一排查项就是抄错了参数。
+- **人话对不上代号**。用户说"小米13"，注册表里是 `2211133C`/`M2012K11AC`。新增 `device.aliases`
+  （`action:"name"` 或面板命名），进提示词「名字」列；所有入口的 `serials` 都接受
+  序列号／型号／`IP:5555`／别名（`normalizeRef` 吃全角、空格、连字符），解析失败**必须回候选设备**
+  （含别名与 adb 目标）——只回"没有这台设备"模型就放弃了。别名跨设备查重是硬约束：
+  两个设备共用一个称呼比没别名更糟，会解析到错的机器。
+- **面板 3 秒一闪**。`call2()` 每次轮询都 `setBusy` → 整排按钮反复 disabled；`PANEL_MS` 还硬编码在
+  Client 里。现在节奏由 Host 下发（`list` 返回 `data.poll`，默认 `panelMs:60000`/`badgeMs:30000`，
+  注意**用户 patch 层会覆盖包内默认**，`~/.dsh/profiles/web/cordis.patch.yml` 已同步改），
+  后台刷新走 silent（不碰 busy），页面不可见不轮询，快照内容不变就复用旧引用不重排。
+
+另外两个坑，改这块必须知道：
+
+- section 必须 `interpolate: false`。设备 `notes`/型号是外部可控文本，里面出现 `{{x}}` 会让 DSH 插值
+  **抛错**（`unknown prompt variable`），而这段拼进**每个会话**的系统提示词——等于全站提示词挂掉。
+- `package.json` 的 `files` 少列一个 `lib/*.js`，打包安装就 `ERR_MODULE_NOT_FOUND`（历史上 `lib/args.js`
+  踩过一次，这次新增 `lib/prompt.js` 同步补上；`tools/pack.mjs` 按 `files` 打包，不报错只是少文件）。
+- 提示词段可自证：`adb_devices{action:"prompt"}` 回读当前注入原文（匿名可读，`curl` 也行），
+  排查"模型到底看到了什么"不必再靠猜。
+
+## 接手收尾：注入已上线 + 验证期又挖出两个硬 bug（2026-11-28 凌晨）
+
+改动全部部署 node_modules 并重启生效，doctor 全绿，`prompt`/别名解析实测通过。两条部署纪律：
+
+- **部署核对必须逐文件 `cmp`**：`diff -rq 源 已装 | grep -v node_modules` 会把差异行也滤掉
+  （差异行文本里含 node_modules 路径），client.js 就这么漏部署了一次（00:26 的解包修正没同步）。
+- `dsh web` 的启动 token 每次重启重新生成（只打在 journalctl 那一行）；写操作（name/inspect）
+  认证要取**当次** token，旧 token 一律 401。
+
+验证期挖出的两个机制 bug，都已修：
+
+- **冷启动竞态：工具没挂上模型照旧说话**。`apply()` 同步跑时 tools 服务常未就绪；旧代码等服务
+  到了也只记账不补注册（"激活窗口已过"）——重启后 `adb_devices` 整个缺席，而 doctor 判定
+  `registration.tool !== 'failed'` 拿带后缀长串（'failed（…）'）做精确比较永远不成立，
+  **真失败也画绿勾**。现在与路由/提示词段同款三段式（立即 → `ctx.inject` → `waitForService`），
+  服务一到**真正补注册**；`registration.tool` 收敛成 'ok'/'pending'/'failed'，doctor 判 `=== 'ok'`；
+  RPC 块里把 tool 记账抢改成 'ok' 的污染一并拔掉（那是面板通道，不是工具）。
+- **JSON 字符串当 `names` 传 → 注册表躺脏别名**。模型把数组整成 `'["自检机","测试机A"]'`
+  字符串传回，`setAliases` 按分隔符硬拆，方括号引号成了名字，注入表里躺着
+  `["自检机"、"测试机A"]`。现在先试 `JSON.parse` 再走分隔符拆分；非 JSON 的
+  「自检机、测试机A」照旧拆（selftest 200 项含两条例子）。
+
+端到端证据：`/adb-devices/prompt` 匿名回读=注入原文；`测试机A` → `43328e37` → adb 目标
+`100.75.247.55:5555`，称呼/目标选择全对（那台 Tailscale 当时确不在线，表里如实标"不可用"）。
