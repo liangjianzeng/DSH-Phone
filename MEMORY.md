@@ -684,3 +684,23 @@ cookie 名字对不上 + token 已废 → 主文档 401 → 拿同一个废 toke
 
 端到端证据：`/adb-devices/prompt` 匿名回读=注入原文；`测试机A` → `43328e37` → adb 目标
 `100.75.247.55:5555`，称呼/目标选择全对（那台 Tailscale 当时确不在线，表里如实标"不可用"）。
+
+## geekpro（Windows）部署事实与远控手法（2026-11-28）
+
+给 geekpro 同步 0.1.6 插件时摸清的机器事实：
+
+- **SSH 免密直达**：`ssh jianz@100.100.140.75`（Tailscale `liang-geekpro`，密钥已配，口令用不上）。
+  默认 shell 是 cmd。
+- **dsh web 不自启**：geekpro 上没有常驻 dsh web（3080 无监听），插件更新**无需重启**，下次启动自然生效。
+  常驻的 node 只有 zcode-phone-server（`E:\DTXY\DSH-Phone\zcode-phone-server\server.mjs`）、ZCode、WorkBuddy。
+- **插件落点**：`C:\Users\jianz\.dsh\profiles\web\node_modules\@local\dsh-device-manager`（真目录非链接）；
+  用户层 patch 同目录 `cordis.patch.yml`。node 用 `C:\Program Files\nodejs\node.exe`（v20.19.5；
+  `C:\nvm4w\nodejs` 这个 nvm4w 链接在 ssh 会话里 Test-Path 为 False，别信进程 Path 字段）。
+- **E:\DTXY\DSH-Phone 检出勿动**：那是 Flutter 开发线，`main` 上挂着大量未提交改动（lib/*.dart 等），
+  不要 pull/checkout/同步；geekpro 的插件更新只动 profile 下的已装副本。
+- **远控 Windows 的坑**（都踩过一遍）：
+  1. ps1 脚本必须**纯 ASCII**——PowerShell 5.1 按 GBK 读 UTF-8 文件，中文注释直接解析报错；
+  2. `wmic` 已移除，进程命令行用 `Get-CimInstance Win32_Process`；
+  3. ssh→cmd→PowerShell 的内联引号必碎（`& node -e "…"` 的双引号会被吞），
+     一律"本地写脚本 → scp → `powershell -File` 执行"，node 侧用落盘 .mjs 而非 `-e`；
+  4. 哈希对拍注意 CRLF：PowerShell 输出经 ssh 回来带 `\r`，比对前 `tr -d '\r'`。
