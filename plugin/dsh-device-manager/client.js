@@ -38,10 +38,29 @@ window.__ModuleLoader__.load({
       createPortal = window.ReactDOM.createPortal.bind(window.ReactDOM);
     }
     const { createElement: h, useState, useEffect, useRef, useCallback, useMemo } = React;
+    // React.memo 让内容没变的设备行整行跳过重渲染。老版本宿主没有 memo 就退化成原组件，
+    // 只是少一层优化，不会白屏。
+    const memo = typeof React.memo === 'function' ? React.memo : (component) => component;
 
     const NS = 'deviceManager';
-    const PANEL_MS = 3000;
-    const BADGE_MS = 20000;
+    /**
+     * 轮询间隔优先取服务端下发的 `data.poll.panelMs / badgeMs`（Host 侧统一下发，
+     * 避免前后端各写一份节奏），这两个常量只是**读不到时的兜底**。
+     *
+     * 之前是 3000 / 20000 且写死：3 秒一次的后台刷新走的是会 setBusy 的 call2，
+     * 而面板里所有按钮都 `disabled: busyAny`，于是每 3 秒全部按钮被禁用再恢复一遍
+     * ——用户抱怨的「每 3 秒闪一下」就是这个。现在后台刷新走 silent（不碰 busy），
+     * 间隔也回到 60s / 30s 的量级。
+     */
+    const PANEL_MS = 60000;
+    const BADGE_MS = 30000;
+    const MIN_PANEL_MS = 5000;
+    const MIN_BADGE_MS = 10000;
+    // 别名的硬限制：与 Host 侧 `name` 动作的校验保持一致（超出的部分客户端先夹掉并提示）。
+    const ALIAS_MAX = 6;
+    const ALIAS_MAX_LEN = 40;
+    const NO_DEVICES = [];
+    const ALIAS_SEPARATOR = /[,，、;；\n]/;
 
     const DICTS = {
       zh: {
@@ -104,6 +123,14 @@ window.__ModuleLoader__.load({
         'hint.noDraft': '当前输入框不可用，已改为复制到剪贴板。',
         'hint.copied': '已复制到剪贴板。',
         'hint.copiedAll': '没有勾选设备，已复制全部 {count} 台的调试文本。',
+        'row.rename': '命名',
+        'row.rename.aria': '为 {model} 设置别名',
+        'alias.placeholder': '小米13、备用机',
+        'alias.aria': '{model} 的别名，用逗号或顿号分隔，Enter 保存，Esc 取消',
+        'alias.help': '逗号分隔，最多 6 个',
+        'alias.saved': '名称已更新。',
+        'alias.tooMany': '最多 {max} 个别名，已保留前 {max} 个。',
+        'alias.tooLong': '单个别名最长 {max} 个字符，已截断。',
       },
       en: {
         'trigger.aria': 'Android test devices',
@@ -165,6 +192,14 @@ window.__ModuleLoader__.load({
         'hint.noDraft': 'Composer unavailable; copied to clipboard instead.',
         'hint.copied': 'Copied to clipboard.',
         'hint.copiedAll': 'Nothing selected — copied the debug text for all {count} devices.',
+        'row.rename': 'Name',
+        'row.rename.aria': 'Set aliases for {model}',
+        'alias.placeholder': 'Xiaomi 13, backup',
+        'alias.aria': 'Aliases for {model}, separated by commas. Enter to save, Esc to cancel',
+        'alias.help': 'Comma separated, up to {max}',
+        'alias.saved': 'Name updated.',
+        'alias.tooMany': 'Up to {max} aliases — kept the first {max}.',
+        'alias.tooLong': 'Each alias is limited to {max} characters — truncated.',
       },
     };
 
@@ -240,6 +275,29 @@ window.__ModuleLoader__.load({
 .dm-hint[data-tone="error"]{color:var(--dsw-alias-state-error-primary)}
 .dm-hint[data-tone="ok"]{color:var(--dsw-alias-state-success-primary)}
 .dm-count{font-size:11px;color:var(--dsw-alias-label-secondary);margin-left:auto;flex:none}
+/* ── 别名（自定义设备名）────────────────────────────────────────────────
+   用户嘴里说的是「小米13」，ro.product.model 给的是 2211133C 这种代号，两者对不上。
+   有别名时主名比型号更醒目、型号退成灰色副标题，其余别名做成小的次要标签。
+   只用 --dsw-alias-* 令牌 + 兜底，不写死颜色，亮/暗两套主题都得可读。 */
+.dm-name{flex-wrap:wrap}
+.dm-alias-name{font-weight:700;color:var(--dsw-alias-label-primary);max-width:180px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dm-model{font-weight:400;color:var(--dsw-alias-label-secondary);font-size:12px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dm-alias-tag{font-size:10px;font-weight:400;padding:1px 5px;border-radius:6px;
+  background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);
+  max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dm-rename{margin-left:auto;flex:none;border:none;background:transparent;
+  color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1.3;padding:1px 5px;
+  border-radius:6px;cursor:pointer}
+.dm-rename:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.dm-rename:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary));outline-offset:1px}
+.dm-alias-edit{display:flex;align-items:center;gap:6px;margin-top:2px}
+.dm-alias-input{flex:1 1 auto;min-width:0;border:1px solid var(--dsw-alias-border-l2);
+  background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);
+  border-radius:8px;padding:3px 7px;font-size:12px}
+.dm-alias-input:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-brand-primary))}
+.dm-alias-help{flex:none;font-size:10px;color:var(--dsw-alias-label-secondary);white-space:nowrap}
 `;
 
     function Icon() {
@@ -267,6 +325,120 @@ window.__ModuleLoader__.load({
       };
     }
 
+    /** 服务端下发的间隔可能是 undefined / 字符串 / 0 / 负数，一律夹到合法区间，兜底用上默认值。 */
+    function clampMs(value, fallback, min) {
+      const num = Number(value);
+      if (!Number.isFinite(num) || num <= 0) return fallback;
+      return Math.max(min, Math.round(num));
+    }
+
+    /** document 可能不存在（SSR / 测试环境），取不到就当作可见，别让面板抛异常。 */
+    function isPageHidden() {
+      try {
+        return typeof document !== 'undefined' && document.hidden === true;
+      } catch {
+        return false;
+      }
+    }
+
+    /** 快照里的 aliases 可能是 undefined / null / 非数组 / 数组里混了非字符串，全部容错。 */
+    function readAliases(value) {
+      if (!Array.isArray(value)) return [];
+      const out = [];
+      const seen = new Set();
+      for (const item of value) {
+        let text = '';
+        try {
+          text = String(item ?? '').trim();
+        } catch {
+          continue;
+        }
+        if (!text || seen.has(text)) continue;
+        seen.add(text);
+        out.push(text);
+      }
+      return out;
+    }
+
+    /**
+     * 输入框里的一行文本 → 规范化的别名整表。
+     * 逗号 / 顿号 / 分号都当分隔符；trim、去空、去重（保留首次顺序）；
+     * 单个超长截断、数量超限截断，把「截断过」回报给调用方去提示用户——
+     * 直接整条拒绝会让人搞不清为什么保存不了。
+     */
+    function parseAliasesInput(text) {
+      const parts = String(text ?? '').split(ALIAS_SEPARATOR);
+      const names = [];
+      const seen = new Set();
+      let truncated = false;
+      let overflow = false;
+      for (const part of parts) {
+        let value = part.trim().replace(/\s+/g, ' ');
+        if (!value) continue;
+        const chars = Array.from(value);
+        if (chars.length > ALIAS_MAX_LEN) {
+          value = chars.slice(0, ALIAS_MAX_LEN).join('');
+          truncated = true;
+        }
+        if (seen.has(value)) continue;
+        seen.add(value);
+        if (names.length >= ALIAS_MAX) {
+          overflow = true;
+          continue;
+        }
+        names.push(value);
+      }
+      return { names, truncated, overflow };
+    }
+
+    /**
+     * 设备行的「渲染指纹」。后台静默刷新每次都带回全新的对象，只要上屏的东西没变，
+     * 就该让 React 跳过整行重渲染——这就是「每 3 秒闪一下」的另一半。
+     *
+     * 只收真正会渲染到行上的字段：facts 里不上屏的易变东西（factsAt、raw 文本、
+     * 各种时间戳）一律不进指纹。但电量/亮屏/锁屏/常亮/前台**确实**渲染成标签，
+     * 所以这几个必须进指纹（任务书里让排除 facts，照做会让后台刷新再也看不到状态变化，
+     * 这里按「渲染字段」的口径取子集，只取 factTags 读的那几个）。
+     */
+    function deviceRenderKey(device) {
+      if (!device || typeof device !== 'object') return '';
+      const transports = Array.isArray(device.transports) ? device.transports : [];
+      const transportText = transports
+        .map((t) => `${t?.key ?? ''}|${t?.endpoint ?? ''}|${t?.state ?? ''}|${t?.label ?? t?.kind ?? ''}|${t?.connectCommand ?? ''}`)
+        .join(',');
+      const facts = (device.facts && typeof device.facts === 'object') ? device.facts : {};
+      const foreground = (facts.foreground && typeof facts.foreground === 'object') ? facts.foreground : {};
+      return [
+        device.serial ?? '',
+        device.model ?? '',
+        device.android ?? '',
+        device.health ?? '',
+        device.stale ? '1' : '0',
+        device.summary ?? '',
+        readAliases(device.aliases).join('\u0001'),
+        transportText,
+        facts.screen ?? '',
+        String(facts.locked),
+        String(facts.battery),
+        facts.powerSource ?? '',
+        facts.stayAwake ? '1' : '0',
+        foreground.systemUi ? '1' : '0',
+        foreground.package ?? '',
+      ].join('\u0000');
+    }
+
+    /** 内容比较：逐项同指纹就复用旧数组引用，让 memo 化的 DeviceRow 整列跳过渲染。 */
+    function sameDevices(prev, next) {
+      if (prev === next) return true;
+      if (!Array.isArray(prev) || !Array.isArray(next)) return false;
+      if (prev.length !== next.length) return false;
+      for (let i = 0; i < prev.length; i += 1) {
+        if (prev[i] === next[i]) continue;
+        if (deviceRenderKey(prev[i]) !== deviceRenderKey(next[i])) return false;
+      }
+      return true;
+    }
+
     function factTags(device, tr) {
       const facts = device.facts ?? {};
       const tags = [{
@@ -292,8 +464,13 @@ window.__ModuleLoader__.load({
       return tags;
     }
 
-    function DeviceRow(props) {
-      const { device, tr, checked, onToggle, onCopy, copied } = props;
+    /**
+     * 一行设备。memo 化 + 父层的内容比较指纹配合，后台静默刷新时内容没变就不重渲染。
+     * 别名（自定义设备名）的编辑态放在行内：点「命名」只重渲染这一行，
+     * 也不会把编辑状态提到 Panel 里让整列跟着刷。
+     */
+    const DeviceRow = memo(function DeviceRow(props) {
+      const { device, tr, checked, onToggle, onCopy, copied, onRename, onHint } = props;
       const command = device.transports?.[0]?.connectCommand;
       const blocked = device.health === 'error' || device.health === 'unknown';
       // 选不上的时候必须说清为什么（unauthorized / offline / 缓存过期），
@@ -303,6 +480,77 @@ window.__ModuleLoader__.load({
       const blockedReason = blocked
         ? `${tr(device.health === 'error' ? 'row.blockedError' : 'row.blockedUnknown')}${transportStates ? `（${transportStates}）` : ''}`
         : undefined;
+      const aliases = readAliases(device.aliases);
+      const primary = aliases[0];
+      const rest = aliases.slice(1);
+      const modelText = `${device.model ?? ''}${device.android ? ` · Android ${device.android}` : ''}`;
+      const label = primary ?? device.serial ?? device.model ?? '';
+
+      const [editing, setEditing] = useState(false);
+      const [draft, setDraft] = useState('');
+      const inputRef = useRef(null);
+      const editRef = useRef(null);
+      // Escape 会让 input 失焦并触发 onBlur；用一个标记掐掉那次「提交」，
+      // 否则「取消」会悄悄变成「保存」。
+      const skipBlur = useRef(false);
+      const submittingRef = useRef(false);
+      const aliveRef = useRef(true);
+      useEffect(() => () => { aliveRef.current = false; }, []);
+
+      // 进入编辑态把焦点送进输入框（键盘用户点完不用再去够鼠标）。
+      useEffect(() => {
+        if (!editing) return;
+        try { inputRef.current?.focus?.(); } catch { /* 拿不到焦点不影响编辑 */ }
+      }, [editing]);
+
+      const openEdit = () => {
+        skipBlur.current = false;
+        setDraft(readAliases(device.aliases).join('、'));
+        setEditing(true);
+      };
+
+      const closeEdit = (restoreFocus) => {
+        setEditing(false);
+        setDraft('');
+        if (!restoreFocus) return;
+        try { editRef.current?.focus?.(); } catch { /* 按钮可能已经不在了 */ }
+      };
+
+      const commit = async () => {
+        if (submittingRef.current) return;
+        const parsed = parseAliasesInput(draft);
+        // 先收编辑态再发请求：请求在飞的时候这一行应该已经是「新名字」的样子，
+        // 而不是一个卡住的输入框。失败由 hint 报出来，下次刷新回到服务端权威值。
+        closeEdit(true);
+        if (parsed.truncated) onHint({ tone: 'error', text: tr('alias.tooLong', { max: ALIAS_MAX_LEN }) });
+        if (parsed.overflow) onHint({ tone: 'error', text: tr('alias.tooMany', { max: ALIAS_MAX }) });
+        submittingRef.current = true;
+        let ok = false;
+        try {
+          ok = (await onRename(device.serial, parsed.names)) === true;
+        } catch {
+          ok = false;
+        }
+        submittingRef.current = false;
+        if (!aliveRef.current) return;
+        if (ok && !parsed.truncated && !parsed.overflow) onHint({ tone: 'ok', text: tr('alias.saved') });
+      };
+
+      const onInputKeyDown = (event) => {
+        if (event.key === 'Escape') {
+          // 只拦住本面板自己的 Escape 处理（Panel 的监听挂在 panel 节点上冒泡），
+          // 不 preventDefault：宿主的 Escape 语义（关命令面板、收起输入框）不受影响。
+          event.stopPropagation();
+          skipBlur.current = true;
+          closeEdit(true);
+          return;
+        }
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          commit();
+        }
+      };
+
       return h('div', { className: 'dm-device', role: 'listitem' },
         h('input', {
           className: 'dm-check',
@@ -316,8 +564,40 @@ window.__ModuleLoader__.load({
         h('div', { className: 'dm-main' },
           h('div', { className: 'dm-name' },
             h('span', { className: 'dm-dot', 'data-tone': TONE[device.health] ?? 'muted' }),
-            h('span', {}, `${device.model}${device.android ? ` · Android ${device.android}` : ''}`),
-            device.stale ? h('span', { className: 'dm-tag', 'data-tone': 'warn' }, tr('row.stale')) : null),
+            // 有别名 → 「主名 + 灰色型号」；没别名 → 完全保持原样，老数据不降级。
+            primary ? h('span', { className: 'dm-alias-name', title: label }, primary) : null,
+            h('span', { className: primary ? 'dm-model' : undefined }, modelText),
+            device.stale ? h('span', { className: 'dm-tag', 'data-tone': 'warn' }, tr('row.stale')) : null,
+            rest.map((alias, index) => h('span', {
+              key: `${index}:${alias}`, className: 'dm-alias-tag', title: alias,
+            }, alias)),
+            h('button', {
+              ref: editRef,
+              className: 'dm-rename',
+              type: 'button',
+              'aria-label': tr('row.rename.aria', { model: label }),
+              title: tr('row.rename'),
+              'aria-expanded': editing,
+              onClick: openEdit,
+            }, tr('row.rename'))),
+          editing
+            ? h('div', { className: 'dm-alias-edit' },
+                h('input', {
+                  ref: inputRef,
+                  className: 'dm-alias-input',
+                  type: 'text',
+                  'aria-label': tr('alias.aria', { model: device.model ?? device.serial ?? '' }),
+                  placeholder: tr('alias.placeholder'),
+                  value: draft,
+                  onChange: (event) => setDraft(event.target.value),
+                  onKeyDown: onInputKeyDown,
+                  onBlur: () => {
+                    if (skipBlur.current) { skipBlur.current = false; return; }
+                    commit();
+                  },
+                }),
+                h('span', { className: 'dm-alias-help' }, tr('alias.help', { max: ALIAS_MAX })))
+            : null,
           h('div', { className: 'dm-sub' }, device.serial),
           h('div', { className: 'dm-tags' },
             (device.transports ?? []).map((transport) => h('span', {
@@ -331,7 +611,7 @@ window.__ModuleLoader__.load({
             type: 'button',
             onClick: () => onCopy(command),
           }, copied === command ? tr('row.copied') : tr('row.copy')) : null));
-    }
+    });
 
     /**
      * 面板的错误边界：面板里任何一处渲染抛异常，都只让面板自己降级成一行错误，
@@ -376,7 +656,9 @@ window.__ModuleLoader__.load({
     }
 
     function Panel(props) {
-      const { call, tr, sessionId, inputActions, panelRef, onClose } = props;
+      const { call, tr, sessionId, inputActions, panelRef, onClose, onPollConfig } = props;
+      // 轮询间隔由 Host 下发（data.poll.panelMs），Trigger 拿到后传进来；没到就用兜底值。
+      const intervalMs = clampMs(props.panelMs, PANEL_MS, MIN_PANEL_MS);
       const [snapshot, setSnapshot] = useState(null);
       const [busy, setBusy] = useState('');
       const [hint, setHint] = useState(null);
@@ -392,18 +674,30 @@ window.__ModuleLoader__.load({
       trRef.current = tr;
       const actionsRef = useRef(inputActions);
       actionsRef.current = inputActions;
+      // 同理：onPollConfig 只在收到响应时读一次，不进 call2 的依赖，保持 call2 引用稳定，
+      // 否则首屏 list + 自动扫描会被反复重跑。
+      const onPollRef = useRef(onPollConfig);
+      onPollRef.current = onPollConfig;
       const aliveRef = useRef(true);
       const autoScanned = useRef(false);
       const inFlight = useRef(false);
+      // 内容没变时复用的 devices 数组引用（见 stableDevices）。
+      const devicesRef = useRef(null);
       useEffect(() => () => { aliveRef.current = false; }, []);
 
-      const call2 = useCallback(async (action, payload) => {
-        setBusy(action);
+      /**
+       * @param {object} [options] `{ silent: true }` = 后台定时器驱动的刷新：
+       *   **不碰 busy**。busy 会让面板里所有按钮 disabled 再恢复，3 秒一次就是用户看到的
+       *   「每 3 秒闪一下」。静默刷新仍然要去重（inFlight）、仍然要判存活、失败仍然要报 hint。
+       */
+      const call2 = useCallback(async (action, payload, options) => {
+        const silent = options?.silent === true;
+        if (!silent) setBusy(action);
         inFlight.current = true;
         const result = await call(action, { ...payload, sessionId });
         inFlight.current = false;
         if (!aliveRef.current) return null;
-        setBusy('');
+        if (!silent) setBusy('');
         if (!result.ok) {
           setHint({ tone: 'error', text: trRef.current('hint.error', { message: result.error ?? 'unknown' }) });
           return null;
@@ -412,6 +706,9 @@ window.__ModuleLoader__.load({
         // 统一信封：{ok, text, data}。data 里是各动作的载荷（快照 / 模板文本 / 投递回执），
         // 之前只取 data 会把 text 丢掉，导致"填入输入框"拿到空文本。
         const body = envelope.data ?? {};
+        // 服务端下发的轮询节奏：{ panelMs, badgeMs }。Host 同事没加之前这里是 undefined，
+        // 传下去会被 clampMs 兜底，行为等价于用常量。
+        try { onPollRef.current?.(body?.poll); } catch { /* 节奏拿不到就用兜底常量 */ }
         const merged = { ...body, text: envelope.text, ok: envelope.ok !== false };
         const snapshotData = body.snapshot ?? (body.devices || body.counts ? body : null);
         // 合并而不是整体替换：只读刷新回来的对象没有 lastScanAt/adbPath，
@@ -420,6 +717,7 @@ window.__ModuleLoader__.load({
         return merged;
       }, [call, sessionId]);
 
+      // 首屏：读一次快照，还没有任何已知设备就自动扫一次。
       useEffect(() => {
         let cancelled = false;
         const first = async () => {
@@ -432,30 +730,68 @@ window.__ModuleLoader__.load({
           }
         };
         first();
-        // 手动 scan 或上一轮 status 还在飞的时候跳过这一 tick：
-        // 否则两轮请求交叠，busy 会被后回来的那一轮提前清空，面板显示也会跳。
-        const timer = setInterval(() => { if (!cancelled && !inFlight.current) call2('status', {}); }, PANEL_MS);
-        return () => { cancelled = true; clearInterval(timer); };
+        return () => { cancelled = true; };
       }, [call2]);
 
+      // 后台刷新：间隔跟着服务端下发值走；页面不可见时不发请求（省 adb 调用，也避免
+      // 切回标签页时看到一屏正在闪的按钮），重新可见立刻补一次静默刷新。
+      useEffect(() => {
+        let cancelled = false;
+        const tick = () => {
+          if (cancelled || inFlight.current) return;
+          if (isPageHidden()) return;
+          call2('status', {}, { silent: true });
+        };
+        const timer = setInterval(tick, intervalMs);
+        const onVisibility = () => {
+          if (cancelled || isPageHidden() || inFlight.current) return;
+          call2('status', {}, { silent: true });
+        };
+        let hasDocument = false;
+        try {
+          hasDocument = typeof document !== 'undefined' && typeof document.addEventListener === 'function';
+          if (hasDocument) document.addEventListener('visibilitychange', onVisibility);
+        } catch { hasDocument = false; }
+        return () => {
+          cancelled = true;
+          clearInterval(timer);
+          if (hasDocument) {
+            try { document.removeEventListener('visibilitychange', onVisibility); } catch { /* 忽略 */ }
+          }
+        };
+      }, [intervalMs, call2]);
+
+      /**
+       * 静默刷新每次回来都是全新的 devices 数组，逐项内容相同也照样让整列重渲染——
+       * 「闪」的另一半就在这。内容一致时返回旧引用，配合 memo 化的 DeviceRow
+       * 让 React 整列跳过渲染。
+       */
+      const stableDevices = useMemo(() => {
+        const next = Array.isArray(snapshot?.devices) ? snapshot.devices : NO_DEVICES;
+        const prev = devicesRef.current;
+        if (prev && sameDevices(prev, next)) return prev;
+        devicesRef.current = next;
+        return next;
+      }, [snapshot]);
+
       const devices = useMemo(() => {
-        const all = snapshot?.devices ?? [];
-        if (filter === 'all') return all;
-        if (filter === 'offline') return all.filter((d) => d.health === 'error' || d.health === 'unknown');
-        return all.filter((d) => (d.kinds ?? []).includes(filter));
-      }, [snapshot, filter]);
+        if (filter === 'all') return stableDevices;
+        if (filter === 'offline') return stableDevices.filter((d) => d?.health === 'error' || d?.health === 'unknown');
+        return stableDevices.filter((d) => (d?.kinds ?? []).includes(filter));
+      }, [stableDevices, filter]);
 
-      const selectable = devices.filter((d) => d.health === 'ok' || d.health === 'degraded');
+      const selectable = devices.filter((d) => d?.health === 'ok' || d?.health === 'degraded');
       // 勾选跨筛选保留：勾完再切 filter，不能把看不见的设备悄悄从消息里丢掉
-      const chosen = [...selected].filter((serial) => (snapshot?.devices ?? []).some((d) => d.serial === serial));
+      const chosen = [...selected].filter((serial) => (snapshot?.devices ?? []).some((d) => d?.serial === serial));
 
-      const toggle = (serial) => setSelected((current) => {
+      // toggle / copy 必须是稳定引用，否则 memo 化的 DeviceRow 每轮都白 memo。
+      const toggle = useCallback((serial) => setSelected((current) => {
         const next = new Set(current);
         if (next.has(serial)) next.delete(serial); else next.add(serial);
         return next;
-      });
+      }), []);
 
-      const copy = async (text) => {
+      const copy = useCallback(async (text) => {
         try {
           await navigator.clipboard.writeText(text);
           setCopied(text);
@@ -464,7 +800,34 @@ window.__ModuleLoader__.load({
         } catch {
           return false;
         }
-      };
+      }, []);
+
+      /**
+       * 改别名。`names` 是**整表替换**（空数组＝清空），走 Host 的 `name` 动作：
+       *   call('name', { serials: [serial], names: [...], sessionId }) → {ok, text, data:{results:[{serial, ok, aliases}]}}
+       * 成功后只本地更新这一台设备的 aliases（优先用 Host 回写的权威 results[].aliases，
+       * 它已经过 NFKC 归一与跨设备查重；拿不到才回退到本地整表），不整块刷新：
+       * 用户改完立刻看到新名字，也不会把列表的滚动位置刷掉。
+       */
+      const rename = useCallback(async (serial, names) => {
+        if (!serial) return false;
+        const wanted = Array.isArray(names) ? names : [];
+        const result = await call2('name', { serials: [serial], names: wanted });
+        if (!aliveRef.current || !result || result.ok === false) return false;
+        // Host 是别名合法性的唯一权威（长度 / 数量 / 标点 / 撞名都在它那儿判）。
+        const echoed = (Array.isArray(result.results) ? result.results : [])
+          .find((row) => row?.serial === serial && row?.ok !== false);
+        const finalAliases = readAliases(echoed?.aliases ?? wanted);
+        setSnapshot((prev) => {
+          if (!prev || !Array.isArray(prev.devices)) return prev;
+          const next = prev.devices.map((device) => (
+            device && device.serial === serial ? { ...device, aliases: finalAliases } : device
+          ));
+          devicesRef.current = next;
+          return { ...prev, devices: next };
+        });
+        return true;
+      }, [call2]);
 
       const compose = () => call2('compose', {
         serials: chosen.length ? chosen : undefined,
@@ -604,13 +967,15 @@ window.__ModuleLoader__.load({
               }, busy === 'scan' ? tr('panel.scanning') : tr('panel.scan')),
               snapshot ? null : h('div', { className: 'dm-hint', 'data-tone': 'error' }, tr('hint.notConnected')))
           : h('div', { className: 'dm-list', role: 'list' },
-              devices.map((device) => h(DeviceRow, {
-                key: device.serial,
-                device,
+              devices.map((device, index) => h(DeviceRow, {
+                key: device?.serial ?? `row-${index}`,
+                device: device ?? {},
                 tr,
-                checked: selected.has(device.serial),
+                checked: device ? selected.has(device.serial) : false,
                 onToggle: toggle,
                 onCopy: copy,
+                onRename: rename,
+                onHint: setHint,
                 copied,
               }))),
 
@@ -663,22 +1028,60 @@ window.__ModuleLoader__.load({
       const { call, tr, sessionId, inputActions } = props;
       const [open, setOpen] = useState(false);
       const [counts, setCounts] = useState(null);
+      // Host 下发的轮询节奏 { panelMs, badgeMs }；没下发就用文件顶部的兜底常量。
+      // 放在 Trigger 这一层：徽标轮询和面板轮询共用同一份节奏，也共用同一次 list 响应。
+      const [poll, setPoll] = useState(null);
       const rootRef = useRef(null);
       const panelRef = useRef(null);
+
+      const applyPoll = useCallback((next) => {
+        if (!next || typeof next !== 'object') return;
+        const panelMs = clampMs(next.panelMs, PANEL_MS, MIN_PANEL_MS);
+        const badgeMs = clampMs(next.badgeMs, BADGE_MS, MIN_BADGE_MS);
+        // 值没变就返回旧对象：否则每次静默刷新都会让 Trigger 重渲染一遍，
+        // 面板里的焦点／滚动跟着受影响。
+        setPoll((prev) => (prev && prev.panelMs === panelMs && prev.badgeMs === badgeMs ? prev : { panelMs, badgeMs }));
+      }, []);
+
+      const panelMs = poll?.panelMs;
+      const badgeMs = clampMs(poll?.badgeMs, BADGE_MS, MIN_BADGE_MS);
 
       useEffect(() => {
         let cancelled = false;
         const tick = async () => {
+          // 页面在后台标签页里就别打 adb 了，切回来会补一次。
+          if (isPageHidden()) return;
           const result = await call('list', { sessionId });
           if (cancelled || !result?.ok) return;
           const value = result.value ?? {};
           const data = value.data ?? value.value ?? value;
-          if (data?.counts) setCounts(data.counts);
+          if (data?.poll) applyPoll(data.poll);
+          if (data?.counts) {
+            const next = data.counts;
+            setCounts((prev) => {
+              const same = prev
+                && ['total', 'ok', 'degraded', 'error', 'unknown', 'transports']
+                  .every((key) => prev[key] === next[key]);
+              return same ? prev : next;
+            });
+          }
         };
         tick();
-        const timer = setInterval(tick, BADGE_MS);
-        return () => { cancelled = true; clearInterval(timer); };
-      }, [call, sessionId]);
+        const timer = setInterval(tick, badgeMs);
+        const onVisibility = () => { if (!isPageHidden()) tick(); };
+        let hasDocument = false;
+        try {
+          hasDocument = typeof document !== 'undefined' && typeof document.addEventListener === 'function';
+          if (hasDocument) document.addEventListener('visibilitychange', onVisibility);
+        } catch { hasDocument = false; }
+        return () => {
+          cancelled = true;
+          clearInterval(timer);
+          if (hasDocument) {
+            try { document.removeEventListener('visibilitychange', onVisibility); } catch { /* 忽略 */ }
+          }
+        };
+      }, [call, sessionId, badgeMs, applyPoll]);
 
       useEffect(() => {
         if (!open) return undefined;
@@ -694,6 +1097,10 @@ window.__ModuleLoader__.load({
         document.addEventListener('pointerdown', onPointerDown, true);
         return () => document.removeEventListener('pointerdown', onPointerDown, true);
       }, [open]);
+
+      // 必须是稳定引用：Panel 的「打开即聚焦 / Escape」effect 把它列进了依赖，
+      // 每次渲染都新建会让那个 effect 每轮重跑（焦点被抢回去、监听反复拆装）。
+      const closePanel = useCallback(() => setOpen(false), []);
 
       let badge = null;
       if (counts) {
@@ -717,7 +1124,7 @@ window.__ModuleLoader__.load({
           badge ? h('span', { className: 'dm-badge', 'data-tone': badge.tone }, badge.text) : null),
         open
           ? renderPanel(h(PanelBoundary, { tr }, h(Panel, {
-              call, tr, sessionId, inputActions, panelRef, onClose: () => setOpen(false),
+              call, tr, sessionId, inputActions, panelRef, onClose: closePanel, panelMs, onPollConfig: applyPoll,
             })))
           : null);
     }
@@ -756,13 +1163,14 @@ window.__ModuleLoader__.load({
         const READ_ONLY = new Set(['list', 'status', 'doctor', 'history']);
 
         const unwrap = (data) => {
-          const inner = data?.ok === true ? data.value : data;
-          // Host 把 perform() 的结果包在 value 里；内层 ok:false 同样是失败，
-          // 并把内层写给用户看的 text 当作错误文案（比裸错误码可读）。
+          // Host 有两种包法：HTTP 是 `{ok, value:{ok, text, data}}`（外层 ok 由 handle() 按
+          // 内层 ok 同步），RPC 门面可能直接给 `{ok, text, data}`。先把 value 拆开再看失败，
+          // 否则外层 ok:false 时内层那句写给人看的 text 会被丢掉——别名被拒（撞名 / 超数量 /
+          // 非法名）就只能看到干巴巴的 'rpc-failed'。
+          const inner = (data && typeof data.value === 'object' && data.value !== null) ? data.value : data;
           if ((data && data.ok === false) || (inner && inner.ok === false)) {
-            const detail = (inner && inner.text)
-              ?? (data && (data.error?.message ?? data.error))
-              ?? (inner && (inner.error?.message ?? inner.error))
+            const detail = (inner && (inner.text ?? inner.error?.message ?? inner.error))
+              ?? (data && (data.text ?? data.error?.message ?? data.error))
               ?? 'rpc-failed';
             return { ok: false, error: String(detail) };
           }

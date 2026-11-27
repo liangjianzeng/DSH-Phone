@@ -85,6 +85,45 @@ export function toSerialList(value) {
   return out;
 }
 
+/**
+ * 「设备称呼」白名单：除了 adb 序列号 / host:port，还要能吃下用户起的别名
+ * （`小米13`、`小米 13`、`Redmi K30 备用`）。这类值**只用于查注册表**，
+ * 真正进 adb 命令行的目标一律取自注册表里的 transport.adbTarget，不经这里。
+ */
+const REF_RE = /^[\p{L}\p{N}][\p{L}\p{N}\p{M} .,:_'\u2019·+@/()\[\]-]{0,63}$/u;
+// 挡掉控制符与任何可能被下游 shell / JSON / URL 重新解释的字符（纵深防御，即使现在不经 shell）。
+const REF_FORBIDDEN = /[\u0000-\u001f\u007f|;&`$<>*?\\"]/;
+
+/**
+ * 与 toSerialList 同样的摊平能力（数组 / 逗号串 / JSON 字符串 / 嵌套），
+ * 但允许 Unicode 字母、数字与空格，用来接"小米13"这种口语称呼。
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+export function toRefList(value) {
+  if (value === undefined || value === null) return [];
+  const atoms = [];
+  if (Array.isArray(value)) {
+    for (const item of value) flatten(item, 0, atoms);
+  } else {
+    flatten(value, 0, atoms);
+  }
+  const seen = new Set();
+  const out = [];
+  for (const atom of atoms) {
+    const ref = atom.replace(/\s+/g, ' ').trim();
+    if (!ref
+      || ref.startsWith('-')
+      || !REF_RE.test(ref)
+      || REF_FORBIDDEN.test(ref)
+      || !/[\p{L}\p{N}]/u.test(ref)
+      || seen.has(ref)) continue;
+    seen.add(ref);
+    out.push(ref);
+  }
+  return out;
+}
+
 /** 数字入参夹紧到区间，非法值回落到默认。 */
 export function toInt(value, { min, max, fallback }) {
   const num = Number(value);

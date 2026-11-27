@@ -21,9 +21,10 @@ import { join } from 'node:path';
 import { homedir, hostname as osHostname } from 'node:os';
 
 import { createScanner, normalizeConfig, discoverAdbPath } from './lib/scan.js';
-import { createRegistry, observe, snapshot as snapshotRegistry } from './lib/registry.js';
+import { createRegistry, observe, snapshot as snapshotRegistry, setAliases, resolveDeviceRefs, deviceNames } from './lib/registry.js';
 import { composeMessage, BUILTIN_TEMPLATES } from './lib/templates.js';
-import { toSerialList, toInt } from './lib/args.js';
+import { renderModelPrompt } from './lib/prompt.js';
+import { toSerialList, toRefList, toInt } from './lib/args.js';
 
 export const name = 'device-manager';
 
@@ -64,6 +65,8 @@ class Store {
         if (!fixed.transports || typeof fixed.transports !== 'object' || Array.isArray(fixed.transports)) fixed.transports = {};
         if (!Array.isArray(fixed.transportKeys)) fixed.transportKeys = Object.keys(fixed.transports);
         if (typeof fixed.model !== 'string') fixed.model = fixed.model == null ? '' : String(fixed.model);
+        // version 1 的缓存没有 aliases；下游（提示词渲染、面板）按数组读，缺了会抛。
+        if (!Array.isArray(fixed.aliases)) fixed.aliases = fixed.aliases ? [String(fixed.aliases)] : [];
         devices[serial] = fixed;
       }
       this.state = createRegistry({ devices });
@@ -166,13 +169,18 @@ const PARAMETERS = {
   action: {
     type: 'string',
     required: true,
-    enum: ['list', 'scan', 'status', 'inspect', 'compose', 'inject', 'doctor', 'history'],
-    description: 'list=读缓存快照；scan=主机重扫（USB/网段/Tailscale）；status=只刷新已知设备状态；inspect=单台设备即时详情；compose=按模板生成调试消息文本；inject=把调试消息投递到会话；doctor=自检（adb/tailscale/缓存/工具链）；history=最近扫描与投递记录。',
+    enum: ['list', 'scan', 'status', 'inspect', 'compose', 'inject', 'name', 'prompt', 'doctor', 'history'],
+    description: 'list=读缓存快照；scan=主机重扫（USB/网段/Tailscale）；status=只刷新已知设备的**即时**状态（屏幕/锁屏/电量/前台，答"该在哪台验证"之前先调它）；inspect=单台设备即时详情；compose=按模板生成调试消息文本；inject=把调试消息投递到会话；name=给用户起的外号建立别名（如把某台叫"小米13"）；prompt=回读当前注入系统提示词的设备清单原文；doctor=自检（adb/tailscale/缓存/工具链）；history=最近扫描与投递记录。',
   },
   serials: {
     type: 'array',
     items: { type: 'string' },
-    description: '设备序列号数组（ro.serialno）。inspect 取第一个；compose/inject 指定要写进消息的设备，省略＝全部健康设备。',
+    description: '设备称呼数组，可直接写序列号、型号、adb 目标（IP:5555），或用户起的别名（如"小米13"）——插件会归一化后匹配。inspect 取第一个；compose/inject/name 指定目标设备；省略＝全部健康设备。写错时错误信息会列出候选设备，照候选改名，别猜。',
+  },
+  names: {
+    type: 'array',
+    items: { type: 'string' },
+    description: '仅 name 用：这台设备的别名表（**整表替换**，空数组＝清空）。首个为主名，最多 6 个、单个 ≤40 字符；会用于匹配用户口中的机器名。',
   },
   sessionId: { type: 'string', description: 'inject 的目标会话 id；省略时使用调用工具所在会话。' },
   target: { type: 'string', description: 'compose/inject 的调试目标文字，例如"登录页重构"。省略时使用会话标题或"本次改动"。' },
@@ -257,6 +265,26 @@ export function apply(ctx, rawConfig) {
   /** 缓存里已知的设备序列号（错误提示里给模型当"可选值"用）。 */
   const knownSerials = () => Object.keys(state.registry?.devices ?? {});
 
+  /** 错误提示里的"已知设备"要带上别名，否则模型不知道用户口中的名字对应哪台。 */
+  const knownNamesHint = () => {
+    const list = Object.values(state.registry?.devices ?? {}).slice(0, 12).map((device) => {
+      const names = deviceNames(device);
+      const alias = names.aliases.length ? `｜别名 ${names.aliases.join('、')}` : '';
+      return `${names.serial}（${names.model ?? '未知型号'}${alias}）`;
+    });
+    return list.join('、') || '无';
+  };
+
+  /** 称呼没解析出来时，把候选摆出来：模型会照着候选改名重试，而不是回"没有这台设备"。 */
+  const describeUnresolved = (unresolved) => unresolved.map((item) => {
+    const candidates = (item.candidates ?? []).map((c) => {
+      const alias = c.aliases?.length ? `，别名：${c.aliases.join('、')}` : '';
+      const target = c.targets?.length ? `，adb 目标：${c.targets[0]}` : '';
+      return `${c.serial}（${c.model ?? '未知型号'}${alias}${target}）`;
+    }).join('；') || '（注册表里还没有设备，先 action:"scan"）';
+    return `没有设备匹配「${item.ref}」（${item.reason}）。候选：${candidates}`;
+  }).join('\n');
+
   /**
    * 会话 id 的地面真相有两种形态：主会话在 workspace 注册表里是 `session-<uuid>`，
    * subagent 会话是裸 `<uuid>`。只按一种查表会得到 "not found"，所以两种都备着。
@@ -274,14 +302,25 @@ export function apply(ctx, rawConfig) {
     if (args.serials !== undefined) {
       const raw = args.serials;
       const hadInput = Array.isArray(raw) ? raw.length > 0 : String(raw ?? '').trim().length > 0;
-      args.serials = toSerialList(raw);
+      // 先按「称呼」收（序列号 / 型号 / IP:5555 / 别名都行），再解析成真实序列号：
+      // 下游 scanner 只认 device.serial，把「小米13」原样传下去会静默变成"没匹配到设备"。
+      const refs = toRefList(raw);
       // 给了 serials 却全被过滤掉 → 绝不能退化成"对全部设备动手"。
-      if (hadInput && args.serials.length === 0) {
+      if (hadInput && refs.length === 0) {
         return {
           ok: false,
           error: 'no-valid-serial',
-          text: `serials 全部非法：${JSON.stringify(raw)}。只接受 adb 序列号或 host:port（不含空格、不以 - 开头）。已知设备：${knownSerials().join(', ') || '无'}`,
+          text: `serials 全部非法：${JSON.stringify(raw)}。可写 adb 序列号、host:port、型号或别名（用户起的名字）。已知设备：${knownNamesHint()}`,
         };
+      }
+      if (refs.length > 0) {
+        const resolved = resolveDeviceRefs(state.registry, refs);
+        if (!resolved.ok) {
+          return { ok: false, error: 'unknown-device', text: describeUnresolved(resolved.unresolved), data: { unresolved: resolved.unresolved, known: knownSerials() } };
+        }
+        args.serials = resolved.devices.map((device) => device.serial);
+      } else {
+        args.serials = [];
       }
     }
     switch (action) {
@@ -290,7 +329,72 @@ export function apply(ctx, rawConfig) {
         return {
           ok: true,
           text: describeSnapshot(snap),
-          data: { ...snap, lastScanAt: state.lastScanAt, hostName, adbPath: adb.path, scanning: Boolean(state.scanning) },
+          data: {
+            ...snap,
+            lastScanAt: state.lastScanAt,
+            hostName,
+            adbPath: adb.path,
+            scanning: Boolean(state.scanning),
+            // 面板把轮询节奏交给服务端统一下发（客户端不再硬编码 3 秒），顺带省掉一次配置往返。
+            poll: { panelMs: config.poll.panelMs, badgeMs: config.poll.badgeMs },
+          },
+        };
+      }
+      case 'prompt': {
+        // 自证入口：模型/用户想确认"到底往系统提示词里塞了什么"时调这个，
+        // 不用去猜注册表与渲染的差别；也是 doctor 之外唯一的提示词回归面。
+        const snap = scanner.snapshot(state.registry, { filter: 'all' });
+        const text = renderModelPrompt({
+          devices: snap.devices,
+          hostName,
+          now: Date.now(),
+          staleAfterMs: config.poll.staleAfterMs,
+          includeVolatile: config.prompt.includeVolatile,
+          maxRows: config.prompt.maxRows,
+          showRules: config.prompt.showRules,
+        });
+        return {
+          ok: true,
+          text: text || '当前没有可注入的设备（注册表为空）。先 action:"scan"。',
+          data: { injected: Boolean(config.exposeToModel), includeVolatile: config.prompt.includeVolatile, registration: registration.prompt, counts: snap.counts },
+        };
+      }
+      case 'name': {
+        // 用户口中的"小米13"必须落到设备上，否则模型永远对不上号。
+        // 必须显式点名设备：省略 serials 时 pickDevices 会回落到"全部健康设备"，
+        // 那等于把同一个别名一次性盖到所有机器上，越权且没法撤销。
+        if (!Array.isArray(args.serials) || args.serials.length === 0) {
+          return { ok: false, error: 'no-serial', text: `name 必须显式指定设备（serials 写序列号、型号、adb 目标或别名）。已知设备：${knownNamesHint()}` };
+        }
+        const targets = pickDevices(args.serials, 'all');
+        if (targets.length === 0) {
+          return { ok: false, error: 'no-device', text: `name 需要指定设备。已知设备：${knownNamesHint()}` };
+        }
+        if (!Array.isArray(args.names) && args.names === undefined) {
+          return { ok: false, error: 'no-names', text: 'name 需要 names（别名数组，整表替换；空数组＝清空）。例如 names:["小米13","备用机"]。' };
+        }
+        const results = [];
+        for (const row of targets) {
+          const outcome = setAliases(state.registry, row.serial, args.names);
+          if (!outcome.ok) {
+            const conflict = outcome.conflict
+              ? `「${outcome.conflict.alias}」已经是设备 ${outcome.conflict.owner}${outcome.conflict.ownerModel ? `（${outcome.conflict.ownerModel}）` : ''} 的名字，换个称呼。`
+              : (outcome.rejected?.length ? `被拒：${outcome.rejected.map((r) => `${r.name}（${r.reason}）`).join('、')}` : outcome.error);
+            results.push({ serial: row.serial, ok: false, error: outcome.error, detail: conflict });
+            continue;
+          }
+          results.push({ serial: row.serial, ok: true, aliases: outcome.aliases, rejected: outcome.rejected ?? [] });
+        }
+        store.state = state.registry;
+        store.touch();
+        const failed = results.filter((r) => !r.ok);
+        return {
+          ok: failed.length === 0,
+          error: failed.length ? failed[0].error : undefined,
+          text: results.map((r) => (r.ok
+            ? `${r.serial} 别名已设为 ${r.aliases.length ? r.aliases.join('、') : '（清空）'}${r.rejected?.length ? `；被拒：${r.rejected.map((x) => `${x.name}（${x.reason}）`).join('、')}` : ''}`
+            : `${r.serial} 设置失败：${r.detail}`)).join('\n'),
+          data: { results, next: '下一次系统提示词更新后，模型就能用这些名字对上机器。' },
         };
       }
       case 'scan': {
@@ -559,7 +663,9 @@ export function apply(ctx, rawConfig) {
           { name: 'tailscale', ok: tailnet.ok, detail: tailnet.ok ? `${tailnet.peers?.length ?? 0} 个 peer` : (tailnet.error ?? tailnet.skipped ? '已关闭' : '不可用') },
           { name: '局域网扫描', ok: true, detail: config.sources.lan.enabled ? `已开：${config.sources.lan.cidrs.join(', ') || '未配 CIDR'}` : '默认关闭（需显式配 CIDR）' },
           { name: '路由注册', ok: registration.route === 'ok', detail: registration.route === 'ok' ? '/adb-devices/* 已注册（App 面板与 /api 通道的命脉）' : `${registration.route}${registration.errors.length ? ` ｜ ${registration.errors.join('；')}` : ' ｜ 未注册，面板会 404'}` },
-          { name: '工具注册', ok: registration.tool !== 'failed', detail: registration.tool === 'pending' ? '等待宿主 tools 服务…' : registration.tool },
+          // 之前写的是 `!== 'failed'`，而失败值是带后缀的长串（'failed（…）'），精确比较永远不成立
+          // → 真失败也画绿勾。现在 registration.tool 只取 'ok'/'pending'/'failed'，失败详情在 errors。
+          { name: '工具注册', ok: registration.tool === 'ok', detail: registration.tool === 'ok' ? 'adb_devices 已注册（模型可调）' : registration.tool === 'pending' ? '等待宿主 tools 服务…（到货自动补注册）' : `${registration.tool}${registration.errors.length ? ` ｜ ${registration.errors.join('；')}` : ' ｜ adb_devices 不可用，模型没法查设备'}` },
           { name: '缓存', ok: true, detail: `${dataDir}（${Object.keys(state.registry.devices ?? {}).length} 台设备，上次扫描 ${state.lastScanAt ? new Date(state.lastScanAt).toLocaleTimeString('zh-CN', { hour12: false }) : '从未'}）` },
           {
             name: '会话投递服务',
@@ -597,8 +703,12 @@ export function apply(ctx, rawConfig) {
     const cap = Math.max(1, Number(config.list?.maxRows ?? 20));
     const rows = snap.devices.slice(0, cap);
     const lines = rows.map((device, index) => {
-      const transports = device.transports.map((t) => `${t.label} ${t.endpoint}[${t.state}]`).join(' + ');
-      return `${index + 1}. ${device.model}（Android ${device.android ?? '?'}）${device.serial}｜${transports}｜${device.summary}`;
+      // 把「adb -s 该填什么」直接印出来：模型抄这一串就行，不用自己猜序列号还是 IP。
+      const transports = device.transports
+        .map((t) => `${t.label} ${t.endpoint}[${t.state}]（adb -s ${t.adbTarget || t.endpoint}）`)
+        .join(' + ');
+      const alias = (device.aliases ?? []).length ? ` 「${device.aliases.join('、')}」` : '';
+      return `${index + 1}. ${device.model}${alias}（Android ${device.android ?? '?'}）serial ${device.serial}｜${transports}｜${device.summary}`;
     });
     const tail = snap.devices.length > rows.length
       ? `（还有 ${snap.devices.length - rows.length} 台未列出，请用 filter 收窄或指定 serials）`
@@ -607,21 +717,14 @@ export function apply(ctx, rawConfig) {
   }
 
   // ── Agent 工具 ────────────────────────────────────────────────────────────
-  const tools = service(ctx, 'tools');
-  if (!tools?.register) {
-    // 同样等一等；本轮激活窗口已过就只能如实记账，doctor 会指名让人重新启用插件。
-    waitForService('tools').then((found) => {
-      if (registration.tool !== 'pending') return;
-      registration.tool = found?.register
-        ? 'failed（tools 服务已到但激活窗口已过，请在插件管理里关掉再打开本插件）'
-        : 'failed（宿主 tools 服务 6s 未就绪，adb_devices 工具不可用）';
-    });
-  }
-  if (tools?.register) {
+  const registerTool = (from = ctx) => {
+    const tools = service(from, 'tools');
+    if (!tools?.register) return false;
+    if (registration.tool === 'ok') return true; // 已注册过（幂等：立即 + inject 回调可能先后到达）
     try {
       const dispose = tools.register({
         name: 'adb_devices',
-        description: '管理本主机上的 Android 测试机（adb）。扫描/刷新设备清单与状态（USB、局域网、Tailscale），按模板生成"去哪台设备调试、设备什么状态、怎么连"的消息，或把它投递到会话。',
+        description: '管理本主机上的 Android 测试机（adb）。要回答"该在哪台设备上验证 / 这台现在什么状态"，先调本工具取实时状态（action:"status" 或 "inspect"），不要凭系统提示词里的设备清单猜屏幕与电量。定位设备用 adb -s <目标>，目标从 list/status 输出里原样取（网络设备是 IP:5555，USB 是序列号，型号名不能当 `-s` 参数）。serials 支持序列号、型号、adb 目标或用户起的别名（如"小米13"）；别名用 action:"name" 建立，之后模型和用户都能用同一个名字对上机器。',
         parameters: PARAMETERS,
         output: OUTPUT,
         async execute(args, exec) {
@@ -639,8 +742,35 @@ export function apply(ctx, rawConfig) {
       });
       ctx.effect?.(() => dispose);
       registration.tool = 'ok';
+      log('adb_devices 工具已注册');
+      return true;
     } catch (error) {
+      // 注册抛了就别再重试（重试只会重复抛），但要如实记账——doctor 靠这个值亮红。
+      registration.tool = 'failed';
+      registration.errors.push(`注册工具异常：${String(error?.message ?? error)}`);
       log('注册工具失败', String(error?.message ?? error));
+      return true;
+    }
+  };
+  if (!registerTool(ctx)) {
+    // 冷启动竞态（2026-11-28 重启实测：apply() 跑在 tools 服务起来之前，旧代码等服务到了
+    // 也只记账不补注册，doctor 报「工具注册 failed」却画绿勾，模型整整没有 adb_devices 可调）。
+    // 与路由 / 提示词段同款三段式：先 ctx.inject 让加载器等依赖，再轮询兜底；服务一到**真正补注册**。
+    if (typeof ctx.inject === 'function') {
+      ctx.inject(['tools'], (inner) => {
+        if (!registerTool(inner ?? ctx) && registration.tool === 'pending') {
+          registration.tool = 'failed';
+          registration.errors.push('ctx.inject 回调里仍取不到 tools 服务，adb_devices 工具不可用');
+        }
+      });
+    } else {
+      waitForService('tools').then((found) => {
+        if (found?.register) registerTool(ctx);
+        if (registration.tool === 'pending') {
+          registration.tool = 'failed';
+          registration.errors.push('宿主 tools 服务在 6s 内未就绪，adb_devices 工具不可用');
+        }
+      });
     }
   }
 
@@ -679,13 +809,14 @@ export function apply(ctx, rawConfig) {
         return handle(endpoint, payload, { source: 'rpc' });
       });
       ctx.effect?.(() => async () => { try { await dispose?.(); } catch { /* 忽略 */ } });
-      registration.tool = 'ok';
+      // 别把 registration.tool 抢改成 'ok'：这是面板的可选 RPC 快通道，不是 agent 工具；
+      // 之前这一句会把「工具其实没注册上」的失败盖成 ok，doctor 就失去了报警能力。
     } catch (error) {
       log('注册 RPC 通道失败', String(error?.message ?? error));
     }
   }
 
-  const READ_ONLY = new Set(['list', 'status', 'doctor', 'history']);
+  const READ_ONLY = new Set(['list', 'status', 'doctor', 'history', 'prompt']);
 
   /**
    * 跨 loopback 源放行：页面可能由端口转发/代理（如 127.0.0.1:3083）提供，
@@ -881,13 +1012,24 @@ export function apply(ctx, rawConfig) {
       const dispose = systemPrompt.section({
         name: 'device-manager',
         order: 60,
+        // 设备 notes / 型号是外部可控文本；DSH 会把 section 里的 {{name}} 当插值变量解析，
+        // 未注册的名字直接抛错，从而**打断所有会话的系统提示词组装**（不是只影响本插件）。
+        // 这段本来就自排版，关掉插值是唯一的正确取值。
+        interpolate: false,
         text: () => {
           // 这一段被拼进**每个会话**的系统提示词：这里抛异常会让整条 prompt 组装失败，
           // 影响面远大于设备面板本身，所以宁可吞掉返回空段。
           try {
             const snap = scanner.snapshot(state.registry, { filter: 'all' });
-            if (snap.counts.total === 0) return '';
-            return `## 可用 Android 测试机（主机 ${hostName}）\n${describeSnapshot(snap)}\n\n需要更细状态或重扫请用 adb_devices 工具；调试消息用 template=default。`;
+            return renderModelPrompt({
+              devices: snap.devices,
+              hostName,
+              now: Date.now(),
+              staleAfterMs: config.poll.staleAfterMs,
+              includeVolatile: config.prompt.includeVolatile,
+              maxRows: config.prompt.maxRows,
+              showRules: config.prompt.showRules,
+            });
           } catch (error) {
             log('系统提示词段生成失败', String(error?.message ?? error));
             return '';

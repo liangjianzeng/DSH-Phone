@@ -1,3 +1,1 @@
-5c0ff64c1af0325f15fb2c235607fa7824c71c16cb73aac38fa44d15ac1183fe  dsh-device-manager-0.1.5.tar.gz
-5bf31b285c557fd013ea2960a032ee4b675e002b7a760eaeaa5e4ffcba89439d  web-search-localxng-0.1.0.tar.gz
-b4c1b467315bc8755ee5968f41f7a4964ee2cafd938938b39b1b7a8e0b8077f8  web-search-searxng-0.1.0.tar.gz
+78cf29e5979a7dd1d5ca0f97599d2d40c1b8327e1398e11957a11e7bca938a17  dsh-device-manager-0.1.6.tar.gz

@@ -69,10 +69,19 @@ export function normalizeConfig(raw = {}) {
     },
     poll: {
       enabled: raw.poll?.enabled !== false,
-      panelMs: Number(raw.poll?.panelMs ?? 3000),
+      // 面板 3 秒一刷会让整排按钮反复 disabled（用户反馈"界面每两三秒闪一下"）。
+      // 默认降到 60 秒；客户端读服务端下发的这个值，不再硬编码。
+      panelMs: Number(raw.poll?.panelMs ?? 60000),
+      badgeMs: Number(raw.poll?.badgeMs ?? 30000),
       backgroundMs: Number(raw.poll?.backgroundMs ?? 30000),
       staleAfterMs: Number(raw.poll?.staleAfterMs ?? 120000),
       pruneAfter: Number(raw.poll?.pruneAfter ?? 3),
+    },
+    // 注入系统提示词的那一段。默认只放慢变事实（见 lib/prompt.js 文件头）。
+    prompt: {
+      includeVolatile: raw.prompt?.includeVolatile === true,
+      maxRows: Number(raw.prompt?.maxRows ?? 12),
+      showRules: raw.prompt?.showRules !== false,
     },
     inject: {
       mode: raw.inject?.mode === 'steer' ? 'steer' : 'queue',

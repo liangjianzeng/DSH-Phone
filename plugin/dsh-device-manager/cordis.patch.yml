@@ -28,7 +28,11 @@
           remoteAdbServers: []
         poll:
           enabled: true
-          panelMs: 3000
+          # 面板轮询：3 秒一刷会把整排按钮反复 disabled，看起来就是"每两三秒闪一下"。
+          # 面板打开时 60 秒足够；要盯实时状态就手动点"刷新状态"。
+          panelMs: 60000
+          # 顶栏徽标（台数）的独立节奏，与面板解耦。
+          badgeMs: 30000
           backgroundMs: 30000
           staleAfterMs: 120000
           pruneAfter: 3
@@ -42,3 +46,12 @@
           mode: queue
           template: default
           allowSteer: true
+        # 注入系统提示词的设备清单（adb_devices action:"prompt" 可回读原文）
+        prompt:
+          # false = 只放慢变事实（身份/别名/通道/可用性）。
+          # 电量、屏幕、前台应用每分钟都在变，写进提示词会让会话里同时躺着多版互相矛盾的
+          # 设备表（DSH 每次文本变化都追加一条 system 消息），模型反而更容易认错设备；
+          # 这些字段交给 adb_devices{action:"status"|"inspect"} 现取。
+          includeVolatile: false
+          maxRows: 12
+          showRules: true

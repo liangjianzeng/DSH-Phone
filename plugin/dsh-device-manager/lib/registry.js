@@ -55,10 +55,216 @@ function ownerOfEndpoint(registry, endpoint) {
 
 /**
  * 建立/复位一个注册表。
+ * version 2：设备多了 `aliases`（用户起的口语名字，如「小米13」）。老缓存没有该字段，
+ * Store.load() 与 snapshot() 都按空表兜底，不做原地迁移——缓存是派生数据，重扫即可。
  * @param {{devices?: Record<string, object>}} initial
  */
 export function createRegistry(initial = {}) {
-  return { version: 1, devices: { ...(initial.devices ?? {}) } };
+  return { version: 2, devices: { ...(initial.devices ?? {}) } };
+}
+
+/** 别名条数与长度上限：面板手输，给个不会被灌爆提示词的上限。 */
+export const ALIAS_MAX = 6;
+export const ALIAS_MAX_LENGTH = 40;
+
+/**
+ * 把"设备称呼"拉平成可比较的形式：模型和用户会写 `小米 13`、`小米-13`、`MI 13`、`#13`。
+ * 只做**比较用**的归一化，展示一律用原文。
+ */
+export function normalizeRef(value) {
+  return String(value ?? '')
+    .normalize('NFKC')
+    .toLowerCase()
+    // 全角标点/括号、下划线、连字符、斜杠、间隔号统统当成分隔符
+    .replace(/[\s_\-/\\|·・．。，、,;:;（）()\[\]{}「」【】#*'`"~^]+/g, '')
+    .trim();
+}
+
+/** 单条别名的清洗；返回 null 表示不可用。 */
+function cleanAlias(raw) {
+  const text = String(raw ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+  if ([...text].length > ALIAS_MAX_LENGTH) return null;
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(text)) return null;
+  // 只有标点/数字的东西没法当名字用（`---`、`1`），会让所有设备互相撞上。
+  if (!/[\p{L}\p{N}]/u.test(text)) return null;
+  return text;
+}
+
+/** 设备参与"称呼"匹配的全部名义值（不含 facts 里的易变字段）。 */
+export function deviceNames(device) {
+  const aliases = Array.isArray(device?.aliases) ? device.aliases : [];
+  const targets = Object.values(device?.transports ?? {}).flatMap((t) => {
+    const list = [t?.adbTarget, t?.endpoint];
+    const host = String(t?.endpoint ?? '').split(':')[0];
+    return [...list, host];
+  });
+  return {
+    serial: device?.serial ?? null,
+    aliases: aliases.filter((a) => typeof a === 'string' && a),
+    model: device?.model ?? null,
+    brand: device?.brand ?? null,
+    targets: targets.filter(Boolean),
+  };
+}
+
+/**
+ * 设置某台设备的别名（整表替换）。
+ * 名字是**用户手输的口语称呼**，所以必须查重：如果它已经指向另一台设备，
+ * 模型就会把"小米13"解析到错的机器上——这比没有别名更糟，所以直接拒绝。
+ * @returns {{ok: boolean, error?: string, aliases?: string[], rejected?: Array<{name: string, reason: string}>}}
+ */
+export function setAliases(registry, serial, names) {
+  const device = registry?.devices?.[serial];
+  if (!device) return { ok: false, error: `unknown-device`, rejected: [] };
+
+  // names 可能被模型整成 JSON 字符串（'["自检机","测试机A"]'）：先试着按 JSON 解开，
+  // 解不开再按分隔符拆——否则方括号和引号会被当成名字的一部分写进注册表，
+  // 提示词里就会躺着 ['["自检机"', '"测试机A"]'] 这种脏别名（2026-11-28 实测踩过）。
+  let raw = names;
+  if (!Array.isArray(raw)) {
+    const text = String(raw ?? '').trim();
+    let parsed = null;
+    if (/^\[.*\]$/s.test(text)) {
+      try { parsed = JSON.parse(text); } catch { /* 不是 JSON，走分隔符拆分 */ }
+    }
+    raw = Array.isArray(parsed) ? parsed : text.split(/[,，、;；]/);
+  }
+  const aliases = [];
+  const rejected = [];
+  const seen = new Set();
+  for (const item of raw ?? []) {
+    const text = cleanAlias(item);
+    if (!text) {
+      const original = String(item ?? '').trim();
+      if (original) rejected.push({ name: original, reason: '为空、超长（>' + ALIAS_MAX_LENGTH + ' 字符）或只含标点' });
+      continue;
+    }
+    const key = normalizeRef(text);
+    if (!key) {
+      rejected.push({ name: text, reason: '归一化后为空' });
+      continue;
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    aliases.push(text);
+  }
+  if (aliases.length > ALIAS_MAX) {
+    return { ok: false, error: `too-many-aliases`, rejected: [...rejected, { name: aliases.slice(ALIAS_MAX).join('、'), reason: `最多 ${ALIAS_MAX} 个别名` }] };
+  }
+
+  // 跨设备查重：别名不能抢走别人已有的称呼。
+  for (const [identity, other] of Object.entries(registry.devices ?? {})) {
+    if (identity === serial) continue;
+    const names2 = deviceNames(other);
+    const owned = [...names2.aliases, names2.serial, names2.model, ...names2.targets]
+      .map(normalizeRef)
+      .filter(Boolean);
+    const clash = aliases.find((alias) => owned.includes(normalizeRef(alias)));
+    if (clash) {
+      return {
+        ok: false,
+        error: `alias-conflict`,
+        rejected,
+        conflict: { alias: clash, owner: identity, ownerModel: other.model ?? null },
+      };
+    }
+  }
+  // 跟自己 serial/型号 撞名的别名纯属冗余，丢掉，不占提示词的位置。
+  const own = new Set([normalizeRef(device.serial), normalizeRef(device.model), normalizeRef(device.brand)].filter(Boolean));
+  const kept = aliases.filter((alias) => !own.has(normalizeRef(alias)));
+  for (const dropped of aliases.filter((alias) => own.has(normalizeRef(alias)))) {
+    rejected.push({ name: dropped, reason: '和它自己的序列号/型号相同，写了也是冗余' });
+  }
+  device.aliases = kept;
+  return { ok: true, aliases: kept, rejected };
+}
+
+/**
+ * 把一个称呼解析成设备。命中顺序：序列号 → 别名 → adb 目标/端点 → 型号 → 唯一包含匹配。
+ * 失败时给出候选（含别名），让模型能从错误信息里自己学会该怎么叫。
+ * @returns {{ok: true, device: object, matchedBy: string} | {ok: false, ref: string, reason: string, candidates: Array<{serial: string, model: string|null, aliases: string[]}>}}
+ */
+export function resolveDeviceRef(registry, ref) {
+  const key = normalizeRef(ref);
+  const fail = (reason) => ({ ok: false, ref: String(ref ?? ''), reason, candidates: suggestDevices(registry, ref) });
+  if (!key) return fail('称呼为空');
+
+  const devices = Object.values(registry?.devices ?? {});
+  const matchStage = (matchedBy, valuesOf) => {
+    const hits = devices.filter((device) => valuesOf(device).some((value) => normalizeRef(value) === key));
+    if (hits.length === 1) return { hit: { ok: true, device: hits[0], matchedBy } };
+    if (hits.length > 1) return { hit: { ok: false, ref: String(ref ?? ''), reason: `${matchedBy}「${ref}」撞上 ${hits.length} 台设备`, candidates: hits.map(candidatesOf) } };
+    return null;
+  };
+  const stages = [
+    ['序列号', (device) => [device.serial]],
+    ['别名', (device) => deviceNames(device).aliases],
+    ['adb 目标', (device) => deviceNames(device).targets],
+    ['型号', (device) => [device.model, `${device.brand ?? ''} ${device.model ?? ''}`]],
+  ];
+  for (const [matchedBy, valuesOf] of stages) {
+    const stage = matchStage(matchedBy, valuesOf);
+    if (stage) return stage.hit;
+  }
+
+  // 兜底：唯一包含匹配（用户会打「小米13」而型号是 `M2012K11AC`，别名才是要害）。
+  const contains = devices.filter((device) => {
+    const names = deviceNames(device);
+    return [...names.aliases, names.model, names.brand, names.serial]
+      .filter(Boolean)
+      .some((value) => {
+        const target = normalizeRef(value);
+        return target.length >= 2 && (target.includes(key) || key.includes(target));
+      });
+  });
+  if (contains.length === 1) return { ok: true, device: contains[0], matchedBy: 'fuzzy' };
+  if (contains.length > 1) return { ok: false, ref: String(ref ?? ''), reason: `同时匹配 ${contains.length} 台，需要更准确的名字`, candidates: contains.slice(0, 5).map(candidatesOf) };
+  return fail('没有设备叫这个名');
+}
+
+function candidatesOf(device) {
+  const names = deviceNames(device);
+  return { serial: names.serial, model: names.model, aliases: names.aliases, targets: names.targets };
+}
+
+/** 给错误信息用的"你可能想说"：按字符重合度挑最多 5 台；一个都没沾上就全量列出来。 */
+export function suggestDevices(registry, ref, limit = 5) {
+  const key = normalizeRef(ref);
+  const all = Object.values(registry?.devices ?? {});
+  const scored = all.map((device) => {
+    const names = deviceNames(device);
+    const pool = [...names.aliases, names.model, names.brand, names.serial].filter(Boolean).map(normalizeRef);
+    const best = pool.reduce((max, value) => {
+      const shared = [...key].filter((ch) => value.includes(ch)).length;
+      return Math.max(max, key.length ? shared / Math.max(key.length, value.length) : 0);
+    }, 0);
+    return { device, best };
+  }).filter((entry) => entry.best > 0).sort((a, b) => b.best - a.best).slice(0, limit);
+  // 一点字符都不沾也要给候选：模型拿到"注册表里到底有哪几台"才能自我纠正，
+  // 只回"没有这台设备"它就会直接放弃。
+  const pool = scored.length > 0 ? scored.map((entry) => entry.device) : all.slice(0, limit);
+  return pool.map((device) => candidatesOf(device));
+}
+
+/** 批量解析：把模型传来的 serials（可能是序列号/型号/别名/adb 目标混着写）换成设备。 */
+export function resolveDeviceRefs(registry, refs) {
+  const devices = [];
+  const unresolved = [];
+  const seen = new Set();
+  for (const ref of refs ?? []) {
+    const result = resolveDeviceRef(registry, ref);
+    if (!result.ok) {
+      unresolved.push({ ref: result.ref, reason: result.reason, candidates: result.candidates });
+      continue;
+    }
+    if (!seen.has(result.device.serial)) {
+      seen.add(result.device.serial);
+      devices.push(result.device);
+    }
+  }
+  return { ok: unresolved.length === 0, devices, unresolved };
 }
 
 /**
@@ -131,6 +337,7 @@ export function observe(registry, observed, options = {}) {
         lastSeenAt: now,
         group: null,
         notes: '',
+        aliases: [],
       };
       registry.devices[identity] = device;
       created.push(identity);
@@ -258,6 +465,7 @@ export function snapshot(registry, { now = Date.now(), staleAfterMs = 120000, fi
       density: device.density ?? null,
       group: device.group ?? null,
       notes: device.notes ?? '',
+      aliases: Array.isArray(device.aliases) ? device.aliases.filter((a) => typeof a === 'string' && a) : [],
       identitySource: device.identitySource,
       health,
       stale,

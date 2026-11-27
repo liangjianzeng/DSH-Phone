@@ -30,10 +30,11 @@ import {
   isTailnetAddress,
 } from '../lib/adb.js';
 import { expandCidrs, tcpProbe, tailscaleCandidates, buildProbeTargets } from '../lib/probe.js';
-import { createRegistry, observe, snapshot, deviceHealth, connectCommand, stateSummary, bestTransport, transportLabel } from '../lib/registry.js';
+import { createRegistry, observe, snapshot, deviceHealth, connectCommand, stateSummary, bestTransport, transportLabel, setAliases, resolveDeviceRef, resolveDeviceRefs, normalizeRef, deviceNames } from '../lib/registry.js';
+import { renderModelPrompt, freshnessBucket, promptTargets } from '../lib/prompt.js';
 import { composeMessage, BUILTIN_TEMPLATES, interpolate, deviceVars } from '../lib/templates.js';
 import { createScanner, normalizeConfig, discoverAdbPath } from '../lib/scan.js';
-import { toSerialList, toInt } from '../lib/args.js';
+import { toSerialList, toRefList, toInt } from '../lib/args.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = join(here, '..', 'test', 'fixtures');
@@ -551,6 +552,141 @@ if (wantLive) {
     live = { error: String(error?.message ?? error), adbPath: adb.path };
   }
 }
+
+// ────────────────── 提示词段 / 别名 / 称呼解析（离线，不碰 adb） ──────────────────
+
+const PROMPT_NOW = 1_795_791_000_000;
+
+/** 造一行 snapshot() 形态的设备（渲染层只认这些字段）。 */
+function promptRow(serial, model, android, transports, extra = {}) {
+  const rows = transports.map((t) => ({
+    key: `${t.kind}|${t.endpoint}`,
+    kind: t.kind,
+    endpoint: t.endpoint,
+    adbTarget: t.adbTarget ?? t.endpoint,
+    state: 'device',
+    connected: true,
+    priority: t.kind === 'usb' ? 0 : 2,
+    label: t.kind === 'usb' ? 'USB' : 'Tailscale',
+    stale: false,
+    connectCommand: 'adb …',
+  }));
+  return {
+    serial,
+    model,
+    brand: null,
+    android,
+    health: 'ok',
+    stale: false,
+    factsAt: PROMPT_NOW,
+    summary: '亮屏 · 已解锁 · 电量 50% · 非常亮',
+    transports: rows,
+    bestTransportKey: rows[0]?.key ?? null,
+    kinds: [...new Set(rows.map((t) => t.kind))],
+    aliases: [],
+    group: null,
+    notes: '',
+    ...extra,
+  };
+}
+
+const promptDevices = () => [
+  promptRow('98fc9410', '2211133C', '16', [{ kind: 'tailscale', endpoint: '100.109.138.2:5555' }]),
+  promptRow('8b1e8747', 'M2012K11AC', '13', [{ kind: 'usb', endpoint: '8b1e8747' }]),
+  promptRow('43328e37', 'M332BF', '17', [{ kind: 'tailscale', endpoint: '100.75.247.55:5555' }, { kind: 'usb', endpoint: '43328e37' }]),
+];
+const promptBase = { hostName: 'test-host', now: PROMPT_NOW + 5_000, staleAfterMs: 120_000 };
+
+check('提示词段: 没有设备时返回空串（整段消失，不留空标题）', renderModelPrompt({ ...promptBase, devices: [] }), '');
+
+const plain = renderModelPrompt({ ...promptBase, devices: promptDevices() });
+checkOk('提示词段: 网络设备的 adb 目标写成 IP:端口', plain.includes('`100.109.138.2:5555`'));
+checkOk('提示词段: USB 设备的 adb 目标写成序列号', plain.includes('`8b1e8747`'));
+checkOk('提示词段: 明确警告型号名不能当 -s 参数', plain.includes('不能当 `-s` 参数'));
+checkOk('提示词段: 每台都带可复制的序列号', plain.includes('`98fc9410`') && plain.includes('`43328e37`'));
+checkOk('提示词段: 没人起别名时不印「名字」列（省 token）', !plain.includes('名字（用户可能这么叫）'));
+checkOk('提示词段: 没别名时教怎么建别名', plain.includes('action:"name"'));
+checkOk('提示词段: 默认不把电量/屏幕写进提示词', !plain.includes('电量 50%') && plain.includes('故意不写在本表里'));
+checkOk('提示词段: 双通道设备给出首选并列出可回落目标', plain.includes('备用 `43328e37`/USB'), plain);
+checkOk('提示词段: 单通道设备不写"备用"废话', !/`100\.109\.138\.2:5555`（备用/.test(plain));
+
+// 抖动回归（本次改动的核心）：facts/summary/factsAt 变了但身份没变 → 文本必须逐字节不变。
+// DSH 每检测到一次 section 文本变化就往会话里追加一条 system 消息，
+// 旧版每 30 秒就制造一版新清单，会话里同时躺着多版互相矛盾的设备表 —— 模型"搞不清设备"的主因。
+const jitter = promptDevices().map((device, index) => ({
+  ...device,
+  factsAt: PROMPT_NOW + index * 1000,
+  summary: '息屏 · 锁屏 · 电量 12% · 非常亮 · 前台 com.tencent.mm',
+  facts: { battery: 12, screen: 'off', foreground: { package: 'com.tencent.mm' } },
+}));
+check('提示词段: 易变字段变化不改变文本（防多版清单）', renderModelPrompt({ ...promptBase, devices: jitter }), plain);
+
+const volatile = renderModelPrompt({ ...promptBase, devices: promptDevices(), includeVolatile: true });
+checkOk('提示词段: includeVolatile 才带实时状态列', volatile.includes('电量 50%') && !plain.includes('电量 50%'));
+
+const aged = renderModelPrompt({ ...promptBase, devices: promptDevices().map((d) => ({ ...d, factsAt: PROMPT_NOW - 40 * 60_000 })) });
+checkOk('提示词段: 数据过期要明说', aged.includes('超过 10 分钟'), aged.slice(-160));
+check('提示词段: 新鲜度分桶（粗到不抖）', [freshnessBucket(90_000, 120_000), freshnessBucket(5_000), freshnessBucket(30 * 60_000)], ['2 分钟内', '30 秒内', '超过 10 分钟，很可能已过期，先 action:"status" 或 action:"scan"']);
+
+const withAlias = renderModelPrompt({ ...promptBase, devices: promptDevices().map((d) => (d.serial === '98fc9410' ? { ...d, aliases: ['小米13', '备用机'] } : d)) });
+checkOk('提示词段: 有别名时给出「名字」列并列出别名', withAlias.includes('名字（用户可能这么叫）') && withAlias.includes('小米13、备用机'));
+checkOk('提示词段: 超行时说明还有几台', renderModelPrompt({ ...promptBase, devices: promptDevices(), maxRows: 2 }).includes('另有 1 台未列出'));
+check('提示词段: 表头与分隔行、数据行列数一致', (() => {
+  const widths = new Set(withAlias.split('\n').filter((line) => line.startsWith('|')).map((line) => line.split('|').length));
+  return widths.size;
+})(), 1);
+check('提示词段: 单元格里的竖线被转义（不撑破表格）', renderModelPrompt({ ...promptBase, devices: promptDevices().map((d) => ({ ...d, model: 'A|B' })) }).split('\n').filter((l) => l.startsWith('|')).every((l) => !/\|A\|B\|/.test(l)), true);
+check('提示词段: 首选通道排在最前', promptTargets(promptRow('43328e37', 'M332BF', '17', [{ kind: 'tailscale', endpoint: '100.75.247.55:5555' }, { kind: 'usb', endpoint: '43328e37' }])).primary, '100.75.247.55:5555');
+
+const reg = createRegistry();
+observe(reg, [
+  { serial: '100.109.138.2:5555', endpoint: '100.109.138.2:5555', kind: 'tailscale', state: 'device', facts: { shellSerial: '98fc9410', model: '2211133C', android: '16' } },
+  { serial: '8b1e8747', endpoint: '8b1e8747', kind: 'usb', state: 'device', facts: { shellSerial: '8b1e8747', model: 'M2012K11AC', android: '13' } },
+], { now: PROMPT_NOW, fullScan: true });
+check('别名: 两台设备入库', Object.keys(reg.devices).length, 2);
+check('别名: 新设备自带空别名表', reg.devices['98fc9410'].aliases, []);
+check('别名: deviceNames 提供 adb 目标', deviceNames(reg.devices['98fc9410']).targets.includes('100.109.138.2:5555'), true);
+
+const named1 = setAliases(reg, '98fc9410', ['小米 13', '小米13', '备用机', '---']);
+check('别名: 归一化去重后落表', reg.devices['98fc9410'].aliases, ['小米 13', '备用机']);
+checkOk('别名: 纯标点被拒并说明原因', named1.ok === true && named1.rejected.some((r) => r.name === '---' && r.reason.includes('标点')));
+check('别名: 与自己序列号同名的别名算冗余并剔除', setAliases(reg, '98fc9410', ['98FC9410', '主力机']), { ok: true, aliases: ['主力机'], rejected: [{ name: '98FC9410', reason: '和它自己的序列号/型号相同，写了也是冗余' }] });
+const conflict = setAliases(reg, '8b1e8747', ['主力机']);
+check('别名: 抢别的设备的名字被整表拒绝', [conflict.ok, conflict.error, conflict.conflict?.owner], [false, 'alias-conflict', '98fc9410']);
+check('别名: 拒绝后原表未被改写', reg.devices['8b1e8747'].aliases, []);
+check('别名: 超过 6 个被拒', setAliases(reg, '8b1e8747', ['a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7']).error, 'too-many-aliases');
+check('别名: 未知设备报错', setAliases(reg, 'nope', ['x']).error, 'unknown-device');
+// 模型会把数组整成 JSON 字符串传回来；按分隔符硬拆会把括号引号拆进名字里
+// （2026-11-28 真机踩过：注册表里躺出 ['["自检机"', '"测试机A"]']）。
+check('别名: JSON 字符串入参先解开再落表', setAliases(reg, '8b1e8747', '["自检机","测试机A"]').aliases, ['自检机', '测试机A']);
+check('别名: 非 JSON 的分隔符串照旧拆分', setAliases(reg, '8b1e8747', '自检机、测试机A').aliases, ['自检机', '测试机A']);
+setAliases(reg, '98fc9410', ['小米13', '备用机']);
+
+const byAlias = resolveDeviceRef(reg, '小米 13');
+check('称呼: 别名带空格/大小写也能命中', [byAlias.ok, byAlias.device?.serial, byAlias.matchedBy], [true, '98fc9410', '别名']);
+check('称呼: 序列号直查', resolveDeviceRef(reg, '8b1e8747').device?.serial, '8b1e8747');
+check('称呼: adb 目标 host:port', resolveDeviceRef(reg, '100.109.138.2:5555').device?.serial, '98fc9410');
+check('称呼: 只写 IP 也能定位', resolveDeviceRef(reg, '100.109.138.2').device?.serial, '98fc9410');
+check('称呼: 型号', resolveDeviceRef(reg, 'M2012K11AC').device?.serial, '8b1e8747');
+check('称呼: 前缀模糊唯一命中', [resolveDeviceRef(reg, '小米').ok, resolveDeviceRef(reg, '小米').device?.serial], [true, '98fc9410']);
+const missing = resolveDeviceRef(reg, '华为Mate60');
+checkOk('称呼: 认不出时给候选而不是空手', missing.ok === false && Array.isArray(missing.candidates));
+// 候选必须带得出身份：一个字符都不沾时也要把"到底有哪几台"摆出来，模型才能自我纠正。
+check('称呼: 候选携带序列号与型号（非空注册表）', missing.candidates.map((c) => c.serial).sort(), ['8b1e8747', '98fc9410']);
+checkOk('称呼: 候选不是空壳', missing.candidates.every((c) => c.serial && c.model));
+const batch = resolveDeviceRefs(reg, ['小米13', '8b1e8747', '不存在的机器']);
+check('称呼: 批量解析能报出未匹配项', [batch.ok, batch.devices.map((d) => d.serial).sort()], [false, ['8b1e8747', '98fc9410']]);
+check('称呼: 归一化吃掉全角与分隔符', [normalizeRef('Ｍｉ 13'), normalizeRef('小米-13'), normalizeRef(' 小米１3 ')], ['mi13', '小米13', '小米13']);
+
+check('入参: 称呼可含中文与空格', toRefList('小米 13,8b1e8747,100.1.1.1:5555'), ['小米 13', '8b1e8747', '100.1.1.1:5555']);
+check('入参: 挡掉 adb 选项注入与危险字符', toRefList(['--help', '-s', 'a|b', 'ok;rm', '', ' ', '$(id)']), []);
+checkOk('入参: 旧 toSerialList 的严格性不回退', toSerialList(['8b1e8747', '小米 13', '--help']), ['8b1e8747']);
+
+const cfg = normalizeConfig({});
+check('配置: 面板轮询默认 60 秒（用户抱怨"两三秒闪一下"）', cfg.poll.panelMs, 60000);
+check('配置: 顶栏徽标默认 30 秒', cfg.poll.badgeMs, 30000);
+check('配置: 提示词默认不含易变字段', cfg.prompt.includeVolatile, false);
+check('配置: 提示词规则默认开启', cfg.prompt.showRules, true);
 
 // ───────────────────────────── 报告 ─────────────────────────────
 

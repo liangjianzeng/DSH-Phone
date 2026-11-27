@@ -14,7 +14,7 @@ DSH 顶栏「安卓测试机」入口：点会话右上角的手机图标 → �
 | 状态 | 亮屏/息屏、锁屏/解锁（含通知栏焦点兜底）、常亮（`stay_on_while_plugged_in` 位掩码）、电量与供电方式、前台应用、分辨率/DPI、自动亮度 |
 | 缓存 | 首次扫描后落本地 JSON（`~/.dsh/device-manager/registry.json`，派生缓存，删掉即可重来）；面板打开只刷状态，重扫才回主机全扫 |
 | 注入 | 勾选单台/全部 → 三种模板生成消息 → `填入输入框`（`inputActions.setDraft`）或 `发送到会话`（Host 侧 `sessionController.prompt(mode:'queue')`） |
-| 模型侧 | `adb_devices` 工具 + 系统提示词段（`exposeToModel`），让 agent 自己知道该去哪台机器验证 |
+| 模型侧 | `adb_devices` 工具（`list/scan/status/inspect/compose/inject/name/prompt/doctor/history`）+ 系统提示词段（`exposeToModel`），让 agent 自己知道有哪几台、`adb -s` 填什么、该选哪台 |
 
 顶栏图标旁的数字角标 = 已知设备数，颜色随健康度变化（绿/黄/红）。
 
@@ -48,21 +48,55 @@ dsh plugin enable device-manager
           tailscale: { enabled: true, ports: [5555] }
           emulator: { enabled: true }
           remoteAdbServers: []   # "host:5037"
-        poll: { panelMs: 3000, backgroundMs: 30000, staleAfterMs: 120000, pruneAfter: 3 }
+        poll: { panelMs: 60000, badgeMs: 30000, backgroundMs: 30000, staleAfterMs: 120000, pruneAfter: 3 }
         inject: { mode: queue, template: default, allowSteer: true }
+        # 注入系统提示词的设备清单：默认只放慢变事实，易变状态交给工具现取
+        prompt: { includeVolatile: false, maxRows: 12, showRules: true }
 ```
+
+### 注入给模型的那段清单（`exposeToModel` / `prompt`）
+
+DSH 每次组装提示词都会把 `systemPrompt.section()` 的文本与已提交状态比对，**文本一变就往会话里追加一条
+system 消息**。所以这段的设计目标是"绝大多数轮次文本一字不变"：
+
+- 只印**慢变事实**：序列号、别名、型号、Android 版本、通道、可用性、`adb -s` 该填哪个目标。
+- **不印**电量/屏幕/锁屏/前台应用（每 30 秒后台刷一次，印进去会让会话里同时躺着多版互相矛盾的设备表，
+  模型回看历史就会引用过期那版 —— 这是"模型搞不清设备"的主因）。需要时让它现取
+  `adb_devices{action:"status"}` / `{action:"inspect"}`。
+- 采集时间用粗粒度分桶（30 秒内 / 2 分钟内 / 10 分钟内 / 已过期），避免"上次更新时间"自己变成抖动源。
+- 要改回来（把易变列塞进提示词）：`prompt.includeVolatile: true`；想看这段原文：`adb_devices{action:"prompt"}`。
+- 该 section 显式 `interpolate: false`：设备 notes/型号是外部可控文本，里面的 `{{x}}` 会让 DSH 插值抛错，
+  从而打断**所有会话**的系统提示词组装。
+
+### 自定义设备名（别名）
+
+型号代号（`2211133C`、`M2012K11AC`）不是人话，用户说的是「小米13」。别名就是这层映射：
+
+```bash
+# 面板：设备行上的「命名」按钮，逗号分隔，回车保存
+# 工具：整表替换
+adb_devices(action:'name', serials:['98fc9410'], names:['小米13','备用机'])
+```
+
+- 别名存在注册表里（`~/.dsh/device-manager/registry.json`，`device.aliases`，首个为主名），
+  会出现在提示词清单的「名字」列与 `list` 输出里。
+- 所有入口的 `serials` 都接受**序列号 / 型号 / `IP:5555` / 别名**，大小写、空格、全角、连字符都会被归一化。
+  匹配不到时返回候选设备（含各自别名），模型会照着候选改名重试，而不是回"没有这台设备"。
+- 查重是硬约束：两个设备不能共用同一个称呼（否则"小米13"会解析到错的机器，比没别名更糟），
+  与自己序列号/型号同名的别名按冗余剔除。
 
 ## 安全边界
 
 - 局域网扫段默认关闭，且只接受显式 CIDR；有 `maxIps` / `ratePerSec` / `maxConcurrency` 上限。
 - 不给模型暴露任意 `adb shell`；`adb_devices` 的 `action` 是闭集，P0 没有任何破坏性动作。
 - 外部命令只在 DSH Host 进程里跑（不在 agent 沙箱），P0 不暴露 install/screenshot/logcat。
-- HTTP 路由 `/adb-devices/*`：读接口（`list/status/doctor/history`）匿名可读，写接口要求已认证凭据。
+- HTTP 路由 `/adb-devices/*`：读接口（`list/status/doctor/history/prompt`）匿名可读，写接口（`scan/compose/inject/name/…`）要求已认证凭据；auth 与 resource 共用同一个 action 解析口径。
+- 别名/称呼只用于**查注册表**，真正进 adb 命令行的目标一律取自注册表里的 `transport.adbTarget`，且执行走 `spawn(argv)` 不经 shell。
 
 ## 自测
 
 ```bash
-# 离线 + fixture 回放（fixture 由真机抓取）：151 项断言
+# 离线 + fixture 回放（fixture 由真机抓取）：200 项断言
 node plugin/dsh-device-manager/tools/selftest.mjs
 
 # 只跑离线用例
